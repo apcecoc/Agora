@@ -1,6 +1,7 @@
 package com.newoether.agora.data.repository
 
 import com.newoether.agora.data.ConversationSettings
+import com.newoether.agora.data.normalizedServiceTier
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -38,6 +39,26 @@ internal class ConversationSettingsState {
             conversationId = conversationId,
             settings = transform(mutableState.value[conversationId] ?: ConversationSettings()),
         )
+    }
+
+    fun applyImport(
+        imported: Map<String, ConversationSettings>,
+        replace: Boolean,
+    ): Map<String, ConversationSettings> = synchronized(lock) {
+        val normalized = imported.filterValues { !it.isAllNull() }
+            .mapValues { (_, value) -> value.normalizedServiceTier() }
+        if (replace) {
+            pendingVersions.clear()
+        } else {
+            imported.keys.forEach(pendingVersions::remove)
+        }
+        val updated = if (replace) {
+            normalized
+        } else {
+            mutableState.value - imported.keys + normalized
+        }
+        mutableState.value = updated
+        updated
     }
 
     fun isLatest(write: ConversationSettingsWrite): Boolean = synchronized(lock) {
@@ -80,7 +101,8 @@ internal class ConversationSettingsState {
         conversationId: String,
         settings: ConversationSettings?,
     ): ConversationSettingsWrite {
-        val normalized = settings?.takeUnless(ConversationSettings::isAllNull)
+        val normalized = settings?.normalizedServiceTier()
+            ?.takeUnless(ConversationSettings::isAllNull)
         val updated = mutableState.value.toMutableMap()
         if (normalized == null) {
             updated.remove(conversationId)

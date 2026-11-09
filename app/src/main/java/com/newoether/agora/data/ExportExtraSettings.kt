@@ -69,7 +69,8 @@ object ExportExtraSettings {
                     ?.contentOrNull
                     ?.let(OpenAiServiceTiers::normalize),
                 webSearchEnabled = s["webSearchEnabled"]?.jsonPrimitive?.boolean,
-                shellEnabled = s["shellEnabled"]?.jsonPrimitive?.boolean
+                shellEnabled = s["shellEnabled"]?.jsonPrimitive?.boolean,
+                lowContextModeEnabled = s["lowContextModeEnabled"]?.jsonPrimitive?.boolean,
             )
             if (!cs.isAllNull()) sm.saveConversationSettings(convId, cs)
         }
@@ -108,6 +109,8 @@ object ExportExtraSettings {
         obj["autoUpdateCheck"]?.jsonPrimitive?.boolean?.let { sm.saveAutoUpdateCheck(it) }
         obj["automationToolsEnabled"]?.jsonPrimitive?.boolean?.let { sm.saveAutomationToolsEnabled(it) }
         obj["exactExecutionEnabled"]?.jsonPrimitive?.boolean?.let { sm.saveExactExecutionEnabled(it) }
+        obj["automationWakeLockEnabled"]?.jsonPrimitive?.boolean
+            ?.let { sm.saveAutomationWakeLockEnabled(it) }
 
         obj["modelAliases"]?.jsonObject?.let { aliasesObj ->
             val map = aliasesObj.mapNotNull { (k, v) ->

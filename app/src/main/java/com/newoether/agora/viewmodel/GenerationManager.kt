@@ -15,14 +15,13 @@ import com.newoether.agora.model.MessageSegment
 import com.newoether.agora.model.MessageStatus
 import com.newoether.agora.model.Participant
 import com.newoether.agora.model.RunEffectIdentity
-import com.newoether.agora.model.RequestTokenUsageAccumulator
-import com.newoether.agora.model.TokenUsage
 import com.newoether.agora.model.ToolCallData
 import com.newoether.agora.R
 import com.newoether.agora.service.AgoraForegroundService
 import com.newoether.agora.service.AppForegroundTracker
-import com.newoether.agora.api.util.ContextTokenEstimator
+import com.newoether.agora.api.util.tokens.FixedContextComposition
 import com.newoether.agora.tool.ToolProvider
+import com.newoether.agora.util.Constants
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -32,16 +31,14 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 
-internal class GenerationForegroundServiceUnavailableException :
-    IllegalStateException("Required foreground service could not be started")
 internal suspend fun acquireGenerationForegroundLease(
     managedExternally: Boolean,
     acquire: suspend () -> Boolean,
 ): Boolean {
     if (managedExternally) return false
-    if (!acquire()) throw GenerationForegroundServiceUnavailableException()
-    return true
+    return acquire()
 }
+
 class GenerationManager(
     private val app: Application,
     private val conversations: com.newoether.agora.data.repository.ConversationRepository,
@@ -51,12 +48,13 @@ class GenerationManager(
     private val sandboxFactory: com.newoether.agora.sandbox.SandboxManagerFactory? = null,
     additionalToolProviders: List<ToolProvider> = emptyList(),
     private val customProviders: () -> List<CustomProviderConfig> = { emptyList() },
+    generatingConversationIds: () -> Set<String> = { emptySet() },
 ) {
     var onMessagePersisted: ((messageId: String, text: String) -> Unit)? = null
 
     /** User-confirmation gate for remote shell mutations. Set by the ViewModel.
      *  Returns true to proceed, false to deny. */
-    var onConfirmShellCommand: (suspend (server: String, summary: String) -> Boolean)? = null
+    var onConfirmShellCommand: (suspend (server: String, summary: String, conversationId: String?) -> Boolean)? = null
 
     private val toolExecutor = GenerationToolExecutor.createDefault(
         app = app,
@@ -65,37 +63,29 @@ class GenerationManager(
         skillManager = skillManager,
         sandboxFactory = sandboxFactory,
         additionalProviders = additionalToolProviders,
-        confirmShellCommand = { server, summary ->
-            onConfirmShellCommand?.invoke(server, summary) ?: true
+        generatingConversationIds = generatingConversationIds,
+        confirmShellCommand = { server, summary, conversationId ->
+            onConfirmShellCommand?.invoke(server, summary, conversationId) ?: true
         },
     )
+    private val contextAccounting = GenerationContextAccounting(toolExecutor)
     private val providerPassEffects = ProviderPassEffectExecutor()
     private val toolBatchEffects = GenerationToolBatchEffectExecutor(toolExecutor)
     private val toolRoundBuilder = GenerationToolRoundBuilder()
     private val runFinalizationExecutor = GenerationRunFinalizationExecutor(conversations)
     private val apiPathBuilder = GenerationApiPathBuilder(
         conversations = conversations,
+        appContext = context,
+        generationErrorFormatter = { raw ->
+            normalizePersistedGenerationErrorText(context, raw)
+        },
         toolDefinitions = toolExecutor,
     )
     private val completionEffects = GenerationCompletionEffectsExecutor(
         isAppInForeground = { AppForegroundTracker.isInForeground },
         releaseForegroundLease = AgoraForegroundService::release,
-        notify = { text, conversationId ->
-            AgoraForegroundService.showCompletionNotification(
-                app,
-                replaceCustomProviderIdsForDisplay(text, customProviders()),
-                conversationId,
-            )
-        },
+        notify = ::showTerminalNotification,
     )
-
-    // Image/video frame extraction lives in ImageProcessor (single source of truth).
-    private val imageProcessor = ImageProcessor(app)
-
-    suspend fun processImages(
-        uris: List<String>,
-        sliceConfigs: Map<String, VideoSliceConfig> = emptyMap()
-    ): List<String> = imageProcessor.processImagesAndVideos(uris, sliceConfigs)
 
     /** Semantic message search — delegates to the RAG tool provider, which owns the
      *  embedding-search logic. Kept here as the entry point used by ChatViewModel's
@@ -103,17 +93,32 @@ class GenerationManager(
     suspend fun semanticSearch(query: String, limit: Int, ctx: GenerationContext): List<Pair<MessageEntity, Float>> =
         toolExecutor.semanticSearch(query, limit, ctx)
 
-    internal fun fixedContextTokenCost(
+    internal fun showTerminalNotification(
+        text: String,
+        conversationId: String,
+        status: MessageStatus,
+    ) {
+        AgoraForegroundService.showTerminalNotification(
+            context = app,
+            responseText = replaceCustomProviderIdsForDisplay(text, customProviders()),
+            conversationId = conversationId,
+            isError = status == MessageStatus.ERROR,
+        )
+    }
+
+    internal fun fixedContextTokenCost(config: GenerationConfig, context: GenerationContext): Int =
+        contextAccounting.fixedContextTokenCost(config, context)
+
+    internal fun fixedContextComposition(
         config: GenerationConfig,
         context: GenerationContext,
-    ): Int = ContextTokenEstimator.estimateFixed(
-        systemPrompt = config.effectiveSystemPrompt,
-        tools = toolExecutor.definitions(context),
-        initialUserPrompt = config.initialUserPrompt,
-        codeExecutionEnabled = config.codeExecutionEnabled,
-        googleSearchEnabled = config.googleSearchEnabled,
-        openAiWebSearchEnabled = config.openAiWebSearchEnabled,
-    )
+    ): FixedContextComposition = contextAccounting.fixedContextComposition(config, context)
+
+    internal fun includesAssistantReasoning(config: GenerationConfig, context: GenerationContext): Boolean =
+        contextAccounting.includesAssistantReasoning(config, context)
+
+    internal suspend fun resolvedFixedContextTokenCost(config: GenerationConfig, context: GenerationContext): Int =
+        contextAccounting.resolvedFixedContextTokenCost(config, context)
 
     internal suspend fun buildApiPath(request: GenerationApiPathRequest): GenerationApiPath =
         apiPathBuilder.build(request)
@@ -146,23 +151,7 @@ class GenerationManager(
         var endedAtGuidanceBoundary = false
         var endedForFollowUp = false
         var followUpParentMessageId: String? = null
-        var totalText = ""
-        var totalThoughts = ""
-        var thinkingPlaceholder = ""
-        var totalThoughtTitle: String? = null
-        var totalTokenCount = 0
-        var totalTokenUsage: TokenUsage? = null
-        val tokenUsageAccumulator = RequestTokenUsageAccumulator()
-        val thoughtTiming = GenerationThoughtTiming()
-        var currentStatus = MessageStatus.SENDING
-        var generationErrorMessage: String? = null
-        var retryText: String? = null
-        val toolOverlay = GenerationToolOverlay(toolExecutor, config.providerName)
-        val generatedImages = mutableListOf<String>()
-        var currentAnswerBuf = StringBuilder()
-        var currentThoughtBuf = StringBuilder()
-        var currentThoughtSignature: String? = null
-        var currentThoughtSignatureProvider: String? = null
+        val output = GenerationOutputAccumulator(toolExecutor, config.providerName)
         var parentId: String? = null
         var modelRunSequence = -1L
         var toolPath = emptyList<ChatMessage>()
@@ -180,18 +169,24 @@ class GenerationManager(
             },
         )
         var terminalPersisted = false
+        var terminalConversationVisible: Boolean? = null
+        var terminalOutputText = ""
+
+        fun projectOutput(message: ChatMessage): ChatMessage =
+            message.withBoundedOutputTextTransform(callbacks.transformFinalText)
 
         fun adoptIncompleteTranscriptionSnapshot() {
             transcriptionExecution.incompleteSnapshot()?.let { snapshot ->
-                totalText = snapshot.text
-                totalThoughts = snapshot.thoughts.orEmpty()
-                totalThoughtTitle = snapshot.thoughtTitle
-                totalTokenCount = snapshot.tokenCount
-                totalTokenUsage = snapshot.tokenUsage
-                thoughtTiming.adoptTotalDuration(snapshot.thoughtTimeMs)
-                generatedImages.clear()
-                generatedImages.addAll(snapshot.images)
-                toolOverlay.replaceAll(snapshot.segments.orEmpty())
+                output.totalText.clear()
+                output.totalText.append(snapshot.text)
+                output.totalThoughts = snapshot.thoughts.orEmpty()
+                output.totalThoughtTitle = snapshot.thoughtTitle
+                output.totalTokenCount = snapshot.tokenCount
+                output.totalTokenUsage = snapshot.tokenUsage
+                output.thoughtTiming.adoptTotalDuration(snapshot.thoughtTimeMs)
+                output.generatedImages.clear()
+                output.generatedImages.addAll(snapshot.images)
+                output.toolOverlay.replaceAll(snapshot.segments.orEmpty())
             }
         }
 
@@ -201,7 +196,7 @@ class GenerationManager(
             // Slot ownership (generating flag / active set) is claimed synchronously by the
             // controller before this coroutine runs — GenerationManager no longer touches it.
             com.newoether.agora.util.CrashReporter.note("generate provider=${config.providerName}")
-            thinkingPlaceholder = context.getString(R.string.thinking_ellipsis)
+            output.thinkingPlaceholder = context.getString(R.string.thinking_ellipsis)
             val placeholder = checkNotNull(conversations.getMessage(modelMessageId)) {
                 "Generation placeholder $modelMessageId does not exist"
             }
@@ -218,7 +213,7 @@ class GenerationManager(
                 managedExternally = ctx.foregroundServiceManagedExternally,
                 acquire = {
                     withContext(Dispatchers.Main) {
-                        AgoraForegroundService.acquire(app, modelMessageId)
+                        AgoraForegroundService.acquire(app, modelMessageId, conversationId)
                     }
                 },
             )
@@ -227,6 +222,8 @@ class GenerationManager(
             val transcription = transcriptionExecution.execute(
                 request = GenerationTranscriptionStageRequest(
                     conversationId = conversationId,
+                    runId = runId,
+                    pass = pass,
                     parentId = parentId,
                     context = ctx,
                     generationJob = generationJob,
@@ -234,19 +231,20 @@ class GenerationManager(
                     startTime = startTime,
                 ),
                 onSnapshot = { snapshot, forceCheckpoint ->
-                    onStreamUpdate(snapshot)
-                    checkpoints.persist(snapshot, forceCheckpoint)
+                    val projected = projectOutput(snapshot)
+                    onStreamUpdate(projected)
+                    checkpoints.persist(projected, forceCheckpoint)
                 },
             )
             if (transcription.segments.isNotEmpty()) {
-                toolOverlay.prependAll(transcription.segments)
+                output.toolOverlay.prependAll(transcription.segments)
             }
             if (transcription.error != null) {
-                generationErrorMessage = transcription.error
-                currentStatus = MessageStatus.ERROR
+                output.generationErrorMessage = transcription.error
+                output.currentStatus = MessageStatus.ERROR
             }
 
-            if (currentStatus != MessageStatus.ERROR) {
+            if (output.currentStatus != MessageStatus.ERROR) {
             val (currentPath, rawProviderConfig) = apiPathBuilder.build(
                 GenerationApiPathRequest(
                     parentId = parentId,
@@ -274,29 +272,31 @@ class GenerationManager(
 
             fun modelMessage() = ChatMessage(
                 id = modelMessageId, parentId = parentId,
-                text = totalText, thoughts = totalThoughts.ifBlank { null },
-                thoughtTitle = totalThoughtTitle, tokenCount = totalTokenCount,
-                tokenUsage = totalTokenUsage,
-                status = currentStatus, participant = Participant.MODEL,
-                timestamp = startTime, thoughtTimeMs = thoughtTiming.totalDurationMs,
+                text = output.totalText.toString(), thoughts = output.totalThoughts.ifBlank { null },
+                thoughtTitle = output.totalThoughtTitle, tokenCount = output.totalTokenCount,
+                tokenUsage = output.totalTokenUsage,
+                status = output.currentStatus, participant = Participant.MODEL,
+                timestamp = startTime, thoughtTimeMs = output.thoughtTiming.totalDurationMs,
                 modelName = modelName, toolCall = toolCallData,
-                images = generatedImages.toList(),
+                images = output.generatedImages.toList(),
                 segments = buildLiveSegments(
-                    toolOverlay.snapshot(),
-                    currentAnswerBuf,
-                    currentThoughtBuf,
-                    currentThoughtSignature,
-                    currentThoughtSignatureProvider,
-                    thoughtTiming.liveDurationMs(),
-                    generationErrorMessage,
+                    output.toolOverlay.snapshot(),
+                    output.currentAnswerBuf,
+                    output.currentThoughtBuf,
+                    output.currentThoughtSignature,
+                    output.currentThoughtSignatureProvider,
+                    output.thoughtTiming.liveDurationMs(),
+                    output.generationErrorMessage,
+                    output.generationErrorCode,
+                    answerDeltas = output.currentAnswerDeltas,
                 ),
-                retryText = retryText,
+                retryText = output.retryText,
                 runId = runId,
                 runSequence = modelRunSequence,
             )
 
             suspend fun publishStreamUpdate(forceCheckpoint: Boolean = false) {
-                val snapshot = modelMessage()
+                val snapshot = projectOutput(modelMessage())
                 onStreamUpdate(snapshot)
                 if (firstUiPublishPending) {
                     firstUiPublishPending = false
@@ -305,54 +305,12 @@ class GenerationManager(
                 checkpoints.persist(snapshot, force = forceCheckpoint)
             }
 
-            fun flushAnswerSegment() {
-                if (currentAnswerBuf.isNotEmpty()) {
-                    toolOverlay.append(
-                        MessageSegment(type = "answer", content = currentAnswerBuf.toString()),
-                    )
-                    currentAnswerBuf = StringBuilder()
-                }
-            }
-
-            fun flushThoughtSegment() {
-                thoughtTiming.finishCurrent()
-                if (currentThoughtBuf.isNotEmpty()) {
-                    toolOverlay.append(
-                        MessageSegment(
-                            type = "thought",
-                            content = currentThoughtBuf.toString(),
-                            signature = currentThoughtSignature,
-                            signatureProvider = currentThoughtSignatureProvider,
-                            durationMs = thoughtTiming.currentDurationMs.takeIf { it > 0L },
-                        ),
-                    )
-                    currentThoughtBuf = StringBuilder()
-                    currentThoughtSignature = null
-                    currentThoughtSignatureProvider = null
-                }
-                thoughtTiming.resetCurrentDuration()
-            }
-
-            fun upsertStreamingToolSegment(
-                streamKey: String,
-                toolCallId: String?,
-                name: String,
-                arguments: String,
-                signature: String?,
-            ): Boolean {
-                if (!toolOverlay.hasStream(streamKey)) {
-                    flushAnswerSegment()
-                    flushThoughtSegment()
-                }
-                return toolOverlay.upsert(streamKey, toolCallId, name, arguments, signature)
-            }
-
             suspend fun executeAcceptedToolBatch() {
                 if (completedToolCalls.isEmpty()) return
                 val batchEffect = toolRoundEffects.requireBatchEffect()
                 val calls = completedToolCalls.values.toList()
                 completedToolCalls.clear()
-                currentStatus = MessageStatus.TOOL_CALLING
+                output.currentStatus = MessageStatus.TOOL_CALLING
                 val outcome = toolBatchEffects.execute(
                     request = AuthorizedToolBatchRequest(
                         effect = batchEffect,
@@ -361,7 +319,7 @@ class GenerationManager(
                         conversationId = conversationId,
                         authorizedToolNames = providerConfig.tools.orEmpty()
                             .mapTo(linkedSetOf()) { it.function.name },
-                        // view_image results reuse this generation's transcription flow when
+                        // file_view_image results reuse this generation's transcription flow when
                         // image transcription is enabled for the current model.
                         toolImageTranscriber =
                             if (
@@ -373,6 +331,10 @@ class GenerationManager(
                                         image = image,
                                         ctx = ctx,
                                         generationJob = generationJob,
+                                        conversationId = conversationId,
+                                        runId = runId,
+                                        pass = pass,
+                                        modelMessageId = modelMessageId,
                                         onProgress = onProgress,
                                     )
                                 }
@@ -380,185 +342,43 @@ class GenerationManager(
                                 null
                             },
                     ),
-                    overlay = toolOverlay,
+                    overlay = output.toolOverlay,
                     callbacks = ToolBatchProgressCallbacks(
                         publish = ::publishStreamUpdate,
                         onPublishedAt = uiUpdateGate::recordPublished,
                     ),
                 )
                 check(outcome.identity == batchEffect.identity)
-                generatedImages.addAll(outcome.generatedImages)
                 roundToolSegments.addAll(outcome.segments)
                 toolCallData = outcome.calls.firstOrNull()
                 toolCallDataList = outcome.calls
                 toolRoundEffects.completeBatch(batchEffect.identity)
-                currentStatus = MessageStatus.SENDING
+                output.currentStatus = MessageStatus.SENDING
                 publishStreamUpdate(forceCheckpoint = true)
                 uiUpdateGate.recordPublished(System.currentTimeMillis())
-            }
-
-            suspend fun handleStreamEvent(
-                event: StreamEvent,
-                providerAnswerStart: Int,
-            ) {
-                requestTrace?.recordParsedEvent(event)
-                when (event) {
-                    is StreamEvent.TextChunk -> {
-                        val answerText = if (currentStatus == MessageStatus.THINKING) event.text.trimStart() else event.text
-                        if (currentStatus == MessageStatus.THINKING && answerText.isBlank()) {
-                            retryText = null
-                            return
-                        }
-                        if (currentStatus == MessageStatus.THINKING) {
-                            flushThoughtSegment()
-                        }
-                        totalText += answerText
-                        currentAnswerBuf.append(answerText)
-                        if (answerText.isNotBlank()) {
-                            currentStatus = MessageStatus.SENDING
-                        }
-                        retryText = null
-                    }
-                    is StreamEvent.CitationUpdate -> {
-                        toolOverlay.upsertCitation(
-                            rebaseCitationForFinalAnswer(
-                                citation = event.citation,
-                                providerAnswerStart = providerAnswerStart,
-                                finalAnswer = totalText,
-                            ),
-                        )
-                    }
-                    is StreamEvent.ThoughtChunk -> {
-                        val updatedCompletedThought = event.thought.isEmpty() &&
-                            currentStatus != MessageStatus.THINKING &&
-                            (event.title != null || event.signature != null) &&
-                            toolOverlay.updateLastThoughtMetadata(
-                                signature = event.signature,
-                                signatureProvider = provider.name.takeIf {
-                                    event.signature != null
-                                },
-                            )
-                        if (updatedCompletedThought) {
-                            if (event.title != null) totalThoughtTitle = event.title
-                            return
-                        }
-                        flushAnswerSegment()
-                        currentStatus = MessageStatus.THINKING
-                        retryText = null
-                        thoughtTiming.ensureStarted()
-                        if (totalThoughts.isEmpty()) totalThoughts = thinkingPlaceholder
-                        if (event.thought.isNotEmpty()) {
-                            currentThoughtBuf.append(event.thought)
-                            if (totalThoughts == thinkingPlaceholder) totalThoughts = event.thought
-                            else totalThoughts += event.thought
-                        }
-                        if (event.title != null) totalThoughtTitle = event.title
-                        if (event.signature != null) {
-                            currentThoughtSignature = event.signature
-                            currentThoughtSignatureProvider = provider.name
-                        }
-                    }
-                    is StreamEvent.UsageUpdate -> {
-                        tokenUsageAccumulator.observeRequestSnapshot(event.usage)
-                        totalTokenUsage = tokenUsageAccumulator.snapshot()
-                        totalTokenCount = totalTokenUsage?.totalTokenCount ?: 0
-                        if (totalText.isEmpty() && event.thoughtsTokenCount > 0) {
-                            currentStatus = MessageStatus.THINKING
-                            thoughtTiming.ensureStarted()
-                            if (totalThoughts.isEmpty()) totalThoughts = thinkingPlaceholder
-                        }
-                    }
-                    is StreamEvent.Retrying -> {
-                        retryText = context.getString(R.string.generation_retry_attempt, event.attempt, event.maxAttempts)
-                        onStreamUpdate(modelMessage())
-                    }
-                    is StreamEvent.Error -> {
-                        flushThoughtSegment()
-                        flushAnswerSegment()
-                        retryText = null
-                        toolOverlay.failIncompleteStreams(completedToolCalls.keys)
-                        currentStatus = MessageStatus.ERROR
-                        generationErrorMessage = localizedGenerationError(context, event.error)
-                    }
-                    is StreamEvent.HostedToolCallUpdate -> {
-                        if (!toolOverlay.hasStream(event.streamKey)) {
-                            flushAnswerSegment()
-                            flushThoughtSegment()
-                        }
-                        val created = toolOverlay.upsertHosted(event)
-                        currentStatus = MessageStatus.TOOL_CALLING
-                        retryText = null
-                        val now = System.currentTimeMillis()
-                        if (created || event.result != null || uiUpdateGate.isDue(now)) {
-                            publishStreamUpdate(forceCheckpoint = created || event.result != null)
-                            uiUpdateGate.recordPublished(now)
-                        }
-                    }
-                    is StreamEvent.ToolCallUpdate -> {
-                        val created = upsertStreamingToolSegment(
-                            streamKey = event.streamKey,
-                            toolCallId = event.id,
-                            name = event.name,
-                            arguments = event.arguments,
-                            signature = event.signature,
-                        )
-                        currentStatus = MessageStatus.TOOL_CALLING
-                        retryText = null
-                        val now = System.currentTimeMillis()
-                        if (created || uiUpdateGate.isDue(now)) {
-                            publishStreamUpdate(forceCheckpoint = created)
-                            uiUpdateGate.recordPublished(now)
-                        }
-                    }
-                    is StreamEvent.ToolCallRequest -> {
-                        upsertStreamingToolSegment(
-                            streamKey = event.streamKey,
-                            toolCallId = event.id,
-                            name = event.name,
-                            arguments = event.arguments,
-                            signature = event.signature,
-                        )
-                        currentStatus = MessageStatus.TOOL_CALLING
-                        publishStreamUpdate(forceCheckpoint = true)
-                        uiUpdateGate.recordPublished(System.currentTimeMillis())
-                    }
-                    is StreamEvent.ToolCallsRequest -> {
-                        event.calls.forEach { call ->
-                            upsertStreamingToolSegment(
-                                streamKey = call.streamKey,
-                                toolCallId = call.id,
-                                name = call.name,
-                                arguments = call.arguments,
-                                signature = call.signature,
-                            )
-                        }
-                        currentStatus = MessageStatus.TOOL_CALLING
-                        publishStreamUpdate(forceCheckpoint = true)
-                        uiUpdateGate.recordPublished(System.currentTimeMillis())
-                    }
-                }
-
-                val now = System.currentTimeMillis()
-                val isSignificant =
-                    event is StreamEvent.Error || event is StreamEvent.CitationUpdate
-                if (uiUpdateGate.isDue(now) || isSignificant) {
-                    publishStreamUpdate(forceCheckpoint = isSignificant)
-                    uiUpdateGate.recordPublished(now)
-                }
             }
 
             suspend fun collectProviderRequest(
                 messages: List<ChatMessage>,
                 onFirstEvent: (() -> Unit)? = null,
             ): ProviderPassOutcome {
-                val providerAnswerStart = totalText.length
-                tokenUsageAccumulator.beginRequest()
+                val providerAnswerStart = output.totalText.length
+                output.beginProviderRequest()
+                val providerRequestIndex = providerRequestOrdinal++
+                val providerRequestTrace = if (providerRequestIndex == 0) {
+                    requestTrace
+                } else {
+                    requestTrace?.child(
+                        requestKind = "tool_continuation",
+                        requestIdSuffix = "provider-$providerRequestIndex",
+                    )
+                }
                 val proposedIdentity = RunEffectIdentity(
                     conversationId = conversationId,
                     ownerToken = ownerToken,
                     runId = runId,
                     pass = pass,
-                    effectId = "provider-$pass-${providerRequestOrdinal++}",
+                    effectId = "provider-$pass-$providerRequestIndex",
                 )
                 try {
                     return providerPassEffects.execute(
@@ -567,6 +387,7 @@ class GenerationManager(
                             provider = provider,
                             messages = messages,
                             config = providerConfig,
+                            requestTrace = providerRequestTrace,
                         ),
                         callbacks = ProviderPassExecutionCallbacks(
                             requestEffect = callbacks.onProviderPassRequested,
@@ -575,14 +396,29 @@ class GenerationManager(
                             },
                             onFirstEvent = onFirstEvent,
                             onEvent = { event ->
-                                handleStreamEvent(event, providerAnswerStart)
+                                output.handleStreamEvent(
+                                    event = event,
+                                    providerAnswerStart = providerAnswerStart,
+                                    provider = provider,
+                                    context = context,
+                                    completedToolCalls = completedToolCalls,
+                                    uiUpdateGate = uiUpdateGate,
+                                    publishStreamUpdate = ::publishStreamUpdate,
+                                    publishRetrySnapshot = {
+                                        val projected = projectOutput(modelMessage())
+                                        onStreamUpdate(projected)
+                                        if (event is StreamEvent.Retrying && event.resetCurrentAttempt) {
+                                            checkpoints.persist(projected, force = true)
+                                        }
+                                    },
+                                )
                             },
                         ),
                     )
                 } finally {
-                    tokenUsageAccumulator.finishRequest()
-                    totalTokenUsage = tokenUsageAccumulator.snapshot()
-                    totalTokenCount = totalTokenUsage?.totalTokenCount ?: totalTokenCount
+                    output.tokenUsageAccumulator.finishRequest()
+                    output.totalTokenUsage = output.tokenUsageAccumulator.snapshot()
+                    output.totalTokenCount = output.totalTokenUsage?.totalTokenCount ?: output.totalTokenCount
                 }
             }
 
@@ -606,7 +442,7 @@ class GenerationManager(
                     }
                     is ProviderPassOutcome.Truncated,
                     is ProviderPassOutcome.Failed,
-                    -> check(currentStatus == MessageStatus.ERROR) {
+                    -> check(output.currentStatus == MessageStatus.ERROR) {
                         "A failed Provider pass must publish its error before closing"
                     }
                     is ProviderPassOutcome.Cancelled -> throw CancellationException(
@@ -615,20 +451,26 @@ class GenerationManager(
                 }
             }
 
-            val apiPath = projectGenerationInputMessages(
-                messages = currentPath,
-                includeImages = providerConfig.includeImages,
-                userPrepend = config.userPrepend,
-                userPostpend = config.userPostpend,
-                initialUserPrompt = config.initialUserPrompt,
-            )
+            val apiPath = if (providerConfig.requestResolver != null) {
+                currentPath
+            } else {
+                projectGenerationInputMessages(
+                    messages = currentPath,
+                    includeImages = providerConfig.includeImages,
+                    userPrepend = config.userPrepend,
+                    userPostpend = config.userPostpend,
+                    assistantPrepend = config.assistantPrepend,
+                    assistantPostpend = config.assistantPostpend,
+                    initialUserPrompt = config.initialUserPrompt,
+                )
+            }
             requestTrace?.mark("provider_dispatch")
             acceptProviderPass(collectProviderRequest(apiPath) {
                 requestTrace?.mark("first_semantic_event")
             })
-            thoughtTiming.finishCurrent()
-            currentStatus = statusAfterThoughtPhaseFinished(currentStatus)
-            if (currentStatus != MessageStatus.ERROR) executeAcceptedToolBatch()
+            output.thoughtTiming.finishCurrent()
+            output.currentStatus = statusAfterThoughtPhaseFinished(output.currentStatus)
+            if (output.currentStatus != MessageStatus.ERROR) executeAcceptedToolBatch()
             // Publish the final in-memory snapshot without waiting for another Room round trip.
             // The terminal transaction below persists this exact state after fencing the
             // checkpoint writer, while genuine tool lifecycle boundaries remain forced.
@@ -640,16 +482,16 @@ class GenerationManager(
             var toolRound = 0
             toolPath = currentPath
 
-            while (toolCallDataList.isNotEmpty() && currentStatus != MessageStatus.ERROR && currentCoroutineContext().isActive) {
+            while (toolCallDataList.isNotEmpty() && output.currentStatus != MessageStatus.ERROR && currentCoroutineContext().isActive) {
                 toolRound++
                 val roundToolList = roundToolSegments.toList()
                 roundToolSegments.clear()
                 val thoughtSegs = toolRoundThoughtSegments(
-                    segments = toolOverlay.contentSnapshot(),
+                    segments = output.toolOverlay.contentSnapshot(),
                     fromIndex = toolRoundSegmentCursor,
                 )
                 val txedSegments = if (thoughtSegs.isNotEmpty()) thoughtSegs + roundToolList else roundToolList
-                toolRoundSegmentCursor = toolOverlay.size
+                toolRoundSegmentCursor = output.toolOverlay.size
                 val prevLastId = if (toolRound == 1) modelMessageId else toolPath.lastOrNull()?.id
                 val tcds = toolCallDataList
                 val round = toolRoundBuilder.build(
@@ -668,6 +510,16 @@ class GenerationManager(
                         expectedPass = commitIdentity.pass,
                     )
                 }
+                output.toolOverlay.markCommittedRound(
+                    tcds.mapTo(linkedSetOf()) { call ->
+                        checkNotNull(call.toolCallId) {
+                            "Committed tool call is missing its provider call id"
+                        }
+                    },
+                    toolRoundId = round.entities.first().id,
+                )
+                publishStreamUpdate(forceCheckpoint = true)
+                uiUpdateGate.recordPublished(System.currentTimeMillis())
                 // A terminal Conch job may be deleted only after the complete tool result is
                 // durable. ACK is best-effort and cannot influence the already-authorized
                 // continuation; Conch's bounded retention remains the failure fallback.
@@ -693,9 +545,8 @@ class GenerationManager(
                 if (endedForFollowUp) break
 
                 // A send queued mid-generation starts a fresh Run at this round boundary.
-                // The round's tool/result rows are already persisted above, so ending here is
-                // clean: slot release drains the complete FIFO batch into one merged USER message,
-                // and the new generation continues from those durable tool results.
+                // Its committed tool/results stay in history; the drain persists separate FIFO
+                // messages in one fresh Run that continues from those durable results.
                 if (callbacks.hasQueuedSends()) {
                     endedAtGuidanceBoundary = true
                     break
@@ -703,16 +554,22 @@ class GenerationManager(
 
                 uiUpdateGate.reset()
 
-                val apiToolPath = projectGenerationInputMessages(
-                    messages = toolPath,
-                    includeImages = providerConfig.includeImages,
-                    userPrepend = config.userPrepend,
-                    userPostpend = config.userPostpend,
-                )
+                val apiToolPath = if (providerConfig.requestResolver != null) {
+                    toolPath
+                } else {
+                    projectGenerationInputMessages(
+                        messages = toolPath,
+                        includeImages = providerConfig.includeImages,
+                        userPrepend = config.userPrepend,
+                        userPostpend = config.userPostpend,
+                        assistantPrepend = config.assistantPrepend,
+                        assistantPostpend = config.assistantPostpend,
+                    )
+                }
                 acceptProviderPass(collectProviderRequest(apiToolPath))
-                thoughtTiming.finishCurrent()
-                currentStatus = statusAfterThoughtPhaseFinished(currentStatus)
-                if (currentStatus != MessageStatus.ERROR) executeAcceptedToolBatch()
+                output.thoughtTiming.finishCurrent()
+                output.currentStatus = statusAfterThoughtPhaseFinished(output.currentStatus)
+                if (output.currentStatus != MessageStatus.ERROR) executeAcceptedToolBatch()
                 // Publish the round's final UI state immediately. The next loop boundary or the
                 // terminal transaction supplies durability, so blocking here would only duplicate
                 // I/O and visibly delay the transition out of generating.
@@ -720,45 +577,45 @@ class GenerationManager(
             }
 
             if (!currentCoroutineContext().isActive) {
-                currentStatus = MessageStatus.STOPPED
+                output.currentStatus = MessageStatus.STOPPED
             }
 
-            if (currentStatus != MessageStatus.ERROR) {
+            if (output.currentStatus != MessageStatus.ERROR) {
                 // A queue-steered interruption is a SUCCESSFUL turn even with no answer text —
                 // its value is the persisted tool activity.
-                currentStatus = if (
-                    totalText.isNotEmpty() ||
-                    totalThoughts.isNotEmpty() ||
+                output.currentStatus = if (
+                    output.totalText.isNotEmpty() ||
+                    output.totalThoughts.isNotEmpty() ||
                     endedAtGuidanceBoundary ||
                     endedForFollowUp
                 ) {
                     MessageStatus.SUCCESS
                 } else MessageStatus.ERROR
             }
-            generationErrorMessage = terminalGenerationErrorMessage(
-                status = currentStatus,
-                currentError = generationErrorMessage,
+            output.generationErrorMessage = terminalGenerationErrorMessage(
+                status = output.currentStatus,
+                currentError = output.generationErrorMessage,
                 fallbackError = context.getString(R.string.failed_to_generate),
             )
-            if (generationJob?.isCancelled == true && currentStatus != MessageStatus.ERROR) {
-                currentStatus = MessageStatus.STOPPED
+            if (generationJob?.isCancelled == true && output.currentStatus != MessageStatus.ERROR) {
+                output.currentStatus = MessageStatus.STOPPED
             }
-            } // else { // called buildApiPath when currentStatus == ERROR
+            } // else { // called buildApiPath when output.currentStatus == ERROR
         } catch (e: CancellationException) {
             // transcribe() owns its mutable segment list until it returns. If cancellation lands
             // mid-transcription, copy the latest durable/UI snapshot into the terminal accumulator
             // so the final upsert does not overwrite that checkpoint with empty content.
             adoptIncompleteTranscriptionSnapshot()
-            toolOverlay.stopIncompleteTools()
-            currentStatus = MessageStatus.STOPPED
+            output.toolOverlay.stopIncompleteTools()
+            output.currentStatus = MessageStatus.STOPPED
             throw e
         } catch (e: Exception) {
             adoptIncompleteTranscriptionSnapshot()
             val isCancelled = generationJob?.isCancelled == true
-            currentStatus = if (isCancelled) MessageStatus.STOPPED else MessageStatus.ERROR
+            output.currentStatus = if (isCancelled) MessageStatus.STOPPED else MessageStatus.ERROR
             if (!isCancelled) {
-                generationErrorMessage =
-                    "Error: ${e.localizedMessage ?: "An unexpected error occurred."}"
+                output.generationErrorMessage =
+                    "Error: ${e.localizedMessage?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName}"
             }
         } finally {
             // Fence the asynchronous checkpoint lane before any terminal transaction. Without
@@ -771,45 +628,46 @@ class GenerationManager(
             // one terminal effect that may write Room. A concurrent Stop wins by entering
             // Stopping first; a natural completion wins by entering Finalizing first.
             withContext(NonCancellable) {
-                // A cancellation can arrive as ImageGenToolProvider's withContext returns,
-                // after the file was queued but before the normal post-tool drain ran.
-                generatedImages.addAll(toolExecutor.drainGeneratedImages(conversationId))
                 try {
                     val conversationExists = conversations.getConversation(conversationId) != null
                     if (conversationExists) {
-                        thoughtTiming.finishCurrent()
+                        output.thoughtTiming.finishCurrent()
                         // Bound the row's toolCallJson aggregate (#51) and the unbounded answer
                         // text column — together they can exceed the 2MB CursorWindow otherwise.
                         val generatedMessage = GenerationFinalSnapshot(
                             messageId = modelMessageId,
                             parentId = parentId,
-                            text = totalText,
-                            images = generatedImages.toList(),
-                            thoughts = totalThoughts,
-                            thoughtTitle = totalThoughtTitle,
-                            tokenCount = totalTokenCount,
-                            tokenUsage = totalTokenUsage,
-                            status = currentStatus,
+                            text = output.totalText.toString(),
+                            images = output.generatedImages.toList(),
+                            thoughts = output.totalThoughts,
+                            thoughtTitle = output.totalThoughtTitle,
+                            tokenCount = output.totalTokenCount,
+                            tokenUsage = output.totalTokenUsage,
+                            status = output.currentStatus,
                             timestamp = startTime,
-                            thoughtTimeMs = thoughtTiming.totalDurationMs,
+                            thoughtTimeMs = output.thoughtTiming.totalDurationMs,
                             modelName = modelName,
-                            flushedSegments = toolOverlay.snapshot(),
-                            answerBuffer = currentAnswerBuf.toString(),
-                            thoughtBuffer = currentThoughtBuf.toString(),
-                            thoughtSignature = currentThoughtSignature,
-                            thoughtSignatureProvider = currentThoughtSignatureProvider,
-                            thoughtDurationMs = thoughtTiming.currentDurationMs.takeIf { it > 0L },
-                            errorMessage = generationErrorMessage,
+                            flushedSegments = output.toolOverlay.snapshot(),
+                            answerBuffer = output.currentAnswerBuf.toString(),
+                            thoughtBuffer = output.currentThoughtBuf.toString(),
+                            thoughtSignature = output.currentThoughtSignature,
+                            thoughtSignatureProvider = output.currentThoughtSignatureProvider,
+                            thoughtDurationMs = output.thoughtTiming.currentDurationMs.takeIf { it > 0L },
+                            errorMessage = output.generationErrorMessage,
+                            errorCode = output.generationErrorCode,
                             runId = runId,
                             runSequence = modelRunSequence,
+                            answerDeltas = output.currentAnswerDeltas.toList(),
                         ).toMessage()
-                        val finalMessage = generatedMessage.withBoundedFinalTextTransform(
-                            callbacks.transformFinalText,
-                        )
+                        val finalMessage = projectOutput(generatedMessage)
+                        terminalOutputText = finalMessage.text
+                        terminalConversationVisible = callbacks.isConversationVisible?.invoke()
                         val terminalDisposition = generationTerminalDisposition(
-                            messageStatus = currentStatus,
+                            messageStatus = output.currentStatus,
                             hasPendingGuidance =
-                                callbacks.hasQueuedSends() || endedForFollowUp,
+                                callbacks.hasQueuedSends() || callbacks.hasPendingContinuation ||
+                                    endedAtGuidanceBoundary || endedForFollowUp,
+                            conversationVisible = terminalConversationVisible,
                         )
                         val finalizationIdentity = RunEffectIdentity(
                             conversationId = conversationId,
@@ -840,7 +698,7 @@ class GenerationManager(
                                         ?.lastFailure
                                 val message =
                                     "Terminal generation effect failed after ${outcome.durableResult.attempts} attempts: " +
-                                        "message=$modelMessageId run=$runId status=$currentStatus"
+                                        "message=$modelMessageId run=$runId status=${output.currentStatus}"
                                 if (failure != null) DebugLog.e("AgoraVM", message, failure)
                                 else DebugLog.e("AgoraVM", message)
                             }
@@ -848,17 +706,25 @@ class GenerationManager(
                     }
                 } catch (e: Exception) {
                     DebugLog.e("AgoraVM", "Failed to execute terminal generation effect", e)
+                    throw e
                 }
             }
             completionEffects.execute(
                 request = GenerationCompletionEffectsRequest(
                     terminalPersisted = terminalPersisted,
-                    status = currentStatus,
-                    text = totalText,
+                    status = output.currentStatus,
+                    text = terminalOutputText,
+                    notificationText = if (output.currentStatus == MessageStatus.ERROR) {
+                        output.generationErrorMessage.orEmpty()
+                    } else {
+                        terminalOutputText
+                    },
                     conversationId = conversationId,
                     modelMessageId = modelMessageId,
                     foregroundLeaseAcquired = foregroundLeaseAcquired,
-                    hasPendingContinuation = endedForFollowUp,
+                    isContextCompact = modelMessageId.startsWith(Constants.COMPACT_MSG_PREFIX),
+                    conversationVisible = terminalConversationVisible,
+                    hasPendingContinuation = endedForFollowUp || callbacks.hasPendingContinuation,
                 ),
                 callbacks = callbacks.completionEffectsCallbacks(onMessagePersisted),
             )

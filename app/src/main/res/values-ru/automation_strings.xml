@@ -12,7 +12,7 @@
     <string name="task_run_now">Запустить сейчас</string>
     <string name="task_delete">Удалить задачу</string>
     <string name="task_delete_confirm">Удалить «%1$s» и всю историю её запусков?</string>
-    <string name="import_conversation_graph_counts">Беседы (%1$d) · Задачи (%2$d) · Циклы (%3$d)</string>
+    <string name="import_conversation_graph_counts">Беседы (%1$d) · Задачи (%2$d)</string>
     <string name="task_enabled">Запускать по расписанию</string>
     <string name="task_enabled_desc">Если отключено, задача запускается только после нажатия «Запустить сейчас».</string>
     <string name="task_enabled_needs_schedule">Сначала выберите расписание.</string>
@@ -58,6 +58,7 @@
     <string name="task_status_unknown">Ожидает</string>
     <string name="task_running_notification">Выполняется запланированная задача…</string>
     <string name="loop_running_notification">Выполняется цикл беседы…</string>
+    <string name="auto_backup_running_notification">Создание резервной копии…</string>
     <string name="loop_running">Цикл выполняется…</string>
     <string name="loop_next_in">Следующий запуск через %1$s</string>
     <string name="loop_cycle">Цикл %1$d/%2$d</string>
@@ -67,7 +68,12 @@
     <string name="settings_automation_desc">Задачи, циклы и точность планирования</string>
     <string name="automation_ai_tools">Доступ к задачам и циклам</string>
     <string name="automation_ai_tools_desc">Разрешить модели создавать задачи и управлять ими, а также запускать и останавливать циклы бесед. По умолчанию отключено.</string>
-    <string name="automation_scheduling">Планирование</string>
+    <string name="automation_background_execution">Фоновое выполнение</string>
+    <string name="automation_wake_lock">Блокировка сна</string>
+    <string name="automation_wake_lock_desc">Не давать устройству засыпать во время каждого запуска задачи или цикла. Обычную запланированную работу уже обслуживает WorkManager; эта дополнительная блокировка может увеличить расход батареи.</string>
+    <string name="automation_battery_optimization">Оптимизация батареи</string>
+    <string name="automation_battery_optimization_ignored_desc">Без оптимизации; Android может разрешить больше фоновой работы, но ограничения производителя всё равно могут действовать</string>
+    <string name="automation_battery_optimization_active_desc">Оптимизация включена; Android может задерживать фоновую работу, а ограничения производителя всё равно могут действовать</string>
     <string name="automation_exact_execution">Точное выполнение</string>
     <string name="automation_exact_execution_on_desc">Использовать точные будильники для задач и циклов. Android по-прежнему может применять системные ограничения.</string>
     <string name="automation_exact_execution_off_desc">Использовать неточные будильники для экономии заряда. Включите, чтобы запросить доступ к будильникам и напоминаниям.</string>

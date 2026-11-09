@@ -1,5 +1,6 @@
 package com.newoether.agora.ui.chat.message
 
+import android.content.res.Resources
 import androidx.compose.animation.core.AnimationSpec
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateDpAsState
@@ -21,39 +22,6 @@ import com.newoether.agora.ui.motion.LocalAgoraMotionPolicy
 import com.newoether.agora.model.ChatMessage
 import com.newoether.agora.model.MessageSegment
 
-internal fun MessageSegment.isHiddenFromMessagePresentation(): Boolean =
-    type == "tool" && toolName == "google_search"
-
-internal fun mergeAdjacentSegments(segs: List<MessageSegment>): List<MessageSegment> {
-    val merged = mutableListOf<MessageSegment>()
-    for (seg in segs) {
-        if (seg.type == "citation" || seg.isHiddenFromMessagePresentation()) continue
-        val last = merged.lastOrNull()
-        // Only continuous answer/reasoning text is merged into one flowing block.
-        // Transcriptions stay separate: each describes a distinct image, so a
-        // 1:1 image↔block correspondence must be preserved.
-        if (last != null && last.type == seg.type && (seg.type == "answer" || seg.type == "thought")) {
-            merged[merged.lastIndex] = last.copy(
-                content = last.content + seg.content,
-                durationMs = mergeDurationMs(last.durationMs, seg.durationMs)
-            )
-        } else {
-            merged.add(seg)
-        }
-    }
-    // Drop content-less thought segments AFTER merging (a streamed thought arrives as blank
-    // fragments that concatenate into real content). Models that signal thinking without
-    // emitting a summary would otherwise render an empty "Thinking" block — and because every
-    // renderer funnels through here, dropping them keeps the block keys, timeline dots, and
-    // detail sheet indices all consistent with what is actually drawn.
-    return merged.filterNot { it.type == "thought" && it.content.isBlank() }
-}
-
-private fun mergeDurationMs(first: Long?, second: Long?): Long? {
-    val merged = (first ?: 0L) + (second ?: 0L)
-    return merged.takeIf { it > 0L }
-}
-
 internal fun thoughtDurationMs(
     segs: List<MessageSegment>,
     fallbackMs: Long? = null,
@@ -68,18 +36,10 @@ internal fun thoughtDurationMs(
 private fun MessageSegment.isBlankAnswerSegment(): Boolean =
     type == "answer" && content.isBlank()
 
-internal fun MessageSegment.isVisibleAnswerSegment(): Boolean =
-    type == "answer" && content.isNotBlank()
-
-internal fun MessageSegment.isInfoSegment(): Boolean =
-    (type == "thought" && content.isNotBlank()) || type == "tool" || type == "transcription"
-
-internal enum class SegmentGroupPosition {
-    SINGLE,
-    FIRST,
-    MIDDLE,
-    LAST,
-}
+internal fun generatedImageAppearanceKey(
+    messageId: String,
+    detailIndex: Int,
+): String = "$messageId:generated-image:$detailIndex"
 
 private const val SEGMENT_GROUP_INNER_RADIUS_DP = 5
 private const val SEGMENT_GROUP_OUTER_RADIUS_DP = 24
@@ -142,86 +102,16 @@ internal fun rememberAnimatedSegmentGroupShape(
     )
 }
 
-internal fun segmentGroupPosition(
-    hasPrevious: Boolean,
-    hasNext: Boolean,
-): SegmentGroupPosition = when {
-    !hasPrevious && !hasNext -> SegmentGroupPosition.SINGLE
-    !hasPrevious -> SegmentGroupPosition.FIRST
-    hasNext -> SegmentGroupPosition.MIDDLE
-    else -> SegmentGroupPosition.LAST
-}
-
-private fun List<MessageSegment>.hasTimelineInfoNeighbor(
-    index: Int,
-    direction: Int,
-): Boolean {
-    var cursor = index + direction
-    while (cursor in indices) {
-        val candidate = this[cursor]
-        when {
-            candidate.isInfoSegment() -> return true
-            candidate.isVisibleAnswerSegment() -> return false
-        }
-        cursor += direction
-    }
-    return false
-}
-
-internal fun timelineSegmentGroupPosition(
-    segments: List<MessageSegment>,
-    index: Int,
-): SegmentGroupPosition {
-    if (index !in segments.indices || !segments[index].isInfoSegment()) {
-        return SegmentGroupPosition.SINGLE
-    }
-    return segmentGroupPosition(
-        hasPrevious = segments.hasTimelineInfoNeighbor(index, direction = -1),
-        hasNext = segments.hasTimelineInfoNeighbor(index, direction = 1),
-    )
-}
-
 internal fun ChatMessage.hasActiveAnswerSegment(): Boolean {
-    val lastVisibleSegment = segments?.lastOrNull { !it.isBlankAnswerSegment() }
+    // Citations annotate prior output; tools and thoughts still delimit the active phase.
+    val lastVisibleSegment = segments?.lastOrNull {
+        it.type != "citation" && !it.isBlankAnswerSegment()
+    }
     return if (lastVisibleSegment != null) {
         lastVisibleSegment.isVisibleAnswerSegment()
     } else {
         text.isNotBlank()
     }
-}
-
-internal data class AssistantErrorContent(
-    val answerText: String?,
-    val errorText: String,
-)
-
-/**
- * Keeps already-generated assistant content separate from the terminal failure detail. Rows
- * written before explicit error segments are recoverable when their persisted answer segments
- * reproduce [ChatMessage.text]; legacy error-only rows continue to treat text as the error.
- */
-internal fun assistantErrorContent(
-    message: ChatMessage,
-    mergedSegments: List<MessageSegment>,
-    fallbackErrorText: String,
-): AssistantErrorContent? {
-    if (message.status != com.newoether.agora.model.MessageStatus.ERROR &&
-        message.participant != com.newoether.agora.model.Participant.ERROR
-    ) {
-        return null
-    }
-    val persistedError = mergedSegments
-        .lastOrNull { it.type == "error" && it.content.isNotBlank() }
-        ?.content
-    val hasPersistedAnswer = mergedSegments.any { it.isVisibleAnswerSegment() }
-    return AssistantErrorContent(
-        answerText = message.text.takeIf {
-            it.isNotBlank() && (persistedError != null || hasPersistedAnswer)
-        },
-        errorText = persistedError
-            ?: message.text.takeIf { it.isNotBlank() && !hasPersistedAnswer }
-            ?: fallbackErrorText,
-    )
 }
 
 /**
@@ -283,6 +173,7 @@ internal fun buildTimelineBlockKeys(
                             detailIndex++
                         }
                         blockEnd++
+                        if (blockSeg.isImageGenerationSegment()) break
                     }
                     keys += "$messageId:group:${firstDetailIndex ?: index}"
                     index = blockEnd
@@ -309,6 +200,10 @@ internal fun buildTimelineBlockKeys(
 @Stable
 internal class SegmentAppearanceRegistry {
     private val seenKeys = HashSet<String>()
+    private val streamingFadeTrackers = HashMap<String, StreamingTailFadeTracker>()
+
+    fun streamingFadeTracker(key: String): StreamingTailFadeTracker =
+        streamingFadeTrackers.getOrPut(key) { StreamingTailFadeTracker() }
 
     fun shouldAnimate(key: String, isStreaming: Boolean): Boolean =
         isStreaming && key !in seenKeys
@@ -328,39 +223,68 @@ internal enum class GroupedSegmentAutoExpansionAction {
     COLLAPSE,
 }
 
+internal fun groupedSegmentExpandedState(
+    persistedExpanded: Boolean?,
+    initiallyAutoExpanded: Boolean,
+    collapseForImageBoundary: Boolean = false,
+): Boolean = !collapseForImageBoundary &&
+    (initiallyAutoExpanded || persistedExpanded == true)
+
 /**
  * Session-scoped lifecycle memory for Grouped cards.
  *
  * This lives above LazyColumn items so recomposition and off-screen disposal cannot replay an
- * automatic expansion. A completed group is terminal: append-only message segments may create a
- * new group with a new key, but an old group never becomes active again.
+ * automatic expansion during one active period. Native generation can arrive after the history
+ * body or recover after reconnecting; the latest authoritative activity owns that transition.
  */
 @Stable
 internal class GroupedSegmentAutoExpansionController {
     private enum class State {
         ACTIVE,
-        FINISHED,
+        INACTIVE,
     }
 
     private val states = HashMap<String, State>()
+    private val collapsedImageBoundaryKeys = HashSet<String>()
+
+    fun shouldCollapseForImageBoundary(
+        key: String,
+        hasImageBoundary: Boolean,
+    ): Boolean = hasImageBoundary && key !in collapsedImageBoundaryKeys
+
+    fun claimImageBoundaryCollapse(
+        key: String,
+        hasImageBoundary: Boolean,
+    ): Boolean {
+        if (!hasImageBoundary || !collapsedImageBoundaryKeys.add(key)) return false
+        states[key] = State.INACTIVE
+        return true
+    }
+
+    fun shouldPresentInitiallyExpanded(
+        key: String,
+        isActive: Boolean,
+        enabled: Boolean,
+    ): Boolean = enabled && isActive && states[key] == null
 
     fun update(
         key: String,
         isActive: Boolean,
         enabled: Boolean,
     ): GroupedSegmentAutoExpansionAction {
+        if (key in collapsedImageBoundaryKeys) return GroupedSegmentAutoExpansionAction.NONE
         if (!enabled) {
             if (isActive) {
                 states.remove(key)
             } else {
-                states[key] = State.FINISHED
+                states[key] = State.INACTIVE
             }
             return GroupedSegmentAutoExpansionAction.NONE
         }
 
         return when (states[key]) {
-            null -> {
-                states[key] = if (isActive) State.ACTIVE else State.FINISHED
+            null, State.INACTIVE -> {
+                states[key] = if (isActive) State.ACTIVE else State.INACTIVE
                 if (isActive) {
                     GroupedSegmentAutoExpansionAction.EXPAND
                 } else {
@@ -371,11 +295,10 @@ internal class GroupedSegmentAutoExpansionController {
                 if (isActive) {
                     GroupedSegmentAutoExpansionAction.NONE
                 } else {
-                    states[key] = State.FINISHED
+                    states[key] = State.INACTIVE
                     GroupedSegmentAutoExpansionAction.COLLAPSE
                 }
             }
-            State.FINISHED -> GroupedSegmentAutoExpansionAction.NONE
         }
     }
 }
@@ -386,6 +309,7 @@ internal fun AnimatedTimelineBlockAppearance(
     animate: Boolean? = null,
     appearanceRegistry: SegmentAppearanceRegistry? = null,
     isStreaming: Boolean = false,
+    forceOpaque: Boolean = false,
     content: @Composable () -> Unit
 ) {
     key(animationKey) {
@@ -403,6 +327,7 @@ internal fun AnimatedTimelineBlockAppearance(
             animate = play,
             durationMillis = SEGMENT_ENTER_DURATION_MS,
             initialScale = SEGMENT_ENTER_INITIAL_SCALE,
+            forceOpaque = forceOpaque,
         )
         Box(
             modifier = appearanceModifier,
@@ -429,10 +354,13 @@ internal fun rememberSegmentAppearance(
 
 // Label a transcription segment; numbers them ("Image Transcription 1/2/…") only
 // when more than one is present, so a single image keeps the clean unnumbered name.
-@Composable
-internal fun transcriptionLabel(segs: List<MessageSegment>, index: Int): String {
+internal fun Resources.transcriptionLabel(segs: List<MessageSegment>, index: Int): String {
     val total = segs.count { it.type == "transcription" }
-    if (total <= 1) return stringResource(R.string.transcription_label)
+    if (total <= 1) return getString(R.string.transcription_label)
     val ordinal = segs.take(index + 1).count { it.type == "transcription" }
-    return stringResource(R.string.transcription_label_numbered, ordinal)
+    return getString(R.string.transcription_label_numbered, ordinal)
 }
+
+@Composable
+internal fun transcriptionLabel(segs: List<MessageSegment>, index: Int): String =
+    currentResources().transcriptionLabel(segs, index)

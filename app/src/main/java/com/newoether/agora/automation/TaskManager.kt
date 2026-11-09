@@ -17,12 +17,10 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 /**
@@ -43,6 +41,7 @@ class TaskManager(
     private val refreshScheduling: () -> Unit = {},
     private val conversationExecutionCoordinator: ConversationExecutionCoordinator =
         ConversationExecutionCoordinator(),
+    private val automationExecutionGate: AutomationExecutionGate = AutomationExecutionGate(),
     private val titleExecutionConversation: suspend (
         conversationId: String,
         response: String,
@@ -73,8 +72,20 @@ class TaskManager(
         data class Ambiguous(val matches: List<TaskEntity>) : DeleteResult
     }
 
-    val tasks: StateFlow<List<TaskEntity>> =
-        taskRepository.getAllTasks().stateIn(scope, SharingStarted.Eagerly, emptyList())
+    private val mutableTasks = MutableStateFlow<List<TaskEntity>>(emptyList())
+    val tasks: StateFlow<List<TaskEntity>> = mutableTasks.asStateFlow()
+    @Volatile
+    private var started = false
+
+    /** Starts the Task list projection after the conversation list has published. */
+    @Synchronized
+    fun start() {
+        if (started) return
+        started = true
+        scope.launch {
+            taskRepository.getAllTasks().collect { mutableTasks.value = it }
+        }
+    }
 
     private val reservationMonitor = Any()
     private val reservedTaskIds = mutableSetOf<String>()
@@ -108,7 +119,7 @@ class TaskManager(
             val last = latestByConversation[conversation.id]
             ExecutionSummary(
                 conversation = conversation,
-                preview = last?.text.orEmpty(),
+                preview = last?.preview.orEmpty(),
                 status = last?.status,
                 timestamp = last?.timestamp ?: 0L,
             )
@@ -163,6 +174,7 @@ class TaskManager(
         prompt: String,
         cronExpr: String,
         modelId: String?,
+        systemPromptId: String? = null,
     ): TaskEntity {
         require(name.isNotBlank()) { "Task name is required" }
         require(prompt.isNotBlank()) { "Task prompt is required" }
@@ -174,6 +186,7 @@ class TaskManager(
             name = name.trim(),
             prompt = prompt.trim(),
             modelId = modelId?.trim()?.takeIf { it.isNotEmpty() },
+            systemPromptId = systemPromptId?.trim()?.takeIf { it.isNotEmpty() },
             cronExpr = cronExpr.trim(),
             nextRunAt = 0L,
         )
@@ -234,30 +247,35 @@ class TaskManager(
         taskRepository.deleteTask(task.id)
     }
 
-    fun nextRunFor(task: TaskEntity, now: Long): Long = when {
-        !task.enabled -> 0L
-        // One-shot: its instant IS the next run, and only while still in the future. Returning 0
-        // once it has passed is what retires the task after it fires (see finishScheduledRun).
-        task.runAt != null -> task.runAt.takeIf { it > now } ?: 0L
-        task.cronExpr.isNotBlank() -> CronExpression.parse(task.cronExpr)?.next(now) ?: 0L
-        else -> 0L
+    fun nextRunFor(task: TaskEntity, now: Long): Long {
+        if (!task.enabled) return 0L
+        val runAt = task.runAt
+        return when {
+            // One-shot: its instant IS the next run, and only while still in the future. Returning 0
+            // once it has passed is what retires the task after it fires (see finishScheduledRun).
+            runAt != null -> runAt.takeIf { it > now } ?: 0L
+            task.cronExpr.isNotBlank() -> CronExpression.parse(task.cronExpr)?.next(now) ?: 0L
+            else -> 0L
+        }
     }
 
     /** Starts one exclusive manual run. A second tap while queued/running is ignored. */
-    fun runNow(task: TaskEntity) {
+    fun runNow(task: TaskEntity, preservePersistedEnabled: Boolean = true) {
         if (task.name.isBlank() || task.prompt.isBlank() || !reserve(task.id)) return
 
         lateinit var job: Job
         job = scope.launch(start = CoroutineStart.LAZY) {
             try {
                 withTaskLock(task.id) {
-                    // Persist the caller's name/prompt/model/cron (the user expects "Run now" to use
-                    // what they see), but NEVER overwrite the enabled flag from the UI snapshot.
-                    // The snapshot may be stale (e.g. the user just toggled the switch off and the
-                    // flow hasn't re-emitted yet); letting runNow re-enable a disabled task would
-                    // silently revive it. The persisted enabled state is authoritative here.
-                    val persistedEnabled = taskRepository.getTask(task.id)?.enabled ?: task.enabled
-                    saveTaskLocked(task.copy(enabled = persistedEnabled))
+                    // List snapshots may be stale immediately after a switch change, so list Run
+                    // Now keeps the persisted enabled state. The editor explicitly opts out because
+                    // its current draft is the configuration the command must save.
+                    val enabledForSave = if (preservePersistedEnabled) {
+                        taskRepository.getTask(task.id)?.enabled ?: task.enabled
+                    } else {
+                        task.enabled
+                    }
+                    saveTaskLocked(task.copy(enabled = enabledForSave))
                     val persisted = taskRepository.getTask(task.id) ?: task
                     executeLocked(
                         task = persisted,
@@ -362,21 +380,49 @@ class TaskManager(
         requestedConversationId: String,
         foregroundServiceManagedExternally: Boolean,
         finishManualSchedule: Boolean,
-    ): ExecutionResult {
-        // Existing deterministic execution IDs are meaningful only after orphaned Runs have been
-        // terminalized. Otherwise recovery can misclassify a live-looking SENDING row and replay
-        // or delete the wrong occurrence.
-        conversationRepository.ensureRunRecovery()
-        var conversationId = requestedConversationId
-        val existing = conversationRepository.getConversation(conversationId)
-        if (existing != null) {
-            if (existing.taskId == task.id) {
-                val recovery = recoverExistingExecution(existing)
-                if (recovery != null) return recovery
-                conversationRepository.deleteConversation(conversationId)
-            } else {
-                conversationId = UUID.randomUUID().toString()
+    ): ExecutionResult = automationExecutionGate.withExecution {
+        val requestedResult = conversationExecutionCoordinator
+            .withAutomationConversationLock(requestedConversationId) {
+                conversationRepository.recoverConversationRuntime(requestedConversationId)
+                val existing = conversationRepository.getConversation(requestedConversationId)
+                if (existing != null && existing.taskId != task.id) {
+                    null
+                } else {
+                    executeConversationLocked(
+                        task = task,
+                        conversationId = requestedConversationId,
+                        existing = existing,
+                        foregroundServiceManagedExternally = foregroundServiceManagedExternally,
+                        finishManualSchedule = finishManualSchedule,
+                    )
+                }
             }
+        if (requestedResult != null) return@withExecution requestedResult
+
+        val conversationId = UUID.randomUUID().toString()
+        conversationExecutionCoordinator.withAutomationConversationLock(conversationId) {
+            conversationRepository.recoverConversationRuntime(conversationId)
+            executeConversationLocked(
+                task = task,
+                conversationId = conversationId,
+                existing = null,
+                foregroundServiceManagedExternally = foregroundServiceManagedExternally,
+                finishManualSchedule = finishManualSchedule,
+            )
+        }
+    }
+
+    private suspend fun executeConversationLocked(
+        task: TaskEntity,
+        conversationId: String,
+        existing: ChatEntity?,
+        foregroundServiceManagedExternally: Boolean,
+        finishManualSchedule: Boolean,
+    ): ExecutionResult {
+        if (existing != null) {
+            val recovery = recoverExistingExecution(existing)
+            if (recovery != null) return recovery
+            conversationRepository.deleteConversation(conversationId)
         }
 
         conversationRepository.upsertConversation(
@@ -384,33 +430,27 @@ class TaskManager(
                 id = conversationId,
                 title = task.name,
                 modelId = task.modelId,
+                // A saved prompt is resolved per run through the ordinary conversation path, so its
+                // placeholders expand with this run's values instead of a frozen copy.
+                systemPromptId = task.systemPromptId,
                 taskId = task.id,
                 origin = "task",
             )
         )
 
-        val result = engine.runOnce(
+        val result = engine.runOnceWithAutomationGuardsHeld(
             conversationId = conversationId,
             userText = task.prompt,
             modelId = task.modelId,
-            systemPromptOverride = task.systemPrompt ?: "",
+            // null hands prompt resolution back to the conversation, which carries the task's saved
+            // prompt id. Without a saved prompt the literal text (blank = no prompt) still wins.
+            systemPromptOverride = if (task.systemPromptId != null) null else task.systemPrompt ?: "",
             foregroundServiceManagedExternally = foregroundServiceManagedExternally,
+            requestKind = "task",
         )
         val outcome = when (result) {
-            is TaskExecutionEngine.Result.Success -> {
-                try {
-                    titleExecutionConversation(conversationId, result.text)
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    DebugLog.e(
-                        "TaskManager",
-                        "Task execution title update failed for conversation=$conversationId",
-                        e,
-                    )
-                }
+            is TaskExecutionEngine.Result.Success ->
                 ExecutionResult.Success(conversationId, result.text)
-            }
             is TaskExecutionEngine.Result.Busy ->
                 ExecutionResult.Deferred(conversationId, result.reason)
             is TaskExecutionEngine.Result.Failure -> {
@@ -423,6 +463,22 @@ class TaskManager(
             }
         }
         if (finishManualSchedule) finishManualRunLocked(task.id)
+        if (outcome is ExecutionResult.Success) {
+            // Title generation is post-processing, not part of the Task's running reservation.
+            scope.launch {
+                try {
+                    titleExecutionConversation(conversationId, outcome.response)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    DebugLog.e(
+                        "TaskManager",
+                        "Task execution title update failed for conversation=$conversationId",
+                        e,
+                    )
+                }
+            }
+        }
         return outcome
     }
 
@@ -432,11 +488,11 @@ class TaskManager(
      * process-interrupted attempts are terminal for this occurrence.
      */
     private suspend fun recoverExistingExecution(existing: ChatEntity): ExecutionResult? {
-        val recoverySnapshot = conversationRepository.withProviderContextSnapshot {
+        val recoverySnapshot = conversationRepository.withReadSnapshot { reader ->
             val topology =
-                conversationRepository.getProviderContextTopologySnapshot(existing.id)
-                    ?: return@withProviderContextSnapshot null
-            if (topology.messages.isEmpty()) return@withProviderContextSnapshot null
+                reader.getProviderContextTopologySnapshot(existing.id)
+                    ?: return@withReadSnapshot null
+            if (topology.messages.isEmpty()) return@withReadSnapshot null
             val assistantId = topology.messages
                 .asSequence()
                 .filter {
@@ -445,7 +501,7 @@ class TaskManager(
                 .filterNot { isSyntheticToolMessageId(it.id) }
                 .maxByOrNull { it.timestamp }
                 ?.id
-            topology to assistantId?.let { conversationRepository.getMessage(it) }
+            topology to assistantId?.let { reader.getMessage(it) }
         } ?: return null
         val (topology, assistant) = recoverySnapshot
         return when (assistant?.status) {

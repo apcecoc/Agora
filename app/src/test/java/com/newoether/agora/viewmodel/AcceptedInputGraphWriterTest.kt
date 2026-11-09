@@ -1,7 +1,9 @@
 package com.newoether.agora.viewmodel
 
+import com.newoether.agora.data.ConversationSettings
 import com.newoether.agora.data.local.MessageContextTopology
 import com.newoether.agora.data.local.MessageEntity
+import com.newoether.agora.data.local.NewChatPersistEntity
 import com.newoether.agora.data.local.ProviderContextTopologySnapshot
 import com.newoether.agora.data.local.RunEntity
 import com.newoether.agora.data.local.RunGraphCommit
@@ -14,6 +16,8 @@ import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.mockk
 import kotlinx.coroutines.test.runTest
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.Json
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
@@ -36,13 +40,17 @@ class AcceptedInputGraphWriterTest {
         lateinit var insertedMessages: List<MessageEntity>
         lateinit var insertedSelections: Map<String?, String>
         lateinit var insertedConversationModelId: String
+        var insertedAt = -1L
+        var insertedTouchPolicy = true
         coEvery {
-            repository.createRunWithMessages(any(), any(), any(), any(), any())
+            repository.createRunWithMessages(any(), any(), any(), any(), any(), any())
         } coAnswers {
             insertedRun = firstArg()
             insertedMessages = secondArg()
             insertedSelections = thirdArg()
             insertedConversationModelId = arg(3)
+            insertedAt = arg(4)
+            insertedTouchPolicy = arg(5)
             RunGraphCommit(insertedMessages, insertedSelections, emptyMap())
         }
 
@@ -55,9 +63,14 @@ class AcceptedInputGraphWriterTest {
                 userText = "prompt",
                 modelId = "OpenAI:model",
                 userTimestamp = 100L,
+                touchConversationOnAdmission = false,
+                source = com.newoether.agora.model.MessageSource.TASK,
             ),
             beforeRoomCommit = { beforeCommitCalled = true },
         )
+
+        assertEquals("""{"kind":"task"}""", result.userMessage.sourceJson)
+        assertNull(result.modelMessage.sourceJson)
 
         assertEquals("selected-run", insertedRun.parentRunId)
         assertEquals("selected", result.userMessage.parentId)
@@ -66,24 +79,38 @@ class AcceptedInputGraphWriterTest {
         assertEquals("new-user", insertedSelections["selected"])
         assertEquals("new-model", insertedSelections["new-user"])
         assertEquals("OpenAI:model", insertedConversationModelId)
+        assertEquals(100L, insertedAt)
+        assertEquals(false, insertedTouchPolicy)
         assertEquals(insertedSelections, result.messageSelections)
         assertEquals(true, beforeCommitCalled)
-        coVerify(exactly = 0) { repository.getMessagesForConversationSnapshot(any()) }
     }
 
     @Test
     fun newConversation_startsAtTheRootWithoutReadingAStaleGraph() = runTest {
         val repository = mockk<ConversationRepository>()
+        val capturedSettings = ConversationSettings(
+            temperature = 0.3f,
+            maxTokens = 640,
+            lowContextModeEnabled = true,
+        )
+        var insertedSettingsJson: String? = null
+        var insertedPersistSnapshot: NewChatPersistEntity? = null
         coEvery {
             repository.createConversationRunWithMessages(
-                any(), any(), any(), any(), any(), any(),
+                any(), any(), any(), any(), any(), any(), any(), any(),
             )
         } coAnswers {
             val messages = thirdArg<List<MessageEntity>>()
             val selections = arg<Map<String?, String>>(3)
+            insertedSettingsJson = arg(5)
+            insertedPersistSnapshot = arg(6)
             RunGraphCommit(messages, selections, emptyMap())
         }
 
+        val persistSnapshot = NewChatPersistEntity(
+            modelId = "OpenAI:model",
+            draftText = "prompt",
+        )
         val result = AcceptedInputGraphWriter(repository).commit(
             AcceptedInputGraphWriter.Request(
                 inputEffect = inputEffect("conversation", "run"),
@@ -92,15 +119,25 @@ class AcceptedInputGraphWriterTest {
                 userText = "prompt",
                 modelId = "OpenAI:model",
                 userTimestamp = 100L,
+                touchConversationOnAdmission = true,
                 newConversation = com.newoether.agora.data.local.ChatEntity(
                     id = "conversation",
                     title = "New",
                 ),
+                newConversationSettings = capturedSettings,
+                newChatPersistSnapshot = persistSnapshot,
             )
         )
 
         assertNull(result.userMessage.parentId)
+        // Typed input carries no automatic source.
+        assertNull(result.userMessage.sourceJson)
         assertEquals("model", result.messageSelections["user"])
+        assertEquals(
+            capturedSettings,
+            Json.decodeFromString<ConversationSettings>(checkNotNull(insertedSettingsJson)),
+        )
+        assertEquals(persistSnapshot, insertedPersistSnapshot)
     }
 
     private fun message(

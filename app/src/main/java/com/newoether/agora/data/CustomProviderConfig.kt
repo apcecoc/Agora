@@ -51,6 +51,12 @@ data class CustomProviderConfig(
     val legacyNames: Set<String> = emptySet(),
     /** Retained across protocol changes, but consumed only while [protocol] is OpenAI. */
     val responsesApiEnabled: Boolean = false,
+    /**
+     * Retained across protocol changes. The enabled flag is the provider's prompt cache switch:
+     * Anthropic consumes it as cache_control, OpenAI as prompt_cache_key. TTL is Anthropic-only.
+     */
+    val anthropicCacheEnabled: Boolean = true,
+    val anthropicCacheTtl: String = "1h",
 ) {
     val providerId: String
         get() = id.takeIf(CustomProviderIdentityPolicy::isStableId) ?: name
@@ -68,6 +74,69 @@ fun isOpenAiProtocolProvider(
             (it.name == providerName || it.ownsIdentity(providerName)) &&
                 it.protocol == CustomEndpointProtocol.OPENAI
         }
+fun isAnthropicProtocolProvider(
+    providerName: String,
+    customProviders: List<CustomProviderConfig>,
+): Boolean = providerName == Constants.PROVIDER_ANTHROPIC || customProviders.any {
+    (it.name == providerName || it.ownsIdentity(providerName)) &&
+        it.protocol == CustomEndpointProtocol.ANTHROPIC
+}
+fun isAnthropicCacheEnabledForProvider(
+    providerName: String,
+    builtInEnabled: Boolean,
+    customProviders: List<CustomProviderConfig>,
+): Boolean = when (providerName) {
+    Constants.PROVIDER_ANTHROPIC -> builtInEnabled
+    else -> customProviders.firstOrNull {
+        it.name == providerName || it.ownsIdentity(providerName)
+    }?.let { it.protocol == CustomEndpointProtocol.ANTHROPIC && it.anthropicCacheEnabled } == true
+}
+/** Whether the provider exposes the user-facing prompt cache switch. */
+fun supportsPromptCacheSetting(
+    providerName: String,
+    customProviders: List<CustomProviderConfig>,
+): Boolean = isAnthropicProtocolProvider(providerName, customProviders) || customProviders.any {
+    (it.name == providerName || it.ownsIdentity(providerName)) &&
+        it.protocol == CustomEndpointProtocol.OPENAI
+}
+
+/**
+ * Whether OpenAI-protocol requests carry prompt_cache_key. Without it, OpenAI and relays such
+ * as sub2api route identical prefixes to arbitrary cache shards, so hits become random.
+ * The official provider always sends it; custom OpenAI endpoints follow their cache switch.
+ */
+fun isPromptCacheKeyEnabledForProvider(
+    providerName: String,
+    customProviders: List<CustomProviderConfig>,
+): Boolean = when (providerName) {
+    Constants.PROVIDER_OPENAI -> true
+    else -> customProviders.firstOrNull {
+        it.name == providerName || it.ownsIdentity(providerName)
+    }?.let { it.protocol == CustomEndpointProtocol.OPENAI && it.anthropicCacheEnabled } == true
+}
+
+/** Cache switch state shown in settings, independent of the request protocol. */
+fun isPromptCacheSettingEnabledForProvider(
+    providerName: String,
+    builtInAnthropicEnabled: Boolean,
+    customProviders: List<CustomProviderConfig>,
+): Boolean = when (providerName) {
+    Constants.PROVIDER_ANTHROPIC -> builtInAnthropicEnabled
+    else -> customProviders.firstOrNull {
+        it.name == providerName || it.ownsIdentity(providerName)
+    }?.anthropicCacheEnabled ?: true
+}
+
+fun anthropicCacheTtlForProvider(
+    providerName: String,
+    builtInTtl: String,
+    customProviders: List<CustomProviderConfig>,
+): String = when (providerName) {
+    Constants.PROVIDER_ANTHROPIC -> builtInTtl
+    else -> customProviders.firstOrNull {
+        it.name == providerName || it.ownsIdentity(providerName)
+    }?.anthropicCacheTtl ?: "1h"
+}
 
 fun isResponsesApiEnabledForProvider(
     providerName: String,

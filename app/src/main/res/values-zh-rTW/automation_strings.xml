@@ -12,7 +12,7 @@
     <string name="task_run_now">立即執行</string>
     <string name="task_delete">刪除任務</string>
     <string name="task_delete_confirm">刪除「%1$s」及其所有執行記錄？</string>
-    <string name="import_conversation_graph_counts">對話（%1$d）· 任務（%2$d）· 迴圈（%3$d）</string>
+    <string name="import_conversation_graph_counts">對話（%1$d）· 任務（%2$d）</string>
     <string name="task_enabled">按排程執行</string>
     <string name="task_enabled_desc">關閉後，只會在你點選「立即執行」時執行任務。</string>
     <string name="task_enabled_needs_schedule">請先選擇排程。</string>
@@ -58,6 +58,7 @@
     <string name="task_status_unknown">等待中</string>
     <string name="task_running_notification">正在執行排程任務…</string>
     <string name="loop_running_notification">正在執行對話迴圈…</string>
+    <string name="auto_backup_running_notification">正在備份資料…</string>
     <string name="loop_running">迴圈執行中…</string>
     <string name="loop_next_in">%1$s 後再次執行</string>
     <string name="loop_cycle">循環 %1$d/%2$d</string>
@@ -67,7 +68,12 @@
     <string name="settings_automation_desc">任務、對話迴圈與排程精度</string>
     <string name="automation_ai_tools">存取任務與迴圈</string>
     <string name="automation_ai_tools_desc">允許模型建立和管理任務，或啟動、停止對話迴圈。預設關閉。</string>
-    <string name="automation_scheduling">排程</string>
+    <string name="automation_background_execution">背景執行</string>
+    <string name="automation_wake_lock">喚醒鎖</string>
+    <string name="automation_wake_lock_desc">讓每次任務或迴圈執行期間保持喚醒。WorkManager 已保障一般排程工作；開啟這項額外喚醒鎖會增加耗電。</string>
+    <string name="automation_battery_optimization">電池最佳化</string>
+    <string name="automation_battery_optimization_ignored_desc">未最佳化；Android 可能允許更多背景工作，但製造商的背景限制仍可能生效</string>
+    <string name="automation_battery_optimization_active_desc">已最佳化；Android 可能延遲背景工作，且製造商的背景限制仍可能生效</string>
     <string name="automation_exact_execution">精確執行</string>
     <string name="automation_exact_execution_on_desc">為任務和迴圈使用精確鬧鐘；Android 仍可能套用系統限制。</string>
     <string name="automation_exact_execution_off_desc">使用較省電的非精確鬧鐘；開啟後需授予「鬧鐘與提醒」權限。</string>

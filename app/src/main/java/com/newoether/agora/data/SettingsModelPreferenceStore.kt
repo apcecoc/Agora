@@ -1,7 +1,9 @@
 package com.newoether.agora.data
 
 import androidx.datastore.core.DataStore
+import androidx.datastore.core.DataMigration
 import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.MutablePreferences
 import androidx.datastore.preferences.core.edit
 import com.newoether.agora.util.Constants
 import com.newoether.agora.util.DebugLog
@@ -10,11 +12,68 @@ import kotlinx.coroutines.flow.map
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
+/** Preserve the old presentation once, before any settings read or edit is admitted. */
+internal val modelProviderNamesMigration = object : DataMigration<Preferences> {
+    override suspend fun shouldMigrate(currentData: Preferences): Boolean =
+        currentData[MODEL_PROVIDER_NAMES_JSON] == null
+
+    override suspend fun migrate(currentData: Preferences): Preferences {
+        if (!shouldMigrate(currentData)) return currentData
+        val aliases = runCatching {
+            Json.decodeFromString<Map<String, String>>(currentData[MODEL_ALIASES_JSON] ?: "{}")
+        }.getOrDefault(emptyMap())
+        return currentData.toMutablePreferences().apply {
+            this[MODEL_PROVIDER_NAMES_JSON] = Json.encodeToString(
+                aliases.filterValues(String::isNotBlank).mapValues { false },
+            )
+        }
+    }
+
+    override suspend fun cleanUp() = Unit
+}
+
 internal class SettingsModelPreferenceStore(
     private val dataStore: DataStore<Preferences>,
     private val json: Json,
 ) {
+    val localModelIdleRetentionMinutes: Flow<Int> = dataStore.data.map {
+        normalizeLocalModelIdleRetentionMinutes(it[LOCAL_MODEL_IDLE_RETENTION_MINUTES])
+    }
+    val localLowContextModeEnabled: Flow<Boolean> = dataStore.data.map {
+        it[LOCAL_LOW_CONTEXT_MODE_ENABLED] ?: DEFAULT_LOCAL_LOW_CONTEXT_MODE_ENABLED
+    }
+    suspend fun saveLocalModelIdleRetentionMinutes(minutes: Int) {
+        dataStore.edit { it[LOCAL_MODEL_IDLE_RETENTION_MINUTES] = normalizeLocalModelIdleRetentionMinutes(minutes) }
+    }
+    suspend fun saveLocalLowContextModeEnabled(enabled: Boolean) {
+        dataStore.edit { it[LOCAL_LOW_CONTEXT_MODE_ENABLED] = enabled }
+    }
     val selectedModel: Flow<String> = dataStore.data.map { it[SELECTED_MODEL] ?: Constants.EXAMPLE_MODEL_ID }
+    val anthropicCacheEnabled: Flow<Boolean> = dataStore.data.map { it[ANTHROPIC_CACHE_ENABLED] ?: true }
+    val anthropicCacheTtl: Flow<String> = dataStore.data.map { it[ANTHROPIC_CACHE_TTL] ?: "1h" }
+
+    suspend fun saveAnthropicCacheEnabled(enabled: Boolean) {
+        dataStore.edit { it[ANTHROPIC_CACHE_ENABLED] = enabled }
+    }
+
+    suspend fun saveAnthropicCacheTtl(ttl: String) {
+        require(ttl == "5m" || ttl == "1h") { "Invalid Anthropic cache duration" }
+        dataStore.edit { it[ANTHROPIC_CACHE_TTL] = ttl }
+    }
+
+    suspend fun updateCustomProviderCache(providerId: String, enabled: Boolean? = null, ttl: String? = null) {
+        require(ttl == null || ttl == "5m" || ttl == "1h") { "Invalid Anthropic cache duration" }
+        dataStore.edit { prefs ->
+            val current = json.decodeFromString<List<CustomProviderConfig>>(prefs[CUSTOM_PROVIDERS_JSON] ?: "[]")
+            val updated = current.map { config ->
+                if (config.providerId == providerId) config.copy(
+                    anthropicCacheEnabled = enabled ?: config.anthropicCacheEnabled,
+                    anthropicCacheTtl = ttl ?: config.anthropicCacheTtl,
+                ) else config
+            }
+            if (updated != current) prefs[CUSTOM_PROVIDERS_JSON] = json.encodeToString(updated)
+        }
+    }
 
     val providerBaseUrls: Flow<Map<String, String>> = dataStore.data.map { pref ->
         val jsonStr = pref[PROVIDER_BASE_URLS] ?: "{}"
@@ -40,6 +99,59 @@ internal class SettingsModelPreferenceStore(
         dataStore.data.map { it[CUSTOM_MODELS] ?: emptySet() }
 
     val enabledModels: Flow<Set<String>> = dataStore.data.map { it[ENABLED_MODELS] ?: emptySet() }
+    val subagentEnabledModels: Flow<Set<String>?> = dataStore.data.map { it[SUBAGENT_ENABLED_MODELS] }
+    val subagentRecommendedModel: Flow<String?> = dataStore.data.map { it[SUBAGENT_RECOMMENDED_MODEL] }
+    val subagentModelIds: Flow<Set<String>> = dataStore.data.map { it.allowedSubagentModels() }
+
+    private fun Preferences.allowedSubagentModels(): Set<String> {
+        val enabled = this[ENABLED_MODELS] ?: emptySet()
+        return this[SUBAGENT_ENABLED_MODELS].orEmpty().intersect(enabled)
+    }
+
+    private fun MutablePreferences.clearInvalidSubagentRecommendation() {
+        if (this[SUBAGENT_RECOMMENDED_MODEL] !in allowedSubagentModels()) {
+            remove(SUBAGENT_RECOMMENDED_MODEL)
+        }
+    }
+
+    suspend fun saveSubagentEnabledModels(models: Set<String>?, merge: Boolean = false) {
+        dataStore.edit { prefs ->
+            when {
+                models == null && merge -> Unit
+                models == null -> prefs.remove(SUBAGENT_ENABLED_MODELS)
+                merge -> prefs[SUBAGENT_ENABLED_MODELS] =
+                    prefs[SUBAGENT_ENABLED_MODELS].orEmpty() + models
+                else -> prefs[SUBAGENT_ENABLED_MODELS] = models
+            }
+            prefs.clearInvalidSubagentRecommendation()
+        }
+    }
+
+    suspend fun addSubagentModels(models: Set<String>) {
+        dataStore.edit { prefs ->
+            val additions = models.intersect(prefs[ENABLED_MODELS].orEmpty())
+            if (additions.isEmpty()) return@edit
+            prefs[SUBAGENT_ENABLED_MODELS] =
+                prefs[SUBAGENT_ENABLED_MODELS].orEmpty() + additions
+        }
+    }
+
+    suspend fun removeSubagentModel(model: String) {
+        dataStore.edit { prefs ->
+            prefs[SUBAGENT_ENABLED_MODELS] =
+                prefs[SUBAGENT_ENABLED_MODELS].orEmpty() - model
+            prefs.clearInvalidSubagentRecommendation()
+        }
+    }
+
+    suspend fun saveSubagentRecommendedModel(model: String?) {
+        dataStore.edit { prefs ->
+            // A settings picker may have become stale while it was open.
+            if (model != null && model !in prefs.allowedSubagentModels()) return@edit
+            if (model == null) prefs.remove(SUBAGENT_RECOMMENDED_MODEL)
+            else prefs[SUBAGENT_RECOMMENDED_MODEL] = model
+        }
+    }
 
     val modelAliases: Flow<Map<String, String>> = dataStore.data.map { pref ->
         val jsonStr = pref[MODEL_ALIASES_JSON] ?: "{}"
@@ -60,6 +172,7 @@ internal class SettingsModelPreferenceStore(
         val jsonStr = pref[LOCAL_CHAT_MODELS_JSON] ?: "[]"
         try { json.decodeFromString<List<LocalChatModelConfig>>(jsonStr) } catch (e: Exception) { emptyList() }
     }
+
     val customProviders: Flow<List<CustomProviderConfig>> = dataStore.data.map { pref ->
         val jsonStr = pref[CUSTOM_PROVIDERS_JSON] ?: "[]"
         try {
@@ -170,7 +283,7 @@ internal class SettingsModelPreferenceStore(
         dataStore.edit { it[CUSTOM_MODELS] = models }
     }
 
-    suspend fun addCustomModel(modelId: String, alias: String) {
+    suspend fun addCustomModel(modelId: String, alias: String, showProviderName: Boolean = true) {
         dataStore.edit { prefs ->
             prefs[CUSTOM_MODELS] = (prefs[CUSTOM_MODELS] ?: emptySet()) + modelId
             val enabledModels = (prefs[ENABLED_MODELS] ?: emptySet()) + modelId
@@ -192,6 +305,7 @@ internal class SettingsModelPreferenceStore(
                 aliases[modelId] = alias.trim()
             }
             prefs[MODEL_ALIASES_JSON] = json.encodeToString(aliases)
+            prefs.setModelProviderName(modelId, showProviderName)
         }
     }
 
@@ -199,6 +313,7 @@ internal class SettingsModelPreferenceStore(
         oldModelId: String,
         newModelId: String?,
         alias: String,
+        showProviderName: Boolean? = null,
     ) {
         if (oldModelId == newModelId) {
             dataStore.edit { prefs ->
@@ -210,6 +325,7 @@ internal class SettingsModelPreferenceStore(
                     emptyMap()
                 }.replaceCustomModelAlias(oldModelId, newModelId, alias)
                 prefs[MODEL_ALIASES_JSON] = json.encodeToString(aliases)
+                if (showProviderName != null) prefs.setModelProviderName(oldModelId, showProviderName)
             }
             return
         }
@@ -235,6 +351,13 @@ internal class SettingsModelPreferenceStore(
             }.replaceCustomModelAlias(oldModelId, newModelId, alias)
             prefs[MODEL_ALIASES_JSON] = json.encodeToString(aliases)
 
+            val visibility = json.decodeFromString<MutableMap<String, Boolean>>(
+                prefs[MODEL_PROVIDER_NAMES_JSON] ?: "{}",
+            )
+            val previousVisibility = visibility.remove(oldModelId) ?: true
+            if (newModelId != null) visibility[newModelId] = showProviderName ?: previousVisibility
+            prefs[MODEL_PROVIDER_NAMES_JSON] = json.encodeToString(visibility)
+
             if (prefs[SELECTED_MODEL] == oldModelId) {
                 prefs[SELECTED_MODEL] =
                     newModelId ?: updatedEnabled.firstOrNull().orEmpty()
@@ -244,6 +367,9 @@ internal class SettingsModelPreferenceStore(
                 (prefs[IMAGE_TRANSCRIPTION_ENABLED_MODELS] ?: emptySet())
                     .replaceModelReference(oldModelId, newModelId)
             prefs[IMAGE_TRANSCRIPTION_ENABLED_MODELS] = updatedTranscriptionTargets
+            prefs[SUBAGENT_ENABLED_MODELS]?.let {
+                prefs[SUBAGENT_ENABLED_MODELS] = it.replaceModelReference(oldModelId, newModelId)
+            }
 
             fun replaceNullableReference(key: androidx.datastore.preferences.core.Preferences.Key<String>) {
                 when (
@@ -261,15 +387,23 @@ internal class SettingsModelPreferenceStore(
             replaceNullableReference(IMAGE_TRANSCRIPTION_MODEL)
             replaceNullableReference(IMAGE_GEN_MODEL)
             replaceNullableReference(CONTEXT_COMPACT_MODEL)
+            replaceNullableReference(SUBAGENT_RECOMMENDED_MODEL)
         }
     }
 
     suspend fun saveEnabledModels(models: Set<String>) {
-        dataStore.edit { it[ENABLED_MODELS] = models }
+        dataStore.edit {
+            it[ENABLED_MODELS] = models
+            it.clearInvalidSubagentRecommendation()
+        }
     }
 
     suspend fun saveModelAliases(aliases: Map<String, String>) {
         dataStore.edit { it[MODEL_ALIASES_JSON] = json.encodeToString(aliases) }
+    }
+
+    val modelProviderNames: Flow<Map<String, Boolean>> = dataStore.data.map { pref ->
+        json.decodeFromString(pref[MODEL_PROVIDER_NAMES_JSON] ?: "{}")
     }
 
     /**
@@ -277,7 +411,7 @@ internal class SettingsModelPreferenceStore(
      * the complete alias map from a StateFlow snapshot: that snapshot can predate startup
      * identity migration and would restore legacy custom-provider keys after migration commits.
      */
-    suspend fun updateModelAlias(modelId: String, alias: String) {
+    suspend fun updateModelAlias(modelId: String, alias: String, showProviderName: Boolean? = null) {
         dataStore.edit { prefs ->
             val aliases = prefs.mutableModelAliasesOrNull() ?: return@edit
             if (alias.isBlank()) {
@@ -286,6 +420,24 @@ internal class SettingsModelPreferenceStore(
                 aliases[modelId] = alias.trim()
             }
             prefs[MODEL_ALIASES_JSON] = json.encodeToString(aliases)
+            if (showProviderName != null) prefs.setModelProviderName(modelId, showProviderName)
+        }
+    }
+
+    private fun MutablePreferences.setModelProviderName(modelId: String, visible: Boolean) {
+        val visibility = json.decodeFromString<MutableMap<String, Boolean>>(
+            this[MODEL_PROVIDER_NAMES_JSON] ?: "{}",
+        )
+        visibility[modelId] = visible
+        this[MODEL_PROVIDER_NAMES_JSON] = json.encodeToString(visibility)
+    }
+
+    suspend fun saveModelProviderNames(values: Map<String, Boolean>, replace: Boolean = true) {
+        dataStore.edit { prefs ->
+            val current = if (replace) emptyMap() else json.decodeFromString<Map<String, Boolean>>(
+                prefs[MODEL_PROVIDER_NAMES_JSON] ?: "{}",
+            )
+            prefs[MODEL_PROVIDER_NAMES_JSON] = json.encodeToString(current + values)
         }
     }
 
@@ -308,7 +460,7 @@ internal class SettingsModelPreferenceStore(
         }
     }
 
-    /** Removes only aliases owned by [providerId], preserving concurrent unrelated edits. */
+    /** Removes only display preferences owned by [providerId], preserving unrelated edits. */
     suspend fun removeModelAliasesForProvider(providerId: String) {
         val prefix = "$providerId:"
         dataStore.edit { prefs ->
@@ -316,6 +468,11 @@ internal class SettingsModelPreferenceStore(
             if (aliases.keys.removeAll { it.startsWith(prefix) }) {
                 prefs[MODEL_ALIASES_JSON] = json.encodeToString(aliases)
             }
+            val visibility = json.decodeFromString<MutableMap<String, Boolean>>(
+                prefs[MODEL_PROVIDER_NAMES_JSON] ?: "{}",
+            )
+            visibility.keys.removeAll { it.startsWith(prefix) }
+            prefs[MODEL_PROVIDER_NAMES_JSON] = json.encodeToString(visibility)
         }
     }
 
@@ -404,14 +561,7 @@ internal class SettingsModelPreferenceStore(
                 decoded,
                 newId = { provider -> CustomProviderIdentityPolicy.legacyId(provider.name) },
             )
-            // The current display name remains a safe compatibility input even when an
-            // intermediate build cleared legacyNames too early. Custom names are unique and may
-            // not shadow built-ins, so this idempotently recovers name-keyed aliases/references.
-            migrations = (
-                normalization.migrations + normalization.providers.map { provider ->
-                    CustomProviderIdentityMigration(provider.name, provider.id)
-                }
-            ).distinct()
+            migrations = normalization.migrations
             val migrationMap = migrations.associate {
                 it.legacyReference to it.providerId
             }
@@ -425,6 +575,9 @@ internal class SettingsModelPreferenceStore(
             val rawCustomModels = prefs[CUSTOM_MODELS]
             val rawEnabledModels = prefs[ENABLED_MODELS]
             val rawTranscriptionModels = prefs[IMAGE_TRANSCRIPTION_ENABLED_MODELS]
+            val rawSubagentModels = prefs[SUBAGENT_ENABLED_MODELS]
+            val subagentModels = rawSubagentModels?.mapTo(linkedSetOf(), ::remap).orEmpty()
+            if (rawSubagentModels != null) prefs[SUBAGENT_ENABLED_MODELS] = subagentModels
             val customModels = rawCustomModels?.mapTo(linkedSetOf(), ::remap).orEmpty()
             val enabledModels = rawEnabledModels?.mapTo(linkedSetOf(), ::remap).orEmpty()
             val transcriptionModels = rawTranscriptionModels
@@ -438,6 +591,7 @@ internal class SettingsModelPreferenceStore(
             modelReferencesChanged =
                 (rawCustomModels != null && rawCustomModels != customModels) ||
                 (rawEnabledModels != null && rawEnabledModels != enabledModels) ||
+                (rawSubagentModels != null && rawSubagentModels != subagentModels) ||
                 (rawTranscriptionModels != null &&
                     rawTranscriptionModels != transcriptionModels)
             val scalarKeys = listOf(
@@ -446,6 +600,7 @@ internal class SettingsModelPreferenceStore(
                 IMAGE_TRANSCRIPTION_MODEL,
                 IMAGE_GEN_MODEL,
                 CONTEXT_COMPACT_MODEL,
+                SUBAGENT_RECOMMENDED_MODEL,
             )
             val scalarModels = scalarKeys.mapNotNull { key ->
                 prefs[key]?.let { modelId ->
@@ -468,14 +623,15 @@ internal class SettingsModelPreferenceStore(
             val aliases = runCatching {
                 json.decodeFromString<Map<String, String>>(prefs[MODEL_ALIASES_JSON] ?: "{}")
             }.getOrNull()
-            val remappedAliases = aliases?.let { remapModelAliases(it, migrationMap) }
+            val remappedAliases = aliases?.let { remapModelPreferenceKeys(it, migrationMap) }
             val repairedAliases = remappedAliases?.let {
-                repairOrphanedCustomProviderAliases(
+                repairOrphanedCustomProviderPreferenceKeys(
                     aliases = it,
                     knownModelReferences = buildList {
                         addAll(customModels)
                         addAll(enabledModels)
                         addAll(transcriptionModels)
+                        addAll(subagentModels)
                         addAll(scalarModels)
                         remappedCatalogs?.values?.forEach(::addAll)
                     },
@@ -487,6 +643,18 @@ internal class SettingsModelPreferenceStore(
             if (repairedAliases != null) {
                 prefs[MODEL_ALIASES_JSON] = json.encodeToString(repairedAliases)
             }
+            val visibility = json.decodeFromString<Map<String, Boolean>>(
+                prefs[MODEL_PROVIDER_NAMES_JSON] ?: "{}",
+            )
+            val remappedVisibility = remapModelPreferenceKeys(visibility, migrationMap)
+            prefs[MODEL_PROVIDER_NAMES_JSON] = json.encodeToString(
+                repairOrphanedCustomProviderPreferenceKeys(
+                    aliases = remappedVisibility,
+                    knownModelReferences = customModels + enabledModels + transcriptionModels + subagentModels +
+                        scalarModels + remappedCatalogs.orEmpty().values.flatten(),
+                    activeProviderIds = normalization.providers.mapTo(linkedSetOf()) { it.providerId },
+                ),
+            )
             if (
                 providersChanged || modelReferencesChanged ||
                 repairedAliases != aliases
@@ -525,7 +693,24 @@ internal class SettingsModelPreferenceStore(
     }
 
     suspend fun saveLocalChatModels(models: List<LocalChatModelConfig>) {
-        dataStore.edit { it[LOCAL_CHAT_MODELS_JSON] = json.encodeToString(models) }
+        dataStore.edit { prefs ->
+            val previous = json.decodeFromString<List<LocalChatModelConfig>>(
+                prefs[LOCAL_CHAT_MODELS_JSON] ?: "[]",
+            )
+            val visibility = json.decodeFromString<MutableMap<String, Boolean>>(
+                prefs[MODEL_PROVIDER_NAMES_JSON] ?: "{}",
+            )
+            val byId = models.associateBy(LocalChatModelConfig::id)
+            previous.forEach { old ->
+                val replacement = byId[old.id]
+                if (replacement?.modelId != old.modelId) {
+                    val showProviderName = visibility.remove("Local:${old.modelId}") ?: true
+                    if (replacement != null) visibility["Local:${replacement.modelId}"] = showProviderName
+                }
+            }
+            prefs[LOCAL_CHAT_MODELS_JSON] = json.encodeToString(models)
+            prefs[MODEL_PROVIDER_NAMES_JSON] = json.encodeToString(visibility)
+        }
     }
     suspend fun saveCustomProviders(providers: List<CustomProviderConfig>) {
         val normalized = CustomProviderIdentityPolicy.normalize(

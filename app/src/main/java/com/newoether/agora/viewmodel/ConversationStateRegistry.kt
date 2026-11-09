@@ -1,5 +1,6 @@
 package com.newoether.agora.viewmodel
 
+import com.newoether.agora.model.RunState
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -26,7 +27,11 @@ import java.util.concurrent.ConcurrentHashMap
  * state via [getOrCreate] and operate on it; ChatViewModel mirrors the currently-open
  * conversation's private flows into the global UI StateFlows.
  */
-class ConversationStateRegistry {
+class ConversationStateRegistry(
+    private val onRunStateChanged: (ConversationGenerationState, RunState, RunState?) -> Unit = { _, _, _ -> },
+    private val onRunHandoffFinished: (ConversationGenerationState, Long) -> Unit = { _, _ -> },
+    private val reclaimQueuedAttachments: (List<com.newoether.agora.model.SelectedAttachment>) -> Unit,
+) {
 
     private val states = ConcurrentHashMap<String, ConversationGenerationState>()
     private val pendingDrainHandoffs = ConcurrentHashMap<String, Job>()
@@ -45,6 +50,9 @@ class ConversationStateRegistry {
                 conversationId = it,
                 onRegistryActive = ::markActive,
                 onRegistryIdle = ::markIdle,
+                reclaimQueuedAttachments = reclaimQueuedAttachments,
+                onRunStateChanged = onRunStateChanged,
+                onRunHandoffFinished = onRunHandoffFinished,
             )
         }
         // Re-applying the current binder is idempotent and closes the race where a state is
@@ -149,7 +157,7 @@ class ConversationStateRegistry {
             // Pending guidance has no Room row yet, so state destruction owns its private files.
             // An in-flight lease remains with its cancelling Job until that Job reconciles whether
             // Room committed; deleting it here could race a transaction that just became durable.
-            it.dispose().forEach(QueuedSend::deleteOwnedFiles)
+            it.dispose().forEach(it::discardQueuedSend)
         }
         markIdle(conversationId)
     }
@@ -163,7 +171,7 @@ class ConversationStateRegistry {
         pendingDrainHandoffs.values.forEach(Job::cancel)
         pendingDrainHandoffs.clear()
         states.values.forEach {
-            it.dispose().forEach(QueuedSend::deleteOwnedFiles)
+            it.dispose().forEach(it::discardQueuedSend)
         }
         states.clear()
         _activeConversationIds.value = emptySet()

@@ -6,6 +6,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
@@ -47,12 +48,17 @@ internal object PortableSettingsArchive {
         putEncoded("customModels", sm.customModels.first())
         putEncoded("enabledModels", sm.enabledModels.first())
         putEncoded("modelAliases", sm.modelAliases.first())
+        putEncoded("modelProviderNames", sm.modelProviderNames.first())
         put("contextTokenBudget", JsonPrimitive(sm.maxContextWindow.first()))
         put("visualizeContextRollout", JsonPrimitive(sm.visualizeContextRollout.first()))
         put("contextCompactEnabled", JsonPrimitive(sm.contextCompactEnabled.first()))
         putNullableString("contextCompactModel", sm.contextCompactModel.first())
         put("contextCompactPrompt", JsonPrimitive(sm.contextCompactPrompt.first()))
         put("contextCompactRetainCount", JsonPrimitive(sm.contextCompactRetainCount.first()))
+        put(
+            "contextCompactPreserveSystemPrompt",
+            JsonPrimitive(sm.contextCompactPreserveSystemPrompt.first()),
+        )
         put("contextCompactThresholdPercent", JsonPrimitive(sm.contextCompactThresholdPercent.first()))
         put("codeExecutionEnabled", JsonPrimitive(sm.codeExecutionEnabled.first()))
         put("googleSearchEnabled", JsonPrimitive(sm.googleSearchEnabled.first()))
@@ -63,6 +69,8 @@ internal object PortableSettingsArchive {
         put("openAiServiceTierEnabled", JsonPrimitive(sm.openAiServiceTierEnabled.first()))
         put("openAiServiceTier", JsonPrimitive(sm.openAiServiceTier.first()))
         put("openAiResponsesApiEnabled", JsonPrimitive(sm.openAiResponsesApiEnabled.first()))
+        put("anthropicCacheEnabled", JsonPrimitive(sm.anthropicCacheEnabled.first()))
+        put("anthropicCacheTtl", JsonPrimitive(sm.anthropicCacheTtl.first()))
         putEncoded("providerBaseUrls", sm.providerBaseUrls.first())
         put("titleGenerationEnabled", JsonPrimitive(sm.titleGenerationEnabled.first()))
         putNullableString("titleGenerationModel", sm.titleGenerationModel.first())
@@ -91,6 +99,10 @@ internal object PortableSettingsArchive {
         put("webSearchProvider", JsonPrimitive(sm.webSearchProvider.first()))
         put("webSearchNumResults", JsonPrimitive(sm.webSearchNumResults.first()))
         put("webSearchBaseUrl", JsonPrimitive(sm.webSearchBaseUrl.first()))
+        val imageQuality = sm.imageQuality.settings.first()
+        put("imageQualityMode", JsonPrimitive(imageQuality.mode))
+        put("imageQualityMaxLongEdge", JsonPrimitive(imageQuality.customMaxLongEdge))
+        put("imageQualityJpegQuality", JsonPrimitive(imageQuality.customJpegQuality))
         put("imageGenEnabled", JsonPrimitive(sm.imageGenEnabled.first()))
         putNullableString("imageGenModel", sm.imageGenModel.first())
         put("imageGenSize", JsonPrimitive(sm.imageGenSize.first()))
@@ -98,6 +110,7 @@ internal object PortableSettingsArchive {
         put("searchMatchLimit", JsonPrimitive(sm.searchMatchLimit.first()))
         put("ragThreshold", JsonPrimitive(sm.ragThreshold.first()))
         put("autoCacheEnabled", JsonPrimitive(sm.autoCacheEnabled.first()))
+        put("showUncachedNotification", JsonPrimitive(sm.showUncachedNotification.first()))
         put("autoUpdateCheck", JsonPrimitive(sm.autoUpdateCheck.first()))
 
         put("imageTranscriptionEnabled", JsonPrimitive(sm.imageTranscriptionEnabled.first()))
@@ -111,9 +124,24 @@ internal object PortableSettingsArchive {
 
         put("shellEnabled", JsonPrimitive(sm.shellEnabled.first()))
         put("shellConfirmEnabled", JsonPrimitive(sm.shellConfirmEnabled.first()))
+        put("askUserEnabled", JsonPrimitive(sm.askUserEnabled.first()))
+        put("askUserTimeoutMinutes", JsonPrimitive(sm.askUserTimeoutMinutes.first()))
+        put("todoEnabled", JsonPrimitive(sm.todoEnabled.first()))
+        put("subagentToolsEnabled", JsonPrimitive(sm.subagentToolsEnabled.first()))
+        put("subagentDeleteEnabled", JsonPrimitive(sm.subagentDeleteEnabled.first()))
+        val subagentMaxTotal = sm.subagentMaxTotal.first()
+        put("subagentMaxTotal", JsonPrimitive(subagentMaxTotal))
+        put(
+            "subagentMaxConcurrent",
+            JsonPrimitive(normalizeSubagentMaxConcurrent(sm.subagentMaxConcurrent.first(), subagentMaxTotal)),
+        )
+        put("subagentCapsuleDisplayMode", JsonPrimitive(sm.subagentCapsuleDisplayMode.first()))
+        putEncoded("subagentEnabledModels", sm.subagentEnabledModels.first())
+        putNullableString("subagentRecommendedModel", sm.subagentRecommendedModel.first())
         putEncoded("shellDevices", sm.shellDevices.first().map(ShellDeviceConfig::withoutSecrets))
         put("automationToolsEnabled", JsonPrimitive(sm.automationToolsEnabled.first()))
         put("exactExecutionEnabled", JsonPrimitive(sm.exactExecutionEnabled.first()))
+        put("automationWakeLockEnabled", JsonPrimitive(sm.automationWakeLockEnabled.first()))
         putEncoded("customProviders", sm.customProviders.first())
         putEncoded("mcpServers", sm.mcpServers.first().map(McpServerConfig::withoutSecrets))
 
@@ -126,12 +154,14 @@ internal object PortableSettingsArchive {
 
         put("showDocumentationFab", JsonPrimitive(sm.showDocumentationFab.first()))
         put("themeMode", JsonPrimitive(sm.themeMode.first()))
+        put("amoledEnabled", JsonPrimitive(sm.amoledEnabled.first()))
         put("colorScheme", JsonPrimitive(sm.colorScheme.first()))
         put("dynamicColor", JsonPrimitive(sm.dynamicColor.first()))
         put("blurEffectsEnabled", JsonPrimitive(sm.blurEffectsEnabled.first()))
         put("reduceMotion", JsonPrimitive(sm.reduceMotion.first()))
         put("stickToBottom", JsonPrimitive(sm.stickToBottom.first()))
         put("parseInlineDollarMath", JsonPrimitive(sm.parseInlineDollarMath.first()))
+        put("autoWrapCodeBlocks", JsonPrimitive(sm.autoWrapCodeBlocks.first()))
         put("hapticsEnabled", JsonPrimitive(sm.hapticsEnabled.first()))
         put("detailedTokenUsage", JsonPrimitive(sm.detailedTokenUsage.first()))
         put("toolCallDisplayMode", JsonPrimitive(sm.toolCallDisplayMode.first()))
@@ -182,6 +212,31 @@ internal object PortableSettingsArchive {
         val previousFontPath = sm.customFontPath.first()
         val previousFontName = sm.customFontName.first()
         val previousCustomProviders = sm.customProviders.first()
+        val cacheRecords = listOf(obj) + (obj["customProviders"] as? JsonArray)
+            .orEmpty().mapNotNull { it as? JsonObject }
+        cacheRecords.forEach { record ->
+            record["anthropicCacheTtl"]?.let { value ->
+                require(value is JsonPrimitive && value.isString && value.content in setOf("5m", "1h")) {
+                    "Invalid Anthropic cache duration"
+                }
+            }
+            record["anthropicCacheEnabled"]?.let { value ->
+                require(value is JsonPrimitive && !value.isString && value.booleanOrNull != null) {
+                    "Invalid Anthropic cache switch"
+                }
+            }
+        }
+        obj["imageQualityMode"]?.let { value ->
+            require(value is JsonPrimitive && value.isString) { "Invalid image quality mode" }
+        }
+        listOf("imageQualityMaxLongEdge", "imageQualityJpegQuality").forEach { key ->
+            obj[key]?.let { value ->
+                require(value is JsonPrimitive && !value.isString && value.intOrNull != null) {
+                    "Invalid image quality integer"
+                }
+            }
+        }
+        val importedCacheTtl = obj.string("anthropicCacheTtl")
         val importedProviderIdentities = prepareImportedCustomProviders(
             raw = obj.decode<List<CustomProviderConfig>>("customProviders").orEmpty(),
             existing = previousCustomProviders,
@@ -196,6 +251,8 @@ internal object PortableSettingsArchive {
         )
 
         if (replace) sm.resetPortableSettingsForImport()
+        obj.boolean("anthropicCacheEnabled")?.let { sm.saveAnthropicCacheEnabled(it) }
+        importedCacheTtl?.let { sm.saveAnthropicCacheTtl(it) }
 
         obj.string("selectedModel")?.let { sm.saveSelectedModel(remapModel(it)) }
 
@@ -216,6 +273,12 @@ internal object PortableSettingsArchive {
             val value = if (replace) remapped else sm.modelAliases.first() + remapped
             sm.saveModelAliases(value)
         }
+        obj.decode<Map<String, Boolean>>("modelProviderNames")?.let { imported ->
+            sm.saveModelProviderNames(
+                remapModelPreferenceKeys(imported, importedProviderIdentities.modelReferenceRemap),
+                replace = replace,
+            )
+        }
 
         (obj.int("contextTokenBudget") ?: obj.int("maxContextWindow"))
             ?.let { sm.saveMaxContextWindow(it) }
@@ -226,6 +289,9 @@ internal object PortableSettingsArchive {
         }
         obj.string("contextCompactPrompt")?.let { sm.saveContextCompactPrompt(it) }
         obj.int("contextCompactRetainCount")?.takeIf { it >= 0 }?.let { sm.saveContextCompactRetainCount(it) }
+        obj.boolean("contextCompactPreserveSystemPrompt")?.let {
+            sm.saveContextCompactPreserveSystemPrompt(it)
+        }
         importedContextCompactThresholdPercent(
             obj.int("contextCompactThresholdPercent"),
         )?.let { sm.saveContextCompactThresholdPercent(it) }
@@ -276,7 +342,9 @@ internal object PortableSettingsArchive {
         obj.string("manualSearchMethod")?.let { sm.saveManualSearchMethod(it) }
 
         val remoteModelsElement = obj["remoteEmbeddingModels"] ?: obj["embeddingModels"]
-        if (remoteModelsElement != null || replace) {
+        val hasActiveReference = obj.containsKey("activeRemoteEmbeddingModelId") ||
+            obj.containsKey("activeEmbeddingModelId")
+        if (remoteModelsElement != null || replace || hasActiveReference) {
             val importedRemote = remoteModelsElement
                 ?.let { runCatching { json.decodeFromJsonElement<List<EmbeddingModelConfig>>(it) }.getOrNull() }
                 .orEmpty()
@@ -320,9 +388,12 @@ internal object PortableSettingsArchive {
             }
             val previousActive = sm.activeEmbeddingModelId.first()
             val active = requestedActive
-                ?.takeIf { requested -> finalModels.any { it.id == requested } }
+                ?.takeIf { requested -> finalRemote.any { it.id == requested } }
                 ?: previousActive.takeIf { previous ->
-                    finalModels.any { it.id == previous && it.type == EmbeddingModelType.LOCAL }
+                    finalModels.any {
+                        it.id == previous &&
+                            (it.type == EmbeddingModelType.LOCAL || (!replace && !hasActiveReference))
+                    }
                 }
                 .orEmpty()
             sm.setActiveEmbeddingModelId(active)
@@ -333,6 +404,11 @@ internal object PortableSettingsArchive {
         obj.string("webSearchProvider")?.let { sm.saveWebSearchProvider(it) }
         obj.int("webSearchNumResults")?.let { sm.saveWebSearchNumResults(it) }
         obj.string("webSearchBaseUrl")?.let { sm.saveWebSearchBaseUrl(it) }
+        sm.imageQuality.update(
+            mode = obj.string("imageQualityMode"),
+            customMaxLongEdge = obj.int("imageQualityMaxLongEdge"),
+            customJpegQuality = obj.int("imageQualityJpegQuality"),
+        )
         obj.boolean("imageGenEnabled")?.let { sm.saveImageGenEnabled(it) }
         if (obj.containsKey("imageGenModel")) {
             sm.saveImageGenModel(obj.nullableString("imageGenModel")?.let(::remapModel))
@@ -342,6 +418,7 @@ internal object PortableSettingsArchive {
         obj.int("searchMatchLimit")?.let { sm.saveSearchMatchLimit(it) }
         obj.float("ragThreshold")?.let { sm.saveRagThreshold(it) }
         obj.boolean("autoCacheEnabled")?.let { sm.saveAutoCacheEnabled(it) }
+        obj.boolean("showUncachedNotification")?.let { sm.saveShowUncachedNotification(it) }
         obj.boolean("autoUpdateCheck")?.let { sm.saveAutoUpdateCheck(it) }
 
         obj.boolean("imageTranscriptionEnabled")?.let { sm.saveImageTranscriptionEnabled(it) }
@@ -362,6 +439,25 @@ internal object PortableSettingsArchive {
 
         obj.boolean("shellEnabled")?.let { sm.saveShellEnabled(it) }
         obj.boolean("shellConfirmEnabled")?.let { sm.saveShellConfirmEnabled(it) }
+        obj.boolean("askUserEnabled")?.let { sm.saveAskUserEnabled(it) }
+        obj.int("askUserTimeoutMinutes")?.let { sm.saveAskUserTimeoutMinutes(it) }
+        obj.boolean("todoEnabled")?.let { sm.saveTodoEnabled(it) }
+        obj.boolean("subagentToolsEnabled")?.let { sm.saveSubagentToolsEnabled(it) }
+        obj.boolean("subagentDeleteEnabled")?.let { sm.saveSubagentDeleteEnabled(it) }
+        val subagentMaxTotal = obj.int("subagentMaxTotal")
+        val subagentMaxConcurrent = obj.int("subagentMaxConcurrent")
+        if (subagentMaxTotal != null || subagentMaxConcurrent != null) {
+            sm.saveSubagentLimits(subagentMaxTotal, subagentMaxConcurrent)
+        }
+        obj.string("subagentCapsuleDisplayMode")?.let { sm.saveSubagentCapsuleDisplayMode(it) }
+        obj.decode<Set<String>>("subagentEnabledModels")?.let { imported ->
+            sm.saveSubagentEnabledModels(imported.mapTo(linkedSetOf(), ::remapModel), merge = !replace)
+        }
+        obj.nullableString("subagentRecommendedModel")?.let(::remapModel)?.let { recommended ->
+            if (recommended in sm.subagentModelIds.first()) {
+                sm.saveSubagentRecommendedModel(recommended)
+            }
+        }
         val shellElement = obj["shellDevices"]
         if (shellElement != null || replace) {
             val decoded = shellElement
@@ -377,6 +473,10 @@ internal object PortableSettingsArchive {
                     } else {
                         existing?.sshPassword.orEmpty()
                     },
+                    // Private keys were introduced after secrets moved out of structural settings.
+                    // Even legacy mode cannot authorize a settings-embedded private key.
+                    sshPrivateKey = existing?.sshPrivateKey.orEmpty(),
+                    sshKeyPassphrase = existing?.sshKeyPassphrase.orEmpty(),
                 )
             }
             sm.saveShellDevices(
@@ -385,6 +485,9 @@ internal object PortableSettingsArchive {
         }
         obj.boolean("automationToolsEnabled")?.let { sm.saveAutomationToolsEnabled(it) }
         obj.boolean("exactExecutionEnabled")?.let { sm.saveExactExecutionEnabled(it) }
+        obj.boolean("automationWakeLockEnabled")?.let {
+            sm.saveAutomationWakeLockEnabled(it)
+        }
 
         if (obj.containsKey("customProviders")) {
             val value = if (replace) {
@@ -424,12 +527,14 @@ internal object PortableSettingsArchive {
 
         obj.boolean("showDocumentationFab")?.let { sm.saveShowDocumentationFab(it) }
         obj.string("themeMode")?.let { sm.saveThemeMode(it) }
+        obj.boolean("amoledEnabled")?.let { sm.saveAmoledEnabled(it) }
         obj.string("colorScheme")?.let { sm.saveColorScheme(it) }
         obj.boolean("dynamicColor")?.let { sm.saveDynamicColor(it) }
         obj.boolean("blurEffectsEnabled")?.let { sm.saveBlurEffectsEnabled(it) }
         obj.boolean("reduceMotion")?.let { sm.saveReduceMotion(it) }
         obj.boolean("stickToBottom")?.let { sm.saveStickToBottom(it) }
         obj.boolean("parseInlineDollarMath")?.let { sm.saveParseInlineDollarMath(it) }
+        obj.boolean("autoWrapCodeBlocks")?.let { sm.saveAutoWrapCodeBlocks(it) }
         obj.boolean("hapticsEnabled")?.let { sm.saveHapticsEnabled(it) }
         obj.boolean("detailedTokenUsage")?.let { sm.saveDetailedTokenUsage(it) }
         obj.string("toolCallDisplayMode")?.let { sm.saveToolCallDisplayMode(it) }
@@ -557,6 +662,9 @@ internal object PortableSettingsArchive {
         replace: Boolean,
     ): ImportedCustomProviderIdentities {
         val sanitization = CustomProviderNamePolicy.sanitize(raw)
+        require(raw.all { it.anthropicCacheTtl == "5m" || it.anthropicCacheTtl == "1h" }) {
+            "Invalid Anthropic cache duration"
+        }
         val occupied = if (replace) linkedSetOf() else existing
             .mapTo(linkedSetOf(), CustomProviderConfig::providerId)
         val normalized = mutableListOf<CustomProviderConfig>()

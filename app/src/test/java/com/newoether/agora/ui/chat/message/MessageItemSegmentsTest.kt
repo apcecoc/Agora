@@ -1,15 +1,19 @@
 package com.newoether.agora.ui.chat.message
 
 import androidx.compose.ui.unit.dp
+import com.newoether.agora.api.LOCAL_CONTEXT_CAPACITY_ERROR_CODE
 import com.newoether.agora.model.MessageSegment
 import com.newoether.agora.model.ChatMessage
 import com.newoether.agora.model.MessageStatus
 import com.newoether.agora.model.Participant
 import com.newoether.agora.model.ThinkingSegmentDisplayModes
 import com.newoether.agora.model.ToolCallDisplayModes
+
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -22,26 +26,6 @@ class MessageItemSegmentsTest {
         )
 
         assertEquals(null, thoughtDurationMs(segments, fallbackMs = 4_000L))
-    }
-
-    @Test
-    fun uiSegmentPreparationHidesOnlyExactGeminiGoogleSearchTool() {
-        val merged = mergeAdjacentSegments(
-            listOf(
-                MessageSegment(type = "answer", content = "Answer"),
-                MessageSegment(type = "tool", toolName = "google_search", toolResult = "{}"),
-                MessageSegment(type = "tool", toolName = "web_search", toolResult = "{}"),
-                MessageSegment(type = "tool", toolName = "openai_search", toolResult = "{}"),
-                MessageSegment(type = "tool", toolName = "code_execution", toolResult = "{}"),
-                MessageSegment(type = "tool", toolName = "Google_Search", toolResult = "{}"),
-            ),
-        )
-
-        assertEquals(
-            listOf("web_search", "openai_search", "code_execution", "Google_Search"),
-            merged.filter { it.type == "tool" }.map { it.toolName },
-        )
-        assertEquals("Answer", merged.first().content)
     }
 
     @Test
@@ -75,70 +59,104 @@ class MessageItemSegmentsTest {
     }
 
     @Test
-    fun settingsStyleSegmentGroupPositionsCoverSingleFirstMiddleAndLast() {
-        assertEquals(
-            SegmentGroupPosition.SINGLE,
-            segmentGroupPosition(hasPrevious = false, hasNext = false),
-        )
-        assertEquals(
-            SegmentGroupPosition.FIRST,
-            segmentGroupPosition(hasPrevious = false, hasNext = true),
-        )
-        assertEquals(
-            SegmentGroupPosition.MIDDLE,
-            segmentGroupPosition(hasPrevious = true, hasNext = true),
-        )
-        assertEquals(
-            SegmentGroupPosition.LAST,
-            segmentGroupPosition(hasPrevious = true, hasNext = false),
-        )
-    }
-
-    @Test
-    fun timelineSegmentGroupsBreakAtVisibleAnswers() {
+    fun imageGenerationEndsGroupedBlocksAndKeepsLaterContentInNewGroups() {
         val segments = listOf(
-            MessageSegment(type = "thought", content = "Thinking"),
-            MessageSegment(type = "tool"),
-            MessageSegment(type = "answer", content = "Answer"),
-            MessageSegment(type = "transcription"),
+            MessageSegment(type = "thought", content = "Before"),
+            MessageSegment(type = "tool", toolName = "generate_image", toolCallId = "image-1"),
+            MessageSegment(type = "tool", toolName = "web_search", toolCallId = "search"),
+            MessageSegment(type = "tool", toolName = "generate_image", toolCallId = "image-2"),
+            MessageSegment(type = "answer", content = "After"),
         )
 
-        assertEquals(SegmentGroupPosition.FIRST, timelineSegmentGroupPosition(segments, 0))
-        assertEquals(SegmentGroupPosition.LAST, timelineSegmentGroupPosition(segments, 1))
-        assertEquals(SegmentGroupPosition.SINGLE, timelineSegmentGroupPosition(segments, 3))
+        assertEquals(2, groupedInfoBlockEndExclusive(segments, 0))
+        assertEquals(4, groupedInfoBlockEndExclusive(segments, 2))
+        assertEquals(
+            setOf("message:group:0", "message:group:2"),
+            buildTimelineBlockKeys(
+                messageId = "message",
+                segments = segments,
+                groupAdjacentBlocks = true,
+            ),
+        )
+        assertEquals(
+            "message:generated-image:1",
+            generatedImageAppearanceKey("message", 1),
+        )
+        assertEquals(
+            "message:generated-image:3",
+            generatedImageAppearanceKey("message", 3),
+        )
     }
 
     @Test
-    fun timelineSegmentGroupsFollowRenderedOrderAcrossSkippedSegments() {
-        val segments = listOf(
-            MessageSegment(type = "error", content = "Earlier error"),
-            MessageSegment(type = "thought", content = "Thinking"),
-            MessageSegment(type = "answer"),
-            MessageSegment(type = "error", content = "Skipped error"),
-            MessageSegment(type = "tool"),
-            MessageSegment(type = "answer"),
-            MessageSegment(type = "transcription"),
-            MessageSegment(type = "error", content = "Later error"),
+    fun imageLifecycleChangesCannotRewriteTheOrderedPrefix() {
+        val pending = listOf(
+            MessageSegment(type = "thought", content = "Before"),
+            MessageSegment(
+                type = "tool",
+                toolName = "generate_image",
+                toolCallId = "image",
+                toolState = "running",
+            ),
+            MessageSegment(type = "answer", content = "After"),
         )
+        val completed = pending.toMutableList().also { segments ->
+            segments[1] = segments[1].copy(
+                toolState = "succeeded",
+                toolResult = "generated",
+            )
+        }
 
-        assertEquals(SegmentGroupPosition.FIRST, timelineSegmentGroupPosition(segments, 1))
-        assertEquals(SegmentGroupPosition.MIDDLE, timelineSegmentGroupPosition(segments, 4))
-        assertEquals(SegmentGroupPosition.LAST, timelineSegmentGroupPosition(segments, 6))
+        assertEquals(
+            groupedInfoBlockEndExclusive(pending, 0),
+            groupedInfoBlockEndExclusive(completed, 0),
+        )
+        assertEquals(
+            buildTimelineBlockKeys("message", pending, groupAdjacentBlocks = true),
+            buildTimelineBlockKeys("message", completed, groupAdjacentBlocks = true),
+        )
+        assertEquals(
+            detailSegmentAppearanceKey("message", 1, pending[1]),
+            detailSegmentAppearanceKey("message", 1, completed[1]),
+        )
     }
 
     @Test
-    fun timelineSegmentGroupInvalidIndicesFailClosed() {
-        val segments = listOf(MessageSegment(type = "tool"))
+    fun imageBoundaryCollapsesOnceAndManualReExpansionRemainsOwnedByTheUser() {
+        val controller = GroupedSegmentAutoExpansionController()
+        val key = "message:group:0"
 
-        assertEquals(SegmentGroupPosition.SINGLE, timelineSegmentGroupPosition(segments, -1))
-        assertEquals(SegmentGroupPosition.SINGLE, timelineSegmentGroupPosition(segments, 1))
+        assertTrue(controller.shouldCollapseForImageBoundary(key, hasImageBoundary = true))
+        assertTrue(controller.claimImageBoundaryCollapse(key, hasImageBoundary = true))
+        assertFalse(controller.shouldCollapseForImageBoundary(key, hasImageBoundary = true))
+        assertFalse(
+            controller.shouldPresentInitiallyExpanded(
+                key = key,
+                isActive = true,
+                enabled = true,
+            ),
+        )
+        assertFalse(
+            groupedSegmentExpandedState(
+                persistedExpanded = true,
+                initiallyAutoExpanded = true,
+                collapseForImageBoundary = true,
+            ),
+        )
+        assertFalse(controller.claimImageBoundaryCollapse(key, hasImageBoundary = true))
+        assertTrue(
+            groupedSegmentExpandedState(
+                persistedExpanded = true,
+                initiallyAutoExpanded = false,
+                collapseForImageBoundary = false,
+            ),
+        )
     }
 
     @Test
     fun thinkingSegmentDisplayPolicyCoversVisibilityEffectiveModeAndAutoExpansion() {
         assertFalse(ThinkingSegmentDisplayModes.isAvailableFor(ToolCallDisplayModes.TIMELINE))
         assertTrue(ThinkingSegmentDisplayModes.isAvailableFor(ToolCallDisplayModes.GROUPED_TIMELINE))
-        assertTrue(ThinkingSegmentDisplayModes.isAvailableFor(ToolCallDisplayModes.COMPACT))
         assertEquals(
             ThinkingSegmentDisplayModes.CARD,
             ThinkingSegmentDisplayModes.effectiveMode(
@@ -163,12 +181,6 @@ class MessageItemSegmentsTest {
             ThinkingSegmentDisplayModes.allowsAutoExpand(
                 ThinkingSegmentDisplayModes.BOTTOM_SHEET,
                 ToolCallDisplayModes.GROUPED_TIMELINE,
-            ),
-        )
-        assertFalse(
-            ThinkingSegmentDisplayModes.allowsAutoExpand(
-                ThinkingSegmentDisplayModes.CARD,
-                ToolCallDisplayModes.COMPACT,
             ),
         )
     }
@@ -207,6 +219,29 @@ class MessageItemSegmentsTest {
         assertTrue(registry.shouldAnimate(key, isStreaming = true))
         registry.markSeen(key)
         assertFalse(registry.shouldAnimate(key, isStreaming = true))
+    }
+
+    @Test
+    fun streamingFadeTimelineSurvivesLazyItemDisposal() {
+        val registry = SegmentAppearanceRegistry()
+        val key = "message:answer"
+        val first = registry.streamingFadeTracker(key)
+        first.update(
+            text = "old",
+            nowMs = 1_000L,
+        )
+
+        val recreated = registry.streamingFadeTracker(key)
+        val sample = recreated.update(
+            text = "oldnew",
+            nowMs = 1_200L,
+        )
+
+        assertSame(first, recreated)
+        assertArrayEquals(
+            longArrayOf(1_000L, 1_000L, 1_000L, 1_200L, 1_200L, 1_200L),
+            sample.birthTimesMs,
+        )
     }
 
     @Test
@@ -295,6 +330,73 @@ class MessageItemSegmentsTest {
     }
 
     @Test
+    fun initialAutoExpansionOverridesAStaleCollapsedMapValue() {
+        assertTrue(
+            groupedSegmentExpandedState(
+                persistedExpanded = false,
+                initiallyAutoExpanded = true,
+            ),
+        )
+        assertTrue(
+            groupedSegmentExpandedState(
+                persistedExpanded = true,
+                initiallyAutoExpanded = false,
+            ),
+        )
+        assertFalse(
+            groupedSegmentExpandedState(
+                persistedExpanded = false,
+                initiallyAutoExpanded = false,
+            ),
+        )
+    }
+
+    @Test
+    fun newActiveGroupedSegmentPresentsExpandedBeforeUpdate() {
+        val controller = GroupedSegmentAutoExpansionController()
+        val key = "message:group:0"
+
+        assertTrue(
+            controller.shouldPresentInitiallyExpanded(
+                key = key,
+                isActive = true,
+                enabled = true,
+            ),
+        )
+        assertEquals(
+            GroupedSegmentAutoExpansionAction.EXPAND,
+            controller.update(key, isActive = true, enabled = true),
+        )
+        assertFalse(
+            controller.shouldPresentInitiallyExpanded(
+                key = key,
+                isActive = true,
+                enabled = true,
+            ),
+        )
+    }
+
+    @Test
+    fun inactiveOrDisabledGroupedSegmentNeverPresentsInitiallyExpanded() {
+        val controller = GroupedSegmentAutoExpansionController()
+
+        assertFalse(
+            controller.shouldPresentInitiallyExpanded(
+                key = "inactive",
+                isActive = false,
+                enabled = true,
+            ),
+        )
+        assertFalse(
+            controller.shouldPresentInitiallyExpanded(
+                key = "disabled",
+                isActive = true,
+                enabled = false,
+            ),
+        )
+    }
+
+    @Test
     fun activeGroupedSegmentExpandsOnlyOnce() {
         val controller = GroupedSegmentAutoExpansionController()
         val key = "message:group:0"
@@ -327,7 +429,50 @@ class MessageItemSegmentsTest {
     }
 
     @Test
-    fun historicalGroupedSegmentNeverAutoExpands() {
+    fun stoppedToolMessageRequestsOneExistingCollapse() {
+        val segments = listOf(
+            MessageSegment(
+                type = "tool",
+                toolName = "shell",
+                toolArgs = "{}",
+                toolCallId = "call",
+            ),
+        )
+        val active = ChatMessage(
+            id = "message",
+            text = "",
+            participant = Participant.MODEL,
+            status = MessageStatus.TOOL_CALLING,
+            segments = segments,
+        )
+        val stopped = active.copy(status = MessageStatus.STOPPED)
+        val controller = GroupedSegmentAutoExpansionController()
+        val key = "message:group:0"
+
+        val activeContent = compactSegmentShowsLoading(
+            generationActive = active.status == MessageStatus.TOOL_CALLING, isCurrentCard = true,
+        )
+        val stoppedContent = compactSegmentShowsLoading(
+            generationActive = stopped.status == MessageStatus.TOOL_CALLING, isCurrentCard = true,
+        )
+        assertTrue(activeContent)
+        assertFalse(stoppedContent)
+        assertEquals(
+            GroupedSegmentAutoExpansionAction.EXPAND,
+            controller.update(key, isActive = activeContent, enabled = true),
+        )
+        assertEquals(
+            GroupedSegmentAutoExpansionAction.COLLAPSE,
+            controller.update(key, isActive = stoppedContent, enabled = true),
+        )
+        assertEquals(
+            GroupedSegmentAutoExpansionAction.NONE,
+            controller.update(key, isActive = stoppedContent, enabled = true),
+        )
+    }
+
+    @Test
+    fun historicalGroupStaysCollapsedUntilAuthoritativeGenerationArrives() {
         val controller = GroupedSegmentAutoExpansionController()
         val key = "message:group:0"
 
@@ -335,8 +480,15 @@ class MessageItemSegmentsTest {
             GroupedSegmentAutoExpansionAction.NONE,
             controller.update(key, isActive = false, enabled = true),
         )
+        assertFalse(
+            controller.shouldPresentInitiallyExpanded(
+                key = key,
+                isActive = true,
+                enabled = true,
+            ),
+        )
         assertEquals(
-            GroupedSegmentAutoExpansionAction.NONE,
+            GroupedSegmentAutoExpansionAction.EXPAND,
             controller.update(key, isActive = true, enabled = true),
         )
     }
@@ -357,6 +509,39 @@ class MessageItemSegmentsTest {
     }
 
     @Test
+    fun timelineAnswerSlicesKeepOnlyTheirOwnGlobalMatchKeys() {
+        val first = "needle"
+        val second = "xx needle yy"
+        val firstRange = 0 until first.length
+        val secondRange = (first.length + 3) until (first.length + 9)
+        val spec = SearchHighlightSpec(
+            query = "needle",
+            activeRange = secondRange,
+            activeKey = "message:${secondRange.first}:${secondRange.last + 1}",
+            matchKeys = listOf(
+                "message:${firstRange.first}:${firstRange.last + 1}",
+                "message:${secondRange.first}:${secondRange.last + 1}",
+            ),
+            sourceRanges = listOf(firstRange, secondRange),
+            onMatchPosition = { _, _, _ -> },
+        )
+
+        val firstSlice = spec.forSourceSlice(sliceStart = 0, sliceLength = first.length)
+        val secondSlice = spec.forSourceSlice(
+            sliceStart = first.length,
+            sliceLength = second.length,
+        )
+
+        assertEquals(listOf("message:0:6"), firstSlice.matchKeys)
+        assertEquals(listOf(0 until 6), firstSlice.sourceRanges)
+        assertEquals(null, firstSlice.activeKey)
+        assertEquals(listOf("message:9:15"), secondSlice.matchKeys)
+        assertEquals(listOf(3 until 9), secondSlice.sourceRanges)
+        assertEquals(3 until 9, secondSlice.activeRange)
+        assertEquals("message:9:15", secondSlice.activeKey)
+    }
+
+    @Test
     fun legacyFailedRowWithAnswerSegmentsDoesNotRenderItsAnswerAsTheErrorDetail() {
         val message = ChatMessage(
             text = "Generated answer",
@@ -369,8 +554,64 @@ class MessageItemSegmentsTest {
             AssistantErrorContent(
                 answerText = "Generated answer",
                 errorText = "Failed to generate",
+                showLocalContextHelp = false,
             ),
             assistantErrorContent(message, message.segments.orEmpty(), "Failed to generate"),
+        )
+    }
+
+    @Test
+    fun localContextErrorOnlyRowKeepsHelpEligibility() {
+        val segments = listOf(
+            MessageSegment(
+                type = "error",
+                content = "Context capacity reached",
+                errorCode = LOCAL_CONTEXT_CAPACITY_ERROR_CODE,
+            ),
+        )
+        val message = ChatMessage(
+            text = "",
+            status = MessageStatus.ERROR,
+            participant = Participant.MODEL,
+            modelName = "Local: model.gguf",
+            segments = segments,
+        )
+
+        assertEquals(
+            AssistantErrorContent(
+                answerText = null,
+                errorText = "Context capacity reached",
+                showLocalContextHelp = true,
+            ),
+            assistantErrorContent(message, segments, "Failed to generate"),
+        )
+    }
+
+    @Test
+    fun localContextAnswerAndErrorRowKeepsHelpEligibility() {
+        val segments = listOf(
+            MessageSegment(type = "answer", content = "Partial answer"),
+            MessageSegment(
+                type = "error",
+                content = "Context capacity reached",
+                errorCode = LOCAL_CONTEXT_CAPACITY_ERROR_CODE,
+            ),
+        )
+        val message = ChatMessage(
+            text = "Partial answer",
+            status = MessageStatus.ERROR,
+            participant = Participant.MODEL,
+            modelName = "Local: model.gguf",
+            segments = segments,
+        )
+
+        assertEquals(
+            AssistantErrorContent(
+                answerText = "Partial answer",
+                errorText = "Context capacity reached",
+                showLocalContextHelp = true,
+            ),
+            assistantErrorContent(message, segments, "Failed to generate"),
         )
     }
 
@@ -391,6 +632,7 @@ class MessageItemSegmentsTest {
             AssistantErrorContent(
                 answerText = "Generated answer",
                 errorText = "Stream ended unexpectedly",
+                showLocalContextHelp = false,
             ),
             assistantErrorContent(message, segments, "Failed to generate"),
         )

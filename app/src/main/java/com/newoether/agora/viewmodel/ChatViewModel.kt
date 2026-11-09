@@ -5,52 +5,39 @@ import android.content.Context
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.newoether.agora.R
-import com.newoether.agora.api.*
-import com.newoether.agora.api.LlamaEngine
-import com.newoether.agora.api.anthropic.*
-import com.newoether.agora.api.gemini.*
-import com.newoether.agora.api.local.*
-import com.newoether.agora.api.ollama.*
-import com.newoether.agora.api.openai.*
+import com.newoether.agora.api.LlmProvider
 import com.newoether.agora.data.AutoBackupManager
-import com.newoether.agora.data.BuiltInPrompts
 import com.newoether.agora.data.ConversationSettings
 import com.newoether.agora.data.DataExporter
 import com.newoether.agora.data.DataImporter
 import com.newoether.agora.data.MemoryManager
 import com.newoether.agora.data.SkillManager
-import com.newoether.agora.data.PredefinedVariables
 import com.newoether.agora.data.forDisplay
 import com.newoether.agora.data.replaceCustomProviderIdsForDisplay
 
-import com.newoether.agora.data.ShellDeviceConfig
 
-import com.newoether.agora.data.local.ChatEntity
 import com.newoether.agora.data.repository.ConversationRepository
+import com.newoether.agora.data.repository.observeConversationTodo
+import com.newoether.agora.data.repository.observeDrawerGeneratingConversationIds
+import com.newoether.agora.ui.chat.observeDrawerInteractions
+import com.newoether.agora.data.repository.observeSubagents
+import com.newoether.agora.data.repository.observeParentConversationId
+import com.newoether.agora.data.repository.ConversationSettingsTransferCoordinator
 import com.newoether.agora.data.repository.SettingsRepository
-import com.newoether.agora.model.AttachmentItem
 import com.newoether.agora.model.ChatConversation
 import com.newoether.agora.model.ChatMessage
-import com.newoether.agora.model.MessageStatus
-import com.newoether.agora.model.isContextCompact
-import com.newoether.agora.model.apiModelName
-import com.newoether.agora.model.SelectedAttachment
 import com.newoether.agora.sandbox.SandboxManager
 import com.newoether.agora.sandbox.SandboxManagerFactory
 import com.newoether.agora.service.AgoraForegroundService
-import com.newoether.agora.util.DebugLog
-import com.newoether.agora.util.PdfPageRenderer
+import com.newoether.agora.service.AppForegroundTracker
 import com.newoether.agora.util.SnackbarEvent
 import com.newoether.agora.util.UpdateChecker
 import com.newoether.agora.util.UpdateInfo
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.*
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
 import java.io.File
-import java.util.UUID
 
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class ChatViewModel(
@@ -69,20 +56,21 @@ class ChatViewModel(
     autoBackupManager: AutoBackupManager,
     conversationRepository: ConversationRepository,
     settingsRepository: SettingsRepository,
+    conversationSettingsTransfers: ConversationSettingsTransferCoordinator,
+    private val startProcessServices: () -> Unit,
     // Process-scoped generation singletons, shared with background task execution.
-    private val localProvider: LocalProvider,
     private val providerRegistry: ProviderRegistry,
     // App-scoped automation orchestrator (task CRUD + run-now).
-    private val taskManager: com.newoether.agora.automation.TaskManager,
+    internal val taskManager: com.newoether.agora.automation.TaskManager,
     private val loopManager: com.newoether.agora.automation.LoopManager,
-    private val automationToolProvider: com.newoether.agora.tool.AutomationToolProvider,
     private val conversationExecutionCoordinator: com.newoether.agora.automation.ConversationExecutionCoordinator,
     private val automationExecutionGate: com.newoether.agora.automation.AutomationExecutionGate,
     private val generationRegistry: ConversationStateRegistry,
-    private val shellConfirmation: ShellConfirmationController,
+    internal val shellConfirmation: ShellConfirmationController,
+    internal val askUser: AskUserController,
     private val mcpRegistry: com.newoether.agora.mcp.McpRegistry,
-    private val mcpToolProvider: com.newoether.agora.tool.McpToolProvider,
-    private val taskExecutionEngine: com.newoether.agora.automation.TaskExecutionEngine,
+    // Process-scoped chat runtime shared by every client (see [ChatRuntime]).
+    private val chatRuntime: ChatRuntime,
 ) : AndroidViewModel(application) {
 
     val settings: SettingsRepository = settingsRepository
@@ -93,7 +81,37 @@ class ChatViewModel(
      * receive the repository (not raw DAO) for a uniform boundary.
      */
     private val convRepo: ConversationRepository = conversationRepository
-    private val composerDrafts = ComposerDraftController(conversationRepository)
+    private val conversationWorkspaces = ConversationWorkspaceStore(
+        conversations = conversationRepository,
+        settings = settingsRepository,
+        transfers = conversationSettingsTransfers,
+        scope = viewModelScope,
+    )
+    internal val messagePayloadHydration =
+        ConversationMessagePayloadHydration(convRepo, appContext)
+    /** Display-only `shell://` Markdown images for native chat, read from the live device settings. */
+    internal val shellMarkdownMedia = com.newoether.agora.ui.chat.message.ShellMarkdownMedia(
+        context = appContext,
+        devices = { settingsRepository.shellDevices.value },
+        sandboxEnabled = { settingsRepository.sandboxEnabled.value },
+        sandbox = { sandboxFactory?.takeIf { it.isAvailable() }?.create() },
+    )
+    private val attachmentProcessor = AttachmentImportProcessor(application)
+    private val composerDrafts = ComposerDraftController(
+        persistence = conversationWorkspaces,
+        conversations = conversationRepository,
+        hydrateAttachment = attachmentProcessor::hydrateDraftAttachment,
+    )
+    internal val conversationComposer = ConversationComposerController(
+        scope = viewModelScope,
+        drafts = composerDrafts,
+        processor = attachmentProcessor,
+        sandboxHomeDir = {
+            sandboxFactory?.takeIf { it.isAvailable() }?.let {
+                File(application.filesDir, "sandbox-home")
+            }
+        },
+    )
     val dataControl = DataControlController(
         conversations = conversationRepository,
         memory = memoryManager,
@@ -103,51 +121,8 @@ class ChatViewModel(
         backupSchedule = AndroidAutoBackupSchedulePort(application),
         scope = viewModelScope,
     )
-    private val conversationForkShare =
-        ConversationForkShareService(
-            conversationRepository,
-            settingsRepository,
-            File(application.filesDir, "fork-attachments"),
-        )
-    private val conversationForkShareController by lazy {
-        ConversationForkShareController(
-            currentConversationId = currentConversationId,
-            service = conversationForkShare,
-            scope = viewModelScope,
-            onConversationForked = selectionController::selectConversation,
-            onShareReady = _conversationShareText::emit,
-            forkFailureText = { reason ->
-                appContext.getString(R.string.conversation_fork_failed, reason)
-            },
-            shareFailureText = { reason ->
-                appContext.getString(R.string.conversation_share_failed, reason)
-            },
-            onFailure = { message -> _snackbarMessage.emit(SnackbarEvent(message)) },
-        )
-    }
-    private val conversationLifecycleController by lazy {
-        ConversationLifecycleController(
-            currentConversationId = currentConversationId,
-            conversations = convRepo,
-            scope = viewModelScope,
-            stopLoop = { conversationId -> loopManager.stopLoop(conversationId) },
-            withConversationLock = { conversationId, block ->
-                conversationExecutionCoordinator.withConversationLock(conversationId) { block() }
-            },
-            removeRuntime = generationRegistry::remove,
-            stopVisibleGeneration = generationStopAdapter::stopVisibleConversation,
-            openNewChat = selectionController::createNewChat,
-        )
-    }
-
-    /** Embedding subsystem: model CRUD + RAG cache + single-message indexing + key resolution. */
-    val ragManager = RagManager(
-        conversations = convRepo,
-        settings = settings,
-        localProvider = localProvider,
-        appContext = appContext,
-        scope = viewModelScope,
-    ) { _snackbarMessage.emit(it) }
+    /** Process-scoped embedding subsystem owned by [ChatRuntime]. */
+    val ragManager: RagManager = chatRuntime.ragManager
 
     /**
      * Data export/import orchestration (native backup + Claude + GPT formats).
@@ -162,6 +137,7 @@ class ChatViewModel(
         settingsManager = settingsManager,
         memoryManager = memoryManager,
         skillManager = skillManager,
+        conversationSettingsTransfers = conversationSettingsTransfers,
         scope = viewModelScope,
         emitSnackbar = { _snackbarMessage.emit(it) },
         onDataChanged = dataControl::refreshCounts,
@@ -175,7 +151,7 @@ class ChatViewModel(
 
     /** Local (on-device) chat-model configuration CRUD. */
     val modelManager = ModelManager(settings, viewModelScope)
-    private val customModelConfiguration = CustomModelConfigurationController(
+    internal val customModelConfiguration = CustomModelConfigurationController(
         providers = providerRegistry,
         conversations = convRepo,
         settings = settings,
@@ -185,8 +161,8 @@ class ChatViewModel(
         },
     )
 
-    // [providerRegistry] and [localProvider] are now constructor-injected, process-scoped
-    // singletons (see AppContainer) so background task execution shares the same instances.
+    // [providerRegistry] is a constructor-injected, process-scoped singleton (see AppContainer)
+    // so background task execution shares the same instance.
 
     /**
      * Startup jobs deferred until all StateFlow/property backing fields are
@@ -203,63 +179,31 @@ class ChatViewModel(
         scope = viewModelScope,
     )
     private val startupMaintenance by lazy {
-        val attachmentSweeper = AttachmentOrphanSweeper(convRepo, application.filesDir)
         StartupMaintenanceCoordinator(
             settings = settings,
-            conversations = convRepo,
             scope = viewModelScope,
             currentVersion = ::getCurrentVersion,
             checkUpdate = UpdateChecker::check,
             onUpdateFound = { _updateDialogData.value = it },
-            isCaching = { ragManager.cachingProgress.value.containsKey(it) },
-            cacheMessages = ragManager::cacheMessagesForModel,
-            cacheReminder = { notCached, total, action ->
-                SnackbarEvent(
-                    getApplication<Application>().getString(
-                        R.string.messages_not_cached,
-                        notCached,
-                        total,
-                    ),
-                    getApplication<Application>().getString(R.string.cache_now),
-                    action,
-                )
-            },
-            emitSnackbar = _snackbarMessage::emit,
-            sweepAttachments = attachmentSweeper::sweep,
-            onAttachmentSweepFailure = { error ->
-                DebugLog.d("ChatViewModel", "Attachment orphan sweep error", error)
-            },
             startAutoBackup = dataControl::startAutoBackup,
+            startSemanticIndex = ragManager::startPostList,
         )
     }
 
     private fun startInitJobs() {
-        proxySettingsSynchronizer.start()
-        startupMaintenance.start()
-        localModelCatalogSynchronizer.start()
-        // Provider map / model-list sync jobs now run on the process-scoped registry
-        // (launched once in AppContainer), so they survive ViewModel recreation.
+        viewModelScope.launch {
+            conversations.filterNotNull().first()
+            startProcessServices()
+            proxySettingsSynchronizer.start()
+            startupMaintenance.start()
+            localModelCatalogSynchronizer.start()
+        }
     }
 
     // Per-conversation generation lifecycle (IO scope, job, slot, race-free stop/persist tokens)
     // lives in [ConversationGenerationState], one per conversation via [generationRegistry].
 
-    private val generationManager by lazy {
-        GenerationManager(
-            app = application,
-            conversations = convRepo,
-            memoryManager = memoryManager,
-            skillManager = skillManager,
-            context = appContext,
-            sandboxFactory = sandboxFactory,
-            additionalToolProviders = listOf(automationToolProvider, mcpToolProvider),
-            customProviders = { settings.customProviders.value },
-        ).also { gm ->
-            // Gate lives in RagManager.indexMessageForRag (autoCacheEnabled + active model).
-            gm.onMessagePersisted = { messageId, text -> ragManager.indexMessageForRag(messageId, text) }
-            gm.onConfirmShellCommand = { server, summary -> shellConfirmation.confirm(server, summary) }
-        }
-    }
+    private val generationManager: GenerationManager get() = chatRuntime.generationManager
     private val semanticSearchService by lazy {
         SemanticSearchService(
             settings = settings,
@@ -282,11 +226,9 @@ class ChatViewModel(
 
     override fun onCleared() {
         super.onCleared()
-        // The engine and the registry are process-scoped while this ViewModel is not, so every
-        // reference either of them holds must be released here or the whole graph leaks.
-        foregroundAutomationBridge.close()
-        sandboxManager?.close()
-        generationRegistry.detachUiCallbacks(generationCallbackOwner)
+        // The runtime is process-scoped while this ViewModel is not; detaching the phone client
+        // releases every reference the runtime holds to this ViewModel graph.
+        chatRuntime.clients.detach(phoneClient)
         dataControl.destroy()
     }
 
@@ -294,20 +236,18 @@ class ChatViewModel(
      *  provider is deleted and must render gracefully instead of crashing. */
     fun getProviderInstanceOrNull(name: String): LlmProvider? = providerRegistry.getInstanceOrNull(name)
 
-
-
-    private val scrollRequests = ScrollRequestCoordinator()
+    internal val scrollRequests = ScrollRequestCoordinator()
     private val selectionController: ConversationSelectionController by lazy {
         ConversationSelectionController(
             scope = viewModelScope,
             conversations = convRepo,
             registry = generationRegistry,
             defaultModel = settings.selectedModel,
+            validModels = settings.validChatModels(viewModelScope),
             scrollRequests = scrollRequests,
             renderStore = { renderStore },
             clearConversationGraph = { conversationUi.clearConversationGraph() },
-            clearPendingSystemPrompt = { _pendingSystemPromptId.value = null },
-            clearPendingConversationSettings = { _pendingConversationSettings.value = null },
+            workspaces = conversationWorkspaces,
             abortRegeneration = { regenerationTransitions.abortCurrent() },
             onTreeMutationCommitted = { conversationId ->
                 contextProjector.invalidate(conversationId)
@@ -318,112 +258,63 @@ class ChatViewModel(
     /** Callback invoked when any send path (manual/queue/loop) accepts a message.
      *  ChatApp wires this to trigger a single haptics.confirm() for all three paths. */
     @Volatile var onSendAccepted: ((conversationId: String, messageId: String) -> Unit)? = null
-    val animatedScrollRequest: StateFlow<AnimatedScrollRequest?> =
-        scrollRequests.request
-
-    /** One-shot: set when sendMessage creates a new conversation so the conversation-open
-     *  auto-scroll skips once (the send's scroll-to-message already handles it), preventing
-     *  a double scroll on the first message of a new chat. Consumed by ChatApp. */
-    var suppressNextOpenScroll: Boolean
-        get() = scrollRequests.suppressNextOpenScroll
-        set(value) { scrollRequests.suppressNextOpenScroll = value }
-
-    /** When true, draft write-backs are suppressed to prevent feedback loops while
-     *  programmatically loading a stored draft into the composer field. */
-    var loadingDraft: Boolean
-        get() = scrollRequests.loadingDraft
-        set(value) { scrollRequests.loadingDraft = value }
-
-    fun triggerScrollToMessage(messageId: String? = null) {
-        scrollRequests.requestMessage(currentConversationId.value, messageId)
-    }
-
-    fun triggerScrollToAbsoluteBottomAfter(conversationId: String, messageId: String) {
-        scrollRequests.requestAbsoluteBottomAfter(conversationId, messageId)
-    }
-
-    fun triggerScrollToAttachedBottomAfter(conversationId: String, messageId: String) {
-        scrollRequests.requestAbsoluteBottomAfter(
-            conversationId = conversationId,
-            messageId = messageId,
-            attachedOnly = true,
-        )
-    }
-
-    fun completeAnimatedScroll(requestId: Long) = scrollRequests.complete(requestId)
 
     val currentActiveModel: StateFlow<String> get() = selectionController.currentActiveModel
 
     fun getProviderForModel(modelId: String): String = providerRegistry.providerForModel(modelId)
-    
-
-        
-    // ── Remote shell command confirmation gate ───────────────────────────
-    /** Shell-command confirmation policy + pending-prompt handshake (see [ShellConfirmationController]). */
-    val pendingShellCommand: StateFlow<ShellConfirmationController.PendingShellCommand?>
-        get() = shellConfirmation.pendingShellCommand
-
-    /** Called by the UI to resolve a pending confirmation. */
-    fun resolveShellConfirmation(allow: Boolean, alwaysAllowServer: Boolean = false) =
-        shellConfirmation.resolve(allow, alwaysAllowServer)
-
-    fun setShellConfirmEnabled(enabled: Boolean) = shellConfirmation.setEnabled(enabled)
-
-    // ── Tasks (automation) ────────────────────────────────────
-    /** Saved automation tasks; CRUD + run-now delegate to the app-scoped [taskManager]. */
-    val tasks: StateFlow<List<com.newoether.agora.data.local.TaskEntity>> get() = taskManager.tasks
-    val runningTaskIds: StateFlow<Set<String>> get() = taskManager.runningTaskIds
-
-    fun executionsForTask(taskId: String) = taskManager.executionsForTask(taskId)
-    fun executionSummariesForTask(taskId: String) = taskManager.executionSummariesForTask(taskId)
-    suspend fun getTask(taskId: String) = taskManager.getTask(taskId)
-
-    fun saveTask(task: com.newoether.agora.data.local.TaskEntity) {
-        viewModelScope.launch { taskManager.saveTask(task) }
-    }
-
-    fun deleteTask(taskId: String) {
-        viewModelScope.launch { taskManager.deleteTask(taskId) }
-    }
-
-    fun runTaskNow(task: com.newoether.agora.data.local.TaskEntity) = taskManager.runNow(task)
 
     // ── Auto Backup ───────────────────────────────────────────
 
     val conversations: StateFlow<List<ChatConversation>?> = convRepo.getAllConversations()
         .stateIn(viewModelScope, SharingStarted.Eagerly, null)
     val currentConversationId: StateFlow<String?> get() = selectionController.currentConversationId
+    internal val currentSubagentFamily = observeSelectedSubagentFamily(
+        selectedConversationId = currentConversationId,
+        observeParent = convRepo::observeParentConversationId,
+        observeSubagents = convRepo::observeSubagents,
+    ).stateIn(
+        viewModelScope,
+        SharingStarted.Eagerly,
+        SubagentFamilySnapshot(),
+    )
+    val currentSubagents = combine(currentConversationId, currentSubagentFamily) { id, family ->
+        id to family.forSelection(id)?.agents.orEmpty()
+    }.stateIn(
+        viewModelScope,
+        SharingStarted.WhileSubscribed(0, replayExpirationMillis = 0),
+        null to emptyList(),
+    )
+
+    private val subagentDeliveryOnOpen = viewModelScope.launch {
+        currentConversationId.collect { id -> id?.let(chatRuntime.onConversationOpened) }
+    }
+
+    val currentConversationTodo = observeSelectedConversationTodo(
+        currentConversationId, convRepo::observeConversationTodo,
+    ).stateIn(viewModelScope, SharingStarted.Eagerly, null to emptyList())
+    private val currentInteractions = combine(
+        currentConversationId, askUser.requests, shellConfirmation.pendingShellCommand,
+    ) { id, questions, shell ->
+        id to com.newoether.agora.ui.chat.interaction.userInteractions(id, questions, shell)
+    }
+    val selectedConversationGenerationSnapshot: StateFlow<ConversationGenerationSnapshot>
+        get() = selectionController.selectedConversationGenerationSnapshot
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
     val currentConversation: StateFlow<ChatConversation?> = currentConversationId
         .flatMapLatest { id -> if (id == null) flowOf(null) else convRepo.observeConversation(id) }
         .stateIn(viewModelScope, SharingStarted.Eagerly, null)
     private val unreadGenerationAcknowledger = UnreadGenerationAcknowledger(
         currentConversation = currentConversation,
+        appForeground = AppForegroundTracker.foreground,
+        chatPresented = AppForegroundTracker.chatPresented,
         conversations = convRepo,
         scope = viewModelScope,
+        onConversationRead = { conversationId ->
+            AgoraForegroundService.cancelTerminalNotification(appContext, conversationId)
+        },
     )
-    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
-    val currentLoop: StateFlow<com.newoether.agora.data.local.LoopEntity?> = currentConversationId
-        .flatMapLatest { id ->
-            if (id == null) {
-                flowOf(null)
-            } else {
-                combine(
-                    loopManager.loopForConversation(id),
-                    loopManager.runningConversationIds,
-                ) { loop, _ ->
-                    // Visibility tracks the TIMER only. The card is a schedule indicator, so once
-                    // the schedule is inactive it must disappear at once, even mid-cycle.
-                    //
-                    // It deliberately does not stay up for a running worker: an in-flight
-                    // generation is already stoppable through the composer's Stop button, so
-                    // keeping the card alive for that would make one control appear to own two
-                    // unrelated lifetimes.
-                    loop?.takeIf { it.active }
-                }
-            }
-        }
-        .stateIn(viewModelScope, SharingStarted.Eagerly, null)
+    val currentLoop: StateFlow<com.newoether.agora.data.local.LoopEntity?> =
+        loopManager.observeCurrentLoop(currentConversationId, viewModelScope)
     val runningLoopConversationIds: StateFlow<Set<String>> get() = loopManager.runningConversationIds
 
     fun stopCurrentLoop() {
@@ -436,14 +327,86 @@ class ChatViewModel(
         registry = generationRegistry,
         executionCoordinator = conversationExecutionCoordinator,
         currentConversationId = currentConversationId,
-        appContext = appContext,
         scope = viewModelScope,
         onConversationLoadFailed = selectionController::failConversationLoad,
     )
     private val renderStore: ConversationRenderStore get() = conversationUi.renderStore
+
+    /** This phone UI as a [ChatClient] of the process runtime; attached in init, detached in onCleared. */
+    private val phoneClient: ChatClient = object : ChatClient {
+        override val openConversationId: String? get() = currentConversationId.value
+        override val renderStore: ConversationRenderStore get() = conversationUi.renderStore
+        override fun isConversationVisible(conversationId: String): Boolean =
+            AppForegroundTracker.isInForeground &&
+                AppForegroundTracker.isChatPresented &&
+                currentConversationId.value == conversationId
+        override val branchTransitions: BranchReplacementTransitionCoordinator
+            get() = regenerationTransitions
+        override suspend fun awaitProjectedPath(conversationId: String, messageId: String) {
+            combine(messages, currentConversationId) { path, openConversationId ->
+                openConversationId != conversationId || path.any { it.id == messageId }
+            }.first { projectedOrClosed -> projectedOrClosed }
+        }
+        override fun requestScrollToBottomAfter(
+            conversationId: String,
+            messageId: String,
+            attachedOnly: Boolean,
+        ) = scrollRequests.requestAbsoluteBottomAfter(conversationId, messageId, attachedOnly)
+        override fun onSendAccepted(conversationId: String, messageId: String) {
+            // Feedback belongs to the conversation on screen. A send from the new-chat page
+            // qualifies because that page becomes this very conversation, but its id is only
+            // published after acceptance, so it is matched via isNewChatMode rather than by id.
+            val currentId = currentConversationId.value
+            val targetsOpenConversation = currentId == conversationId ||
+                (currentId == null && isNewChatMode.value)
+            if (targetsOpenConversation) onSendAccepted?.invoke(conversationId, messageId)
+        }
+        override suspend fun applyCommittedNewConversationState(conversationId: String) =
+            conversationWorkspaces.applyCommittedNewConversationState(conversationId)
+        override suspend fun publishAcceptedNewConversation(
+            conversationId: String,
+            modelId: String,
+            entryId: Long,
+        ): Boolean = withContext(Dispatchers.Main.immediate) {
+            selectionController.publishAcceptedConversationIfOriginStillOpen(
+                conversationId,
+                modelId,
+                entryId,
+            )
+        }.also { selected ->
+            if (selected) {
+                // The send's own bottom scroll handles the first message; skip the open scroll.
+                scrollRequests.suppressNextOpenScroll = true
+                _firstMessageCommitted.tryEmit(conversationId)
+            }
+        }
+        override suspend fun beginTreeMutation(conversationId: String, scrollToTarget: Boolean) =
+            selectionController.beginTreeMutation(conversationId, scrollToTarget)
+        override fun settleTreeMutation(requestId: Long?, targetMessageId: String?) =
+            selectionController.markTreeMutationReady(requestId, targetMessageId)
+        override fun failTreeMutation(requestId: Long?) = selectionController.failTreeMutation(requestId)
+        override fun showSnackbar(message: String) = emitSnackbar(message)
+        override fun openConversation(conversationId: String) {
+            viewModelScope.launch { selectionController.selectConversation(conversationId) }
+        }
+        override fun showShareText(text: String) {
+            _conversationShareText.tryEmit(text)
+        }
+        override fun settleDeletedConversation(conversationId: String, parentConversationId: String?) =
+            selectionController.settleDeletedSelectedConversation(conversationId, parentConversationId)
+        override fun isSubmissionFrozen(conversationId: String): Boolean =
+            conversationComposerSubmission.isFrozen(conversationId)
+        override fun onGenerationActivityChanged(conversationId: String, active: Boolean) =
+            if (active) conversationUi.markActive(conversationId) else conversationUi.markIdle(conversationId)
+    }
     val allMessages: StateFlow<List<ChatMessage>> = conversationUi.allMessages
-    val loadedMessagesConversationId: StateFlow<String?> =
-        conversationUi.loadedMessagesConversationId
+    val loadedMessagesConversationId: StateFlow<String?> = observeConversationContentReadiness(
+        selectedConversationId = currentConversationId,
+        loadedMessagesConversationId = conversationUi.loadedMessagesConversationId,
+        todo = currentConversationTodo,
+        family = currentSubagentFamily,
+        interactions = currentInteractions,
+    ).stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
     private val providerModelSync = ProviderModelSyncController(
         providers = providerRegistry,
@@ -453,20 +416,7 @@ class ChatViewModel(
     private val providerModelSyncUi by lazy {
         ProviderModelSyncUiAdapter(
             controller = providerModelSync,
-            text = ProviderModelSyncUiText(
-                failureLabels = ModelSyncFailureLabels(
-                    noModels = appContext.getString(R.string.sync_error_no_models),
-                    timeout = appContext.getString(R.string.sync_error_timeout),
-                    invalidResponse = appContext.getString(R.string.sync_error_invalid_response),
-                    unknown = appContext.getString(R.string.unknown_error),
-                ),
-                globalProviderName = appContext.getString(R.string.models_title),
-                successfulProviders = { count ->
-                    appContext.getString(R.string.sync_success_providers, count)
-                },
-                noProviders = appContext.getString(R.string.sync_no_providers),
-                completed = appContext.getString(R.string.sync_completed),
-            ),
+            text = appContext.providerModelSyncUiText(),
             publishMessage = { message -> _snackbarMessage.emit(SnackbarEvent(message)) },
         )
     }
@@ -480,7 +430,7 @@ class ChatViewModel(
         extraBufferCapacity = 1,
         onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST,
     )
-    val snackbarMessage = _snackbarMessage
+    val snackbarMessage = merge(_snackbarMessage, chatRuntime.snackbarEvents)
         .map { it.forDisplay(settings.customProviders.value) }
     fun displayText(text: String): String =
         replaceCustomProviderIdsForDisplay(text, settings.customProviders.value)
@@ -508,260 +458,131 @@ class ChatViewModel(
     fun dismissUpdateDialog() { _updateDialogData.value = null }
     fun showUpdateDialog(info: UpdateInfo) { _updateDialogData.value = info }
 
-    /** PDF / text-file preview state (see [MediaPreviewState]). */
-    private val mediaPreview = MediaPreviewState()
-    val previewPdfPages: StateFlow<List<String>> get() = mediaPreview.pdfPages
-    val previewPdfIndex: StateFlow<Int> get() = mediaPreview.pdfIndex
-    val previewFileContent: StateFlow<String?> get() = mediaPreview.fileContent
-    val previewFileName: StateFlow<String?> get() = mediaPreview.fileName
-
-    fun showPdfPreview(pages: List<String>, startIndex: Int) = mediaPreview.showPdf(pages, startIndex)
-    fun showFilePreview(fileName: String, content: String) = mediaPreview.showFile(fileName, content)
-    fun clearPreviews() = mediaPreview.clear()
+    /** PDF / text-file preview state shared by the existing UI consumers. */
+    val mediaPreview = MediaPreviewState()
 
     val messages: StateFlow<List<ChatMessage>> = conversationUi.messages
-    val totalTokens: StateFlow<Int> = conversationUi.totalTokens
     val isLoading: StateFlow<Boolean> = conversationUi.isLoading
     val generatingInConversationId: StateFlow<String?> =
         conversationUi.generatingInConversationId
     val generationSnapshot: StateFlow<ConversationGenerationSnapshot> =
         conversationUi.generationSnapshot
 
-    /** Content-free runtime history used only by the explicitly unlocked Developer inspector. */
-    internal fun developerRuntimeTraceSnapshot(
-        conversationId: String,
-    ): List<com.newoether.agora.model.ConversationRuntimeTraceEntry> =
-        generationRegistry.get(conversationId)?.runtimeTraceSnapshot().orEmpty()
+    /** Drawer activity includes each active conversation and the parent of any active Subagent. */
+    val generatingConversationIds: StateFlow<Set<String>> = convRepo.observeDrawerGeneratingConversationIds(
+        foregroundIds = generationRegistry.activeConversationIds,
+        automationIds = conversationExecutionCoordinator.activeAutomationConversationIds,
+    ).stateIn(viewModelScope, SharingStarted.Eagerly, emptySet())
 
-    /** Per-conversation generation state registry. Each conversation owns an independent
-     *  ConversationGenerationState; the global loading/render mirrors
-     *  below are now a MIRROR of whichever conversation is currently open (see init collectors). */
-    private val generationCallbackOwner = Any()
-    private val foregroundAutomationBridge by lazy {
-        ForegroundAutomationBridgeController(
-            currentConversationId = currentConversationId,
-            send = generationController::sendMessageFromAutomationAwaitingCompletion,
-            loadMessage = convRepo::getMessage,
-            attach = taskExecutionEngine::attachForegroundSendBridge,
-            detach = taskExecutionEngine::detachForegroundSendBridge,
-        )
-    }
-    private val generationCallbacksAttached = Unit.also {
-        generationRegistry.attachUiCallbacks(generationCallbackOwner) { state ->
-            state.onActive = { conversationId ->
-                // Publish synchronously with the slot claim so Stop and edit closure are immediate.
-                conversationUi.markActive(conversationId)
-            }
-            state.onIdle = { conversationId ->
-                conversationUi.markIdle(conversationId)
-            }
-            state.onStreamCommit = { conversationId, message ->
-                conversationUi.commitTerminalStreamingMessage(conversationId, message)
-            }
-            state.onQueueDrainRequested = { settledState ->
-                settledState.scope.launch {
-                    generationController.drainQueuedAfterGeneration(settledState)
-                }
-            }
-        }
-    }
-
-    /** Every conversation currently mutating its message tree through foreground generation or
-     * headless Task/Loop execution. Drawer rows use this per-id set instead of the open
-     * conversation's open UI loading mirror. */
-    val generatingConversationIds: StateFlow<Set<String>> = combine(
-        generationRegistry.activeConversationIds,
-        conversationExecutionCoordinator.activeAutomationConversationIds,
-    ) { foreground, automation ->
-        foreground + automation
-    }.stateIn(viewModelScope, SharingStarted.Eagerly, emptySet())
-
-    private val generationStopAdapter by lazy {
-        GenerationStopAdapter(
-            currentConversationId = currentConversationId,
-            registry = generationRegistry,
-            renderStore = renderStore,
-            finalizer = GenerationFinalizer(convRepo, ragManager::indexMessageForRag),
-            failureText = {
-                getApplication<Application>().getString(R.string.failed_to_generate)
-            },
-            onFailure = { message -> emitSnackbar(message) },
-        )
-    }
+    internal val drawerInteractions = convRepo.observeDrawerInteractions(
+        askUser.requests, shellConfirmation.pendingShellCommand,
+    ).stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyMap())
 
     val isSwitching: StateFlow<Boolean> get() = selectionController.isSwitching
 
-    private val regenerationTransitions = RegenerationTransitionCoordinator()
-    internal val regenerationTransition: StateFlow<RegenerationTransitionRequest?> =
-        regenerationTransitions.request
-
-    fun acknowledgeRegenerationFade(requestId: Long) {
-        regenerationTransitions.acknowledgeFade(requestId)
-    }
-
-    fun acknowledgeRegenerationScroll(requestId: Long, success: Boolean) {
-        regenerationTransitions.acknowledgeScroll(requestId, success)
-    }
-
-    fun completeRegenerationTransition(requestId: Long) {
-        regenerationTransitions.complete(requestId)
-    }
-
+    internal val regenerationTransitions = BranchReplacementTransitionCoordinator()
     val isNewChatMode: StateFlow<Boolean> get() = selectionController.isNewChatMode
     val newChatEntryId: StateFlow<Long> get() = selectionController.newChatEntryId
     val isTransitioningToNewChat: StateFlow<Boolean>
         get() = selectionController.isTransitioningToNewChat
 
-    private val _pendingSystemPromptId = MutableStateFlow<String?>(null)
-    val pendingSystemPromptId: StateFlow<String?> = _pendingSystemPromptId.asStateFlow()
+    val pendingSystemPromptId: StateFlow<String?> =
+        conversationWorkspaces.newChatSystemPromptId
 
     fun setPendingSystemPrompt(promptId: String?) {
-        _pendingSystemPromptId.value = promptId
+        conversationWorkspaces.setSystemPrompt(NEW_CHAT_WORKSPACE_ID, promptId)
     }
 
-    private val _pendingConversationSettings = MutableStateFlow<ConversationSettings?>(null)
-    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
-    val isCompacting: StateFlow<Boolean> = currentConversationId
-        .flatMapLatest { conversationId ->
-            if (conversationId == null) flowOf(false)
-            else generationRegistry.getOrCreate(conversationId).streamingMessage
-                .map { message -> message?.isContextCompact() == true }
-        }
-        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
-    val compactPreview: StateFlow<String> = currentConversationId
-        .flatMapLatest { conversationId ->
-            if (conversationId == null) flowOf("")
-            else generationRegistry.getOrCreate(conversationId).streamingMessage
-                .map { message ->
-                    message?.takeIf(ChatMessage::isContextCompact)?.text.orEmpty()
-                }
-        }
-        .stateIn(viewModelScope, SharingStarted.Eagerly, "")
-    val pendingConversationSettings: StateFlow<ConversationSettings?> = _pendingConversationSettings.asStateFlow()
-
-    fun setPendingConversationSettings(settings: ConversationSettings?) {
-        _pendingConversationSettings.value = settings
-    }
-
-    private val payloadBuilder by lazy {
-        MessagePayloadBuilder(
-            generationManager = generationManager,
-            onSnackbar = { msg -> _snackbarMessage.emit(SnackbarEvent(msg)) },
-        )
-    }
-
-    private val requestBuilder = GenerationRequestBuilder(
-        settings = settings,
-        convRepo = convRepo,
-        memoryManager = memoryManager,
-        skillManager = skillManager,
-        providerRegistry = providerRegistry,
-        ragManager = ragManager,
-        appContext = appContext,
-        pendingConversationSettings = _pendingConversationSettings,
-        onSnackbar = { msg -> emitSnackbar(msg) },
+    val pendingConversationSettings: StateFlow<ConversationSettings?> =
+        conversationWorkspaces.newChatConversationSettings
+    internal val compactUi = ConversationCompactUiCoordinator(
+        currentConversationId = currentConversationId,
+        registry = generationRegistry,
+        scope = viewModelScope,
+        configuredModel = { settings.contextCompactModel.value },
+        currentModel = { currentActiveModel.value },
+        configuredPrompt = { settings.contextCompactPrompt.value },
+        configuredRetainCount = { settings.contextCompactRetainCount.value },
+        configuredPreserveSystemPrompt = { settings.contextCompactPreserveSystemPrompt.value },
+        compactManual = { request ->
+            generationController.compactManual(currentConversationId.value, request)
+        },
+        failureMessage = { result -> compactFailureMessage(appContext, result) },
+        onFailure = { message -> emitSnackbar(message) },
     )
+    fun setConversationSettings(convId: String?, value: ConversationSettings?) =
+        conversationWorkspaces.setConversationSettings(convId ?: NEW_CHAT_WORKSPACE_ID, value)
+    internal fun updateConversationSettings(convId: String?, update: (ConversationSettings) -> ConversationSettings) =
+        conversationWorkspaces.updateConversationSettings(convId ?: NEW_CHAT_WORKSPACE_ID, update)
     private val contextProjector by lazy {
         ConversationContextProjector(
             conversations = convRepo,
-            requestBuilder = requestBuilder,
+            appContext = appContext,
+            requestBuilder = chatRuntime.requestBuilder,
             generationManager = { generationManager },
-            newChatSystemPromptId = { _pendingSystemPromptId.value },
+            generationErrorFormatter = { raw ->
+                normalizePersistedGenerationErrorText(appContext, raw)
+            },
+            newChatSystemPromptId = { pendingSystemPromptId.value },
+            newChatConversationSettings = { pendingConversationSettings.value },
         )
     }
 
     internal val conversationContextProjection: StateFlow<ConversationContextProjection>
         get() = contextProjector.projection
+    internal val conversationContextInvalidationRevision: StateFlow<Long>
+        get() = contextProjector.invalidationRevision
 
     internal fun requestConversationContext(
         conversationId: String?,
         selectedBranchesJson: String?,
         selectedModelId: String,
         tokenBudget: Int,
-    ) {
-        viewModelScope.launch {
-            contextProjector.project(
-                conversationId,
-                selectedBranchesJson,
-                selectedModelId,
-                tokenBudget,
-            )
-        }
-    }
+    ) = contextProjector.request(
+        viewModelScope,
+        conversationId,
+        selectedBranchesJson,
+        selectedModelId,
+        tokenBudget,
+    )
 
-    private val generationController by lazy {
-        MessageGenerationController(
-            viewModelScope = viewModelScope,
-            application = getApplication(),
-            appContext = appContext,
-            convRepo = convRepo,
-            settings = settings,
-            registry = generationRegistry,
-            generationManagerProvider = { generationManager },
-            requestBuilder = requestBuilder,
-            payloadBuilder = payloadBuilder,
-            providerRegistry = providerRegistry,
-            localProvider = localProvider,
-            executionCoordinator = conversationExecutionCoordinator,
-            renderStore = renderStore,
-            currentConversationId = currentConversationId,
-            isNewChatMode = isNewChatMode,
-            applyPendingConversationSettings = { conversationId ->
-                _pendingConversationSettings.value?.let { pending ->
-                    settings.setConversationSettings(conversationId, pending)
-                    _pendingConversationSettings.value = null
-                }
-            },
-            pendingSystemPromptId = _pendingSystemPromptId,
-            currentActiveModel = currentActiveModel,
-            messages = messages,
-            onScrollToMessage = { id -> triggerScrollToMessage(id) },
-            onScrollToAbsoluteBottomAfter = ::triggerScrollToAbsoluteBottomAfter,
-            onScrollToAttachedBottomAfter = ::triggerScrollToAttachedBottomAfter,
-            onSendAcceptedEvent = { convId, msgId ->
-                // Feedback belongs to the conversation on screen. A send from the new-chat page
-                // qualifies because that page becomes this very conversation, but its id is only
-                // published after acceptance, so it is matched via isNewChatMode rather than by id.
-                // Background automation on another conversation stays silent: from the user's point
-                // of view nothing happened on screen.
-                val currentId = currentConversationId.value
-                val targetsOpenConversation = currentId == convId ||
-                    (currentId == null && isNewChatMode.value)
-                if (targetsOpenConversation) onSendAccepted?.invoke(convId, msgId)
-            },
-            onSnackbar = { msg -> emitSnackbar(msg) },
-            onSnackbarSuspend = { msg -> _snackbarMessage.emit(SnackbarEvent(msg)) },
-            onConversationCreatedBySend = { conversationId ->
-                suppressNextOpenScroll = true
-                _firstMessageCommitted.tryEmit(conversationId)
-            },
-            onConversationAcceptedBySend = selectionController::publishAcceptedConversation,
-            onUserMessagePersisted = ragManager::indexMessageForRag,
-            onTreeMutationStart = { scrollToTarget ->
-                selectionController.beginTreeMutation(scrollToTarget)
-            },
-            onTreeMutationSettling = selectionController::markTreeMutationReady,
-            onTreeMutationFailed = selectionController::failTreeMutation,
-            regenerationTransitions = regenerationTransitions,
-            pauseConversationTasks = { conversationId -> loopManager.stopLoop(conversationId) },
-        )
-    }
-    private val composerSendAdapter by lazy {
-        ComposerSendAdapter(
-            send = generationController::sendMessage,
-            drafts = composerDrafts,
+    private val generationController: MessageGenerationController
+        get() = chatRuntime.messageGeneration
+    internal val conversationComposerSubmission by lazy {
+        ConversationComposerSubmissionController(
             scope = viewModelScope,
+            composers = conversationComposer,
+            drafts = composerDrafts,
+            captureTarget = { ownerId ->
+                generationController.captureForegroundSendTarget(
+                    ownerId = ownerId,
+                    currentId = currentConversationId.value,
+                    isNewChatMode = isNewChatMode.value,
+                    newChatEntryId = newChatEntryId.value,
+                    modelId = currentActiveModel.value,
+                    captureNewChatWorkspace = conversationWorkspaces::captureNewChatSnapshot,
+                )
+            },
+            prepare = { target, composer ->
+                generationController.prepareForegroundSend(target, composer, phoneClient)
+            },
+            send = { admission, text, attachments, onAccepted ->
+                generationController.sendMessage(admission, text, attachments, onAccepted, phoneClient)
+            },
+            onAcceptedClearFailed = { _, retry ->
+                emitSnackbar(
+                    message = appContext.getString(R.string.composer_clear_failed),
+                    actionLabel = appContext.getString(R.string.retry),
+                    onAction = retry,
+                )
+            },
         )
     }
 
-    fun updateConversationSetting(convId: String?, update: (ConversationSettings) -> ConversationSettings) {
-        if (convId != null) {
-            settings.updateConversationSettings(convId, update)
-        } else {
-            val current = _pendingConversationSettings.value ?: ConversationSettings()
-            _pendingConversationSettings.value = update(current)
-        }
-    }
+    fun updateConversationSetting(
+        convId: String?,
+        update: (ConversationSettings) -> ConversationSettings,
+    ) = conversationWorkspaces.updateConversationSettings(convId ?: NEW_CHAT_WORKSPACE_ID, update)
 
     val switchingScrollRequest: StateFlow<SwitchingScrollRequest?> =
         selectionController.switchingScrollRequest
@@ -773,43 +594,10 @@ class ChatViewModel(
         selectionController.failSwitchingScroll(requestId, reason)
 
     init {
+        chatRuntime.clients.attach(phoneClient)
         startInitJobs()
         unreadGenerationAcknowledger.start()
         conversationUi.start()
-
-        // Loop cycles for the open conversation use the regular Send path; the bridge waits for
-        // that exact durable turn and returns a typed result to the automation lease owner.
-        foregroundAutomationBridge.start()
-    }
-
-    // ── Custom providers ──────────────────────────────────────
-    // Settings persistence lives in SettingsRepository; ChatViewModel only maintains
-    // the live in-memory provider instances (the `providers` map) via callbacks.
-    fun addCustomProvider(
-        name: String,
-        baseUrl: String,
-        protocol: com.newoether.agora.data.CustomEndpointProtocol =
-            com.newoether.agora.data.CustomEndpointProtocol.OPENAI,
-    ) = customModelConfiguration.addProvider(name, baseUrl, protocol)
-    fun renameCustomProvider(oldName: String, newName: String) =
-        customModelConfiguration.renameProvider(oldName, newName)
-    fun updateCustomProviderProtocol(
-        name: String,
-        protocol: com.newoether.agora.data.CustomEndpointProtocol,
-    ) = customModelConfiguration.updateProviderProtocol(name, protocol)
-    fun deleteCustomProvider(name: String) = customModelConfiguration.deleteProvider(name)
-
-    fun updateCustomModel(
-        oldModelId: String,
-        provider: String,
-        modelId: String,
-        alias: String,
-    ) {
-        customModelConfiguration.updateModel(oldModelId, provider, modelId, alias)
-    }
-
-    fun deleteCustomModel(modelId: String) {
-        customModelConfiguration.deleteModel(modelId)
     }
 
     fun getCurrentVersion(): String {
@@ -823,62 +611,57 @@ class ChatViewModel(
     suspend fun semanticSearch(query: String, limit: Int = 20) =
         semanticSearchService.search(query, limit)
     suspend fun searchMessages(query: String, limit: Int = 20) = convRepo.searchMessages(query, limit)
-    fun addShellDevice(device: ShellDeviceConfig) {
-        settings.addShellDevice(device)
-    }
-    fun updateShellDevice(device: ShellDeviceConfig) {
-        settings.updateShellDevice(device)
-    }
-
-    private val sshHostKeyVerifier = SshHostKeyVerifier()
-    private val remoteEmbeddingConnectionTester by lazy {
+    internal val sshHostKeyVerifier = SshHostKeyVerifier()
+    internal val remoteEmbeddingConnectionTester by lazy {
         RemoteEmbeddingConnectionTester(
             resolveApiKey = ragManager::resolveEmbeddingApiKey,
             resolveBaseUrl = ragManager::resolveEmbeddingBaseUrl,
         )
     }
 
-    suspend fun verifySshHostKey(
-        host: String, port: Int, user: String, password: String
-    ): Result<Pair<String, String>> = sshHostKeyVerifier.verify(host, port, user, password)
-
-    suspend fun testRemoteEmbedding(
-        modelName: String,
-        baseUrl: String,
-        apiKey: String = "",
-    ): String? = remoteEmbeddingConnectionTester.test(modelName, baseUrl, apiKey)
-
     fun createNewChat() = selectionController.createNewChat()
+
+    internal fun restoreNewChatDestination(onFailure: (() -> Unit)? = null) =
+        selectionController.restoreNewChatDestination(onFailure)
 
     fun selectConversation(
         id: String,
         hapticOnCompletion: Boolean = true,
     ) = selectionController.selectConversation(id, hapticOnCompletion)
 
-    fun forkConversationFrom(messageId: String? = null) =
-        conversationForkShareController.fork(messageId)
+    internal fun restoreConversationDestination(id: String, onFailure: (() -> Unit)? = null) =
+        selectionController.restoreConversationDestination(id, onFailure)
 
-    fun shareConversation() = conversationForkShareController.shareConversation()
+    fun forkConversationFrom(messageId: String? = null, onResult: (Boolean) -> Unit = {}): Boolean =
+        chatRuntime.conversationForkShare.fork(phoneClient, messageId, onResult = onResult)
 
     fun shareGeneration(assistantMessageId: String) =
-        conversationForkShareController.shareGeneration(assistantMessageId)
+        chatRuntime.conversationForkShare.shareGeneration(phoneClient, assistantMessageId)
 
     fun shareMessages(messageIds: Set<String>) =
-        conversationForkShareController.shareMessages(messageIds)
+        chatRuntime.conversationForkShare.shareMessages(phoneClient, messageIds)
 
-    fun renameConversation(id: String, newTitle: String) {
-        conversationLifecycleController.rename(id, newTitle)
-    }
+    fun renameConversation(id: String, newTitle: String) =
+        chatRuntime.conversationLifecycle.rename(id, newTitle)
 
-    fun generateTitle(conversationId: String) = generationController.generateTitle(conversationId)
+    fun setConversationPinned(id: String, pinned: Boolean) =
+        chatRuntime.conversationLifecycle.setPinned(id, pinned)
 
-    fun setConversationSystemPrompt(id: String, promptId: String?) {
-        conversationLifecycleController.setSystemPrompt(id, promptId)
-    }
+    fun generateTitle(conversationId: String) =
+        generationController.generateTitle(conversationId, phoneClient)
+
+    fun setConversationSystemPrompt(id: String, promptId: String?) =
+        conversationWorkspaces.setSystemPrompt(id, promptId)
 
     fun setActiveModel(model: String) = selectionController.setActiveModel(model)
 
-    fun deleteConversation(id: String) = conversationLifecycleController.delete(id)
+    fun deleteConversation(
+        id: String,
+        expectedMessageIds: Set<String>? = null,
+        onResult: (Boolean) -> Unit = {},
+    ): Boolean = chatRuntime.conversationLifecycle.delete(phoneClient, id, expectedMessageIds, onResult)
+
+    fun isConversationDeleteLocked(id: String): Boolean = chatRuntime.clients.isSubmissionFrozen(id)
 
     /**
      * Deletes a message and all its descendants (BFS cascade).
@@ -886,58 +669,21 @@ class ChatViewModel(
      * Attachments, embeddings, and branch selections are cleaned up.
      * Returns the count of deleted messages (for the confirmation dialog).
      */
-    suspend fun compactContextManual(
-        model: String,
-        prompt: String,
-        retainLogicalMessages: Int,
-    ): CompactResult = generationController.compactManual(
-        CompactRequest(model, prompt, retainLogicalMessages),
-    )
-
-    /** Owns manual Compact beyond the lifetime of the dialog/composition that initiated it. */
-    fun startContextCompactManual(
-        model: String,
-        prompt: String,
-        retainMessages: Int,
-    ) {
-        viewModelScope.launch {
-            val result = try {
-                compactContextManual(model, prompt, retainMessages)
-            } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                throw cancelled
-            } catch (_: Exception) {
-                CompactResult.Failed(CompactFailureReason.GENERIC)
-            }
-            if (result is CompactResult.Failed) emitSnackbar(compactFailureMessage(appContext, result))
+    fun deleteMessage(
+        messageId: String,
+        onResult: ((Boolean) -> Unit)? = null,
+    ): Int {
+        if (isSwitching.value) {
+            onResult?.invoke(false)
+            return 0
         }
-    }
-
-    /** Re-runs Compact for one terminal Compact pill while preserving its graph position. */
-    fun startContextRecompact(messageId: String) {
-        val model = settings.contextCompactModel.value
-            ?.takeIf(String::isNotBlank)
-            ?: currentActiveModel.value
-        val request = CompactRequest(
-            model = model,
-            prompt = settings.contextCompactPrompt.value,
-            retainLogicalMessages = settings.contextCompactRetainCount.value,
-            replaceMessageId = messageId,
+        return generationController.deleteMessage(
+            origin = phoneClient,
+            conversationId = currentConversationId.value,
+            messageId = messageId,
+            snapshot = renderStore.allMessages,
+            onResult = onResult,
         )
-        viewModelScope.launch {
-            val result = try {
-                generationController.compactManual(request)
-            } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                throw cancelled
-            } catch (_: Exception) {
-                CompactResult.Failed(CompactFailureReason.GENERIC)
-            }
-            if (result is CompactResult.Failed) emitSnackbar(compactFailureMessage(appContext, result))
-        }
-    }
-
-    fun deleteMessage(messageId: String): Int {
-        if (isSwitching.value) return 0
-        return generationController.deleteMessage(messageId)
     }
 
     private val currentRuntimeFacade = CurrentConversationRuntimeFacade(
@@ -945,52 +691,39 @@ class ChatViewModel(
         registry = generationRegistry,
         scope = viewModelScope,
     )
-    val queuedSends: StateFlow<List<QueuedSend>> get() = currentRuntimeFacade.queuedSends
+    internal val queuedSends: StateFlow<List<QueuedSend>> get() = currentRuntimeFacade.queuedSends
     val isStopping: StateFlow<Boolean> get() = currentRuntimeFacade.isStopping
 
     fun removeQueuedSend(id: String) = currentRuntimeFacade.removeQueuedSend(id)
+    fun sendQueuedNow() = currentRuntimeFacade.requestQueueDrain()
 
-    fun stopGeneration() = generationStopAdapter.stopVisibleConversation()
+    fun stopGeneration() = chatRuntime.generationStop.stop(currentConversationId.value, phoneClient)
 
-    fun regenerate(messageId: String): Boolean = generationController.regenerate(messageId)
+    fun regenerate(messageId: String): Boolean = generationController.regenerate(
+        origin = phoneClient,
+        conversationId = currentConversationId.value,
+        messageId = messageId,
+        modelId = currentActiveModel.value,
+        visiblePath = messages.value.toList(),
+    )
 
     fun switchBranch(parentId: String?, currentMessageId: String, direction: Int) =
         selectionController.switchBranch(parentId, currentMessageId, direction)
 
     suspend fun editMessage(messageId: String, newText: String): Boolean =
-        generationController.editMessage(messageId, newText)
+        generationController.editMessage(
+            origin = phoneClient,
+            conversationId = currentConversationId.value,
+            messageId = messageId,
+            newText = newText,
+            modelId = currentActiveModel.value,
+            visiblePath = messages.value.toList(),
+        )
 
-    suspend fun sendMessage(
-        text: String,
-        images: List<String> = emptyList(),
-        attachments: List<SelectedAttachment> = emptyList(),
-        onAccepted: suspend () -> Unit = {},
-    ): SendAcceptance? = composerSendAdapter.sendMessage(text, images, attachments, onAccepted)
-
-    suspend fun fetchModelsForProvider(name: String): List<String> =
-        providerModelSyncUi.fetchModelsForProvider(name)
+    suspend fun fetchModelsForProvider(name: String): List<String> = providerModelSyncUi.fetchModelsForProvider(name)
 
     fun computeProviderFingerprint(): String = providerModelSyncUi.computeFingerprint()
 
     fun fetchAvailableModels() = providerModelSyncUi.fetchAvailableModels()
 
-    // ── Per-conversation draft persistence ─────────────────────
-
-    suspend fun persistDraft(
-        conversationId: String,
-        expectedRevision: Long,
-        text: String,
-        attachments: List<SelectedAttachment>,
-        explicitlyRemovedAttachments: List<SelectedAttachment> = emptyList(),
-    ): DraftPersistResult = composerDrafts.persist(
-        conversationId = conversationId,
-        expectedRevision = expectedRevision,
-        text = text,
-        attachments = attachments,
-        explicitlyRemovedAttachments = explicitlyRemovedAttachments,
-    )
-
-    suspend fun loadDraft(
-        conversationId: String,
-    ): LoadedComposerDraft = composerDrafts.load(conversationId)
 }

@@ -2,7 +2,6 @@ plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.kotlin.serialization)
-    alias(libs.plugins.ksp)
     // Build-time bytecode fix for the Android 15 removeFirst()/removeLast() crash (see build-logic).
     id("buildlogic.removefirstlast-fix")
 }
@@ -17,6 +16,16 @@ if (keystorePropertiesFile.exists()) {
 
 android {
     namespace = "com.newoether.agora"
+    testOptions.unitTests.isIncludeAndroidResources = true
+    // Robolectric installs Conscrypt as the first security provider for the whole test JVM;
+    // on JDK 17+ its TLS server needs reflective access to java.net (InetAddress.holder).
+    testOptions.unitTests.all {
+        it.jvmArgs("--add-opens=java.base/java.net=ALL-UNNAMED")
+        // Reuse each worker for a bounded batch instead of restarting it for every class.
+        it.forkEvery = 16
+        it.maxParallelForks = 2
+        it.maxHeapSize = "1g"
+    }
     compileSdk {
         version = release(36)
     }
@@ -25,10 +34,10 @@ android {
 
     defaultConfig {
         applicationId = "com.newoether.agora"
-        minSdk = 24
+        minSdk = 26
         targetSdk = 36
-        versionCode = 30
-        versionName = "2.0.0"
+        versionCode = 32
+        versionName = "2.2.0"
 
 
         ndk {
@@ -44,10 +53,6 @@ android {
         }
     }
 
-    ksp {
-        arg("room.schemaLocation", "$projectDir/schemas")
-    }
-
     signingConfigs {
         create("release") {
             storeFile = file(keystoreProperties.getProperty("storeFile", "."))
@@ -61,9 +66,18 @@ android {
     val releaseSigning = if (hasKeystore) signingConfigs.getByName("release") else signingConfigs.getByName("debug")
 
     buildTypes {
+        debug {
+            applicationIdSuffix = ".screenshots"
+            versionNameSuffix = "-screenshots"
+            ndk {
+                abiFilters.clear()
+                abiFilters += "x86_64"
+            }
+        }
         release {
             signingConfig = releaseSigning
-            isMinifyEnabled = false
+            // R8 shrinks and optimizes release code; keep rules live in proguard-rules.pro.
+            isMinifyEnabled = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -91,6 +105,7 @@ android {
     }
     buildFeatures {
         compose = true
+        aidl = true
     }
     // The app switches locales at runtime without Play Feature Delivery. Keep every
     // packaged translation available instead of letting App Bundles split languages.
@@ -105,6 +120,10 @@ android {
     packaging {
         jniLibs {
             useLegacyPackaging = true
+        }
+        resources {
+            // bcprov, bcutil and bcpkix each ship the same BouncyCastle (MIT) license text.
+            pickFirsts += "META-INF/LICENSE.md"
         }
     }
 
@@ -151,6 +170,13 @@ afterEvaluate {
 }
 
 dependencies {
+    implementation(project(":core:model"))
+    implementation(project(":core:contracts"))
+    implementation(project(":core:presentation"))
+    implementation(project(":data:database"))
+    implementation(project(":provider:cloud"))
+    implementation("dev.rikka.shizuku:api:13.1.5")
+    implementation("dev.rikka.shizuku:provider:13.1.5")
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.core.splashscreen)
     implementation(libs.androidx.lifecycle.runtime.ktx)
@@ -167,7 +193,6 @@ dependencies {
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.androidx.room.runtime)
     implementation(libs.androidx.room.ktx)
-    ksp(libs.androidx.room.compiler)
     implementation(libs.androidx.datastore.preferences)
     implementation(libs.compose.markdown)
     implementation(libs.jetbrains.markdown)
@@ -184,6 +209,13 @@ dependencies {
     implementation(libs.work.runtime.ktx)
     implementation(libs.jsch)
     implementation(libs.commons.compress)
+    // WebUI server (stage 2): embedded HTTP with the pure-Kotlin CIO engine.
+    implementation(libs.ktor.server.core)
+    implementation(libs.ktor.server.cio)
+    implementation(libs.ktor.server.websockets)
+    // Builds the WebUI's self-signed TLS certificate.
+    implementation(libs.bouncycastle.pkix)
+    testImplementation(libs.ktor.server.test.host)
     debugImplementation(libs.androidx.compose.ui.tooling)
 
     // Unit tests
@@ -191,6 +223,9 @@ dependencies {
     testImplementation("io.mockk:mockk:1.13.12")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
     testImplementation("androidx.arch.core:core-testing:2.2.0")
+    testImplementation("org.robolectric:robolectric:4.16")
+    testImplementation("androidx.compose.ui:ui-test-junit4")
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
 }
 
 tasks.whenTaskAdded {

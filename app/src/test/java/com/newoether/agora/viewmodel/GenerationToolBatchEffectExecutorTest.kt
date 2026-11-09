@@ -4,6 +4,7 @@ import com.newoether.agora.api.StreamEvent
 import com.newoether.agora.api.ToolDefinition
 import com.newoether.agora.model.CitationAnchor
 import com.newoether.agora.model.CitationPolicy
+import com.newoether.agora.model.MessagePersistenceGuard
 import com.newoether.agora.model.MessageSegment
 import com.newoether.agora.model.RunEffect
 import com.newoether.agora.model.RunEffectIdentity
@@ -16,6 +17,8 @@ import com.newoether.agora.tool.ToolProvider
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.test.runTest
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
@@ -28,7 +31,7 @@ class GenerationToolBatchEffectExecutorTest {
     fun `malformed citation segments fail closed during overlay restore and append`() {
         val overlay = GenerationToolOverlay(
             presentation = object : GenerationToolPresentationSource {
-                override fun presentationMetadata(name: String) = null
+                override fun presentationMetadata(name: String, arguments: String?) = null
             },
             providerName = "provider",
         )
@@ -45,7 +48,7 @@ class GenerationToolBatchEffectExecutorTest {
     fun `late thought signature updates the completed thought without adding a segment`() {
         val overlay = GenerationToolOverlay(
             presentation = object : GenerationToolPresentationSource {
-                override fun presentationMetadata(name: String) = null
+                override fun presentationMetadata(name: String, arguments: String?) = null
             },
             providerName = "provider",
         )
@@ -69,7 +72,7 @@ class GenerationToolBatchEffectExecutorTest {
     fun `overlay uniquely owns stream indices metadata and terminal presentation`() {
         val overlay = GenerationToolOverlay(
             presentation = object : GenerationToolPresentationSource {
-                override fun presentationMetadata(name: String) =
+                override fun presentationMetadata(name: String, arguments: String?) =
                     ToolPresentationMetadata(displayName = "Display $name", target = "initial")
             },
             providerName = "provider",
@@ -103,10 +106,57 @@ class GenerationToolBatchEffectExecutorTest {
     }
 
     @Test
+    fun `router arguments reach all overlay metadata boundaries and exact execution title persists`() {
+        val observed = mutableListOf<Pair<String, String?>>()
+        val source = object : GenerationToolPresentationSource {
+            override fun presentationMetadata(name: String, arguments: String?): ToolPresentationMetadata? {
+                observed += name to arguments
+                return null
+            }
+        }
+        val overlay = GenerationToolOverlay(source, "provider")
+        val prefix = """{"arguments":{"content":""""
+        val full = prefix + "x".repeat(10_000) + """"},"tool_id":"mcp_server_read_ab1234"}"""
+        val request = call(arguments = full).copy(name = "mcp_call_tool")
+        overlay.upsert("stream", "call", "mcp_call_tool", prefix, null)
+        overlay.upsert("stream", "call", "", full, null)
+        overlay.start(request)
+        assertEquals(listOf("mcp_call_tool" to prefix, "mcp_call_tool" to full,
+            "mcp_call_tool" to full), observed)
+        overlay.applyProgress("call", ToolExecutionEvent.TargetResolved("server", "filesystem/read_file"))
+        overlay.applyProgress("call", ToolExecutionEvent.TargetResolved("exact server"))
+        val completed = overlay.complete(request, ToolExecutionResult("done"))
+        assertEquals("filesystem/read_file", completed.segment.toolDisplayName)
+        assertEquals("filesystem/read_file", completed.data.displayName)
+        assertEquals("exact server", completed.data.target)
+        assertEquals("mcp_call_tool", completed.data.toolName)
+        assertEquals(full, completed.data.arguments)
+    }
+
+    @Test
+    fun `executor forwards raw arguments to provider metadata`() {
+        val observed = mutableListOf<Pair<String, String?>>()
+        val provider = object : ToolProvider {
+            override fun definitions(ctx: GenerationContext): List<ToolDefinition> = emptyList()
+            override fun handles(name: String) = true
+            override suspend fun execute(name: String, arguments: String, ctx: GenerationContext) = "done"
+            override fun presentationMetadata(name: String, arguments: String?): ToolPresentationMetadata? {
+                observed += name to arguments
+                return ToolPresentationMetadata("remote", "server")
+            }
+        }
+        val executor = GenerationToolExecutor.forTest(listOf(provider))
+        val arguments = """{"tool_id":"complete","arguments":{}}"""
+        assertEquals(ToolPresentationMetadata("remote", "server"),
+            executor.presentationMetadata("mcp_call_tool", arguments))
+        assertEquals(listOf("mcp_call_tool" to arguments), observed)
+    }
+
+    @Test
     fun `citation overlay preserves first source order and merges repeated terminal updates`() {
         val overlay = GenerationToolOverlay(
             presentation = object : GenerationToolPresentationSource {
-                override fun presentationMetadata(name: String) = null
+                override fun presentationMetadata(name: String, arguments: String?) = null
             },
             providerName = "provider",
         )
@@ -154,7 +204,7 @@ class GenerationToolBatchEffectExecutorTest {
     fun `provider hosted tool lifecycle becomes one terminal display segment`() {
         val overlay = GenerationToolOverlay(
             presentation = object : GenerationToolPresentationSource {
-                override fun presentationMetadata(name: String) =
+                override fun presentationMetadata(name: String, arguments: String?) =
                     ToolPresentationMetadata(displayName = "OpenAI Search")
             },
             providerName = "OpenAI",
@@ -224,7 +274,87 @@ class GenerationToolBatchEffectExecutorTest {
         assertEquals(4, publishedAt.size)
         assertEquals("done", outcome.calls.single().result)
         assertEquals(ToolExecutionStates.SUCCEEDED, outcome.segments.single().toolState)
-        assertTrue(outcome.generatedImages.isEmpty())
+    }
+
+    @Test
+    fun `oversized running checkpoint fails before tool execution and leaves a writable terminal overlay`() = runTest {
+        val provider = StreamingToolProvider()
+        val tools = GenerationToolExecutor.forTest(listOf(provider))
+        val executor = GenerationToolBatchEffectExecutor(tools)
+        val overlay = GenerationToolOverlay(tools, "provider")
+        val continuation = Json.parseToJsonElement(
+            """{"type":"reasoning","encrypted_content":"${"x".repeat(610_000)}"}""",
+        ).jsonObject
+        val requestCall = call(responseOutputItems = listOf(continuation))
+        overlay.upsert("stream", "call", "tool", "{}", null)
+
+        val failure = runCatching {
+            executor.execute(
+                request = AuthorizedToolBatchRequest(
+                    effect = RunEffect.ExecuteToolBatch(IDENTITY),
+                    calls = listOf(requestCall),
+                    context = GenerationContext(),
+                    conversationId = "conversation",
+                    authorizedToolNames = setOf("tool"),
+                ),
+                overlay = overlay,
+                callbacks = ToolBatchProgressCallbacks(
+                    publish = { force ->
+                        if (force) MessagePersistenceGuard.encodeSegmentsBounded(overlay.snapshot())
+                    },
+                    onPublishedAt = {},
+                ),
+            )
+        }.exceptionOrNull()
+
+        assertTrue(failure is IllegalStateException)
+        assertTrue(
+            failure?.message.orEmpty().contains("continuation state exceeds"),
+        )
+        assertTrue(provider.executedNames.isEmpty())
+        val terminalSegment = overlay.snapshot().single { it.type == "tool" }
+        assertEquals(ToolExecutionStates.FAILED, terminalSegment.toolState)
+        assertTrue(terminalSegment.responseOutputItems.isEmpty())
+        assertNull(terminalSegment.responseOutputItemProvider)
+        assertTrue(MessagePersistenceGuard.encodeSegmentsBounded(overlay.snapshot()) != null)
+    }
+
+    @Test
+    fun `committed response state is released only from the root overlay copy`() {
+        val tools = GenerationToolExecutor.forTest(emptyList())
+        val overlay = GenerationToolOverlay(tools, "provider")
+        val continuation = Json.parseToJsonElement(
+            """{"id":"rs_1","type":"reasoning","encrypted_content":"opaque"}""",
+        ).jsonObject
+        val requestCall = call(responseOutputItems = listOf(continuation))
+        overlay.upsert("stream", "call", "tool", "{}", null)
+        overlay.start(requestCall)
+        val completed = overlay.complete(requestCall, ToolExecutionResult(text = "done"))
+
+        overlay.markCommittedRound(setOf("call"), toolRoundId = "tool_round")
+
+        val rootSegment = overlay.snapshot().single { it.type == "tool" }
+        assertEquals("tool_round", rootSegment.toolRoundId)
+        assertNull(completed.segment.toolRoundId)
+        assertTrue(rootSegment.responseOutputItems.isEmpty())
+        assertNull(rootSegment.responseOutputItemProvider)
+        assertEquals(listOf(continuation), completed.data.responseOutputItems)
+        assertEquals("provider", completed.data.responseOutputItemProvider)
+    }
+
+    @Test
+    fun `later round with a reused call id cannot reassign committed history`() {
+        val overlay = GenerationToolOverlay(GenerationToolExecutor.forTest(emptyList()), "provider")
+        overlay.upsert("first", "call", "tool", "{}", null)
+        overlay.markCommittedRound(setOf("call"), "tool_first")
+        val committed = overlay.snapshot()
+        overlay.upsert("second", "call", "tool", "{}", null)
+
+        overlay.markCommittedRound(setOf("call"), "tool_second")
+
+        assertEquals(committed, overlay.snapshot().take(committed.size))
+        assertEquals(listOf("tool_first", "tool_second"),
+            overlay.snapshot().filter { it.type == "tool" }.map { it.toolRoundId })
     }
 
     @Test
@@ -286,6 +416,14 @@ class GenerationToolBatchEffectExecutorTest {
         // the image-context row (ToolMessagesTest).
         assertEquals(listOf("done", "done"), outcome.calls.map { it.result })
         assertEquals(
+            listOf("/private/a.png", "/private/b.png"),
+            outcome.calls.map { call -> call.resultImages.single().path },
+        )
+        assertEquals(
+            listOf("/private/a.png", "/private/b.png"),
+            outcome.segments.map { segment -> segment.toolImages.single().path },
+        )
+        assertEquals(
             listOf(
                 "description of /private/a.png",
                 "description of /private/b.png",
@@ -328,19 +466,83 @@ class GenerationToolBatchEffectExecutorTest {
         assertTrue(overlay.snapshot().none { it.type == "transcription" })
     }
 
+    @Test
+    fun `every image is transcribed even when the tool does not opt in`() = runTest {
+        val tools = GenerationToolExecutor.forTest(listOf(ImageResultToolProvider(imageCount = 2, transcribe = false)))
+        val overlay = GenerationToolOverlay(tools, "provider")
+        overlay.upsert("stream", "call", "tool", "{}", null)
+        val observed = mutableListOf<String>()
+        val outcome = GenerationToolBatchEffectExecutor(tools).execute(
+            request = AuthorizedToolBatchRequest(
+                effect = RunEffect.ExecuteToolBatch(IDENTITY),
+                calls = listOf(call(arguments = "{\"path\":\"/private/image.png\"}")),
+                context = GenerationContext(), conversationId = "conversation",
+                authorizedToolNames = setOf("tool"),
+                toolImageTranscriber = { image, progress ->
+                    observed += image.path
+                    progress("working")
+                    "description ${observed.size}"
+                },
+            ),
+            overlay = overlay,
+            callbacks = ToolBatchProgressCallbacks(publish = {}, onPublishedAt = {}),
+        )
+        assertEquals(listOf("/private/image.png", "/private/image.png.1"), observed)
+        assertEquals(2, outcome.calls.single().resultImages.size)
+        assertEquals("[Image 1]\ndescription 1\n\n[Image 2]\ndescription 2", outcome.calls.single().transcription)
+        assertEquals(outcome.calls.single().transcription, outcome.segments.single().toolTranscription)
+        assertEquals(listOf("description 1", "description 2"),
+            overlay.snapshot().filter { it.type == "transcription" }.map { it.content })
+    }
+
+    @Test
+    fun `partial or blank transcription cannot replace the image batch`() = runTest {
+        for (failedDescription in listOf(null, "  ")) {
+            val tools = GenerationToolExecutor.forTest(listOf(ImageResultToolProvider(imageCount = 2)))
+            val overlay = GenerationToolOverlay(tools, "provider")
+            overlay.upsert("stream", "call", "tool", "{}", null)
+            var described = 0
+            val outcome = GenerationToolBatchEffectExecutor(tools).execute(
+                request = AuthorizedToolBatchRequest(
+                    effect = RunEffect.ExecuteToolBatch(IDENTITY),
+                    calls = listOf(call(arguments = "{\"path\":\"/private/image.png\"}")),
+                    context = GenerationContext(), conversationId = "conversation",
+                    authorizedToolNames = setOf("tool"),
+                    toolImageTranscriber = { _, progress ->
+                        described++
+                        progress("partial $described")
+                        if (described == 1) "first image" else failedDescription
+                    },
+                ),
+                overlay = overlay,
+                callbacks = ToolBatchProgressCallbacks(publish = {}, onPublishedAt = {}),
+            )
+            assertEquals(2, described)
+            assertNull(outcome.calls.single().transcription)
+            assertNull(outcome.segments.single().toolTranscription)
+            assertEquals(2, outcome.calls.single().resultImages.size)
+            assertEquals(outcome.calls.single().resultImages, outcome.segments.single().toolImages)
+        }
+    }
+
     private fun call(
         id: String = "call",
         streamKey: String = "stream",
         arguments: String = "{}",
+        responseOutputItems: List<JsonObject> = emptyList(),
     ) = StreamEvent.ToolCallRequest(
         id = id,
         name = "tool",
         arguments = arguments,
         streamKey = streamKey,
         signature = "signature",
+        responseOutputItems = responseOutputItems,
     )
 
-    private class ImageResultToolProvider : ToolProvider {
+    private class ImageResultToolProvider(
+        private val imageCount: Int = 1,
+        private val transcribe: Boolean = true,
+    ) : ToolProvider {
         override fun definitions(ctx: GenerationContext): List<ToolDefinition> = emptyList()
 
         override fun handles(name: String): Boolean = name == "tool"
@@ -359,17 +561,16 @@ class GenerationToolBatchEffectExecutorTest {
                 ToolExecutionEvent.Completed(
                     ToolExecutionResult(
                         text = "done",
-                        images = listOf(
+                        images = List(imageCount) { index ->
                             com.newoether.agora.model.ToolImageAttachment(
-                                path = path,
+                                path = if (index == 0) path else "$path.$index",
                                 mimeType = "image/png",
                                 sizeBytes = 1L,
                                 width = 1,
                                 height = 1,
-                                sha256 = "sha",
-                            ),
-                        ),
-                        transcribeImages = true,
+                            )
+                        },
+                        transcribeImages = transcribe,
                     ),
                 ),
             )
@@ -383,7 +584,7 @@ class GenerationToolBatchEffectExecutorTest {
 
         override fun handles(name: String): Boolean = name == "tool"
 
-        override fun presentationMetadata(name: String) = ToolPresentationMetadata("Display")
+        override fun presentationMetadata(name: String, arguments: String?) = ToolPresentationMetadata("Display")
 
         override suspend fun execute(name: String, arguments: String, ctx: GenerationContext): String =
             error("Streaming adapter expected")

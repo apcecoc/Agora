@@ -12,7 +12,7 @@
     <string name="task_run_now">今すぐ実行</string>
     <string name="task_delete">タスクを削除</string>
     <string name="task_delete_confirm">「%1$s」とその実行履歴をすべて削除しますか？</string>
-    <string name="import_conversation_graph_counts">会話（%1$d）· タスク（%2$d）· ループ（%3$d）</string>
+    <string name="import_conversation_graph_counts">会話（%1$d）· タスク（%2$d）</string>
     <string name="task_enabled">スケジュールで実行</string>
     <string name="task_enabled_desc">オフにすると、「今すぐ実行」をタップした場合にのみタスクが実行されます。</string>
     <string name="task_enabled_needs_schedule">先にスケジュールを選択してください。</string>
@@ -58,6 +58,7 @@
     <string name="task_status_unknown">保留中</string>
     <string name="task_running_notification">スケジュール済みタスクを実行中…</string>
     <string name="loop_running_notification">会話ループを実行中…</string>
+    <string name="auto_backup_running_notification">バックアップを作成中…</string>
     <string name="loop_running">ループ実行中…</string>
     <string name="loop_next_in">次回まで %1$s</string>
     <string name="loop_cycle">サイクル %1$d/%2$d</string>
@@ -67,7 +68,12 @@
     <string name="settings_automation_desc">タスク、ループ、スケジュール精度</string>
     <string name="automation_ai_tools">タスクとループへのアクセス</string>
     <string name="automation_ai_tools_desc">モデルによるタスクの作成と管理、会話ループの開始と停止を許可します。デフォルトではオフです。</string>
-    <string name="automation_scheduling">スケジュール</string>
+    <string name="automation_background_execution">バックグラウンド実行</string>
+    <string name="automation_wake_lock">ウェイクロック</string>
+    <string name="automation_wake_lock_desc">各タスクまたはループの実行中に端末を起動状態に保ちます。通常の予約作業は WorkManager がすでに管理しており、この追加のウェイクロックは電池消費を増やす可能性があります。</string>
+    <string name="automation_battery_optimization">バッテリー最適化</string>
+    <string name="automation_battery_optimization_ignored_desc">最適化なし。Android がより多くのバックグラウンド作業を許可する場合がありますが、メーカー独自の制限は残ることがあります</string>
+    <string name="automation_battery_optimization_active_desc">最適化あり。Android がバックグラウンド作業を遅らせ、メーカー独自の制限も適用される場合があります</string>
     <string name="automation_exact_execution">正確な実行</string>
     <string name="automation_exact_execution_on_desc">タスクとループに正確なアラームを使用します。Androidのシステム制限が適用される場合があります。</string>
     <string name="automation_exact_execution_off_desc">省電力の不正確なアラームを使用します。有効にすると、アラームとリマインダーへのアクセスを要求します。</string>

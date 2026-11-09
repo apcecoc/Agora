@@ -1,103 +1,118 @@
 package com.newoether.agora.viewmodel
 
 import android.app.Application
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+import android.media.MediaMetadataRetriever
+import android.net.Uri
+import com.newoether.agora.model.ImageArtifact
+import com.newoether.agora.util.AttachmentSourceReader
+import com.newoether.agora.util.ImageArtifactProcessor
 import java.io.File
-import java.util.UUID
+import java.net.URI
+import kotlin.coroutines.coroutineContext
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withContext
 
 data class VideoSliceConfig(
     val intervalMicros: Long,
-    val frameCount: Int
+    val frameCount: Int,
 )
 
+/** Pixel size of the actual encoded artifact used for model input. */
+data class ImagePixelSize(val width: Int, val height: Int)
+
+internal fun imageSampleSizeForBounds(
+    width: Int,
+    height: Int,
+    maxEdge: Int = ImageArtifactProcessor.DEFAULT_LONG_EDGE,
+): Int = ImageArtifactProcessor.sampleSizeForBounds(width, height, maxEdge)
+
 class ImageProcessor(
-    private val app: Application
+    private val app: Application,
+    private val artifacts: ImageArtifactProcessor? = null,
 ) {
-    suspend fun processImagesAndVideos(
-        uris: List<String>,
-        sliceConfigs: Map<String, VideoSliceConfig> = emptyMap()
-    ): List<String> = withContext(Dispatchers.IO) {
-        uris.flatMap { uriString ->
-            try {
-                val uri = android.net.Uri.parse(uriString)
-                val mimeType = app.contentResolver.getType(uri)
-
-                when {
-                    mimeType?.startsWith("video/") == true -> {
-                        val config = sliceConfigs[uriString]
-                        val retriever = android.media.MediaMetadataRetriever()
-                        try {
-                            retriever.setDataSource(app, uri)
-                            val paths = mutableListOf<String>()
-
-                            if (config != null && config.frameCount > 1) {
-                                var timeUs = 0L
-                                for (i in 0 until config.frameCount) {
-                                    val bitmap = retriever.getFrameAtTime(
-                                        timeUs, android.media.MediaMetadataRetriever.OPTION_CLOSEST
-                                    )
-                                    if (bitmap != null) {
-                                        val file = File(app.filesDir, "vid_${UUID.randomUUID()}_$i.jpg")
-                                        file.outputStream().use { out ->
-                                            bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 80, out)
-                                        }
-                                        bitmap.recycle()
-                                        paths.add(file.absolutePath)
-                                    }
-                                    timeUs += config.intervalMicros
-                                }
-                            } else {
-                                val bitmap = retriever.frameAtTime
-                                if (bitmap != null) {
-                                    val file = File(app.filesDir, "vid_${UUID.randomUUID()}.jpg")
-                                    file.outputStream().use { out ->
-                                        bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 80, out)
-                                    }
-                                    bitmap.recycle()
-                                    paths.add(file.absolutePath)
-                                }
-                            }
-                            paths
-                        } finally {
-                            retriever.release()
-                        }
-                    }
-                    mimeType?.startsWith("image/") == true || mimeType == null -> {
-                        val options = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                        openStream(uriString)?.use { stream ->
-                            android.graphics.BitmapFactory.decodeStream(stream, null, options)
-                        }
-
-                        if (options.outWidth > 0 && options.outHeight > 0) {
-                            var scale = 1
-                            while (options.outWidth / scale / 2 >= 1024 && options.outHeight / scale / 2 >= 1024) {
-                                scale *= 2
-                            }
-
-                            val decodeOptions = android.graphics.BitmapFactory.Options().apply { inSampleSize = scale }
-                            val bitmap = openStream(uriString)?.use { stream ->
-                                android.graphics.BitmapFactory.decodeStream(stream, null, decodeOptions)
-                            }
-
-                            if (bitmap != null) {
-                                val file = File(app.filesDir, "img_${UUID.randomUUID()}.jpg")
-                                file.outputStream().use { out ->
-                                    bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 80, out)
-                                }
-                                bitmap.recycle()
-                                listOf(file.absolutePath)
-                            } else emptyList()
-                        } else emptyList()
-                    }
-                    else -> emptyList()
-                }
-            } catch (_: Exception) {
-                emptyList()
-            }
+    suspend fun normalizeImage(source: String, outputOwner: Any? = null): String? = withContext(Dispatchers.IO) {
+        var output: String? = null
+        try {
+            coroutineContext.ensureActive()
+            val processor = artifacts ?: ImageArtifactProcessor.configured(app)
+            output = processor.fromSource(source, app.filesDir, "img", outputOwner).path
+            coroutineContext.ensureActive()
+            output
+        } catch (cancelled: CancellationException) {
+            output?.let { File(it).delete() }
+            throw cancelled
+        } catch (_: Exception) {
+            output?.let { File(it).delete() }
+            null
         }
     }
 
-    private fun openStream(source: String): java.io.InputStream? =
-        com.newoether.agora.util.AttachmentSourceReader.open(app, source)
+    suspend fun measureArtifact(source: String): ImageArtifact = withContext(Dispatchers.IO) {
+        (artifacts ?: ImageArtifactProcessor(app)).inspect(source, ImageArtifactProcessor.POLICY_VERSION)
+    }
+
+    /** Legacy callers may still request only bounds; new imports retain the complete descriptor. */
+    suspend fun measurePixels(source: String): ImagePixelSize? = withContext(Dispatchers.IO) {
+        try {
+            val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            AttachmentSourceReader.open(app, source)?.use { stream ->
+                android.graphics.BitmapFactory.decodeStream(stream, null, bounds)
+            }
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) null
+            else ImagePixelSize(bounds.outWidth, bounds.outHeight)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    suspend fun extractVideoFrames(
+        source: String,
+        config: VideoSliceConfig,
+        outputOwner: Any? = null,
+    ): List<String> = withContext(Dispatchers.IO) {
+        val paths = mutableListOf<String>()
+        val retriever = MediaMetadataRetriever()
+        try {
+            val processor = artifacts ?: ImageArtifactProcessor.configured(app)
+            setRetrieverSource(retriever, source)
+            val frameCount = config.frameCount.coerceAtLeast(1)
+            var timeUs = 0L
+            repeat(frameCount) { index ->
+                coroutineContext.ensureActive()
+                val bitmap = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                if (bitmap != null) {
+                    try {
+                        val artifact = processor.fromBitmap(bitmap, app.filesDir, "vid_$index", outputOwner)
+                        paths += artifact.path
+                        coroutineContext.ensureActive()
+                    } finally {
+                        bitmap.recycle()
+                    }
+                }
+                timeUs += config.intervalMicros.coerceAtLeast(0L)
+            }
+            paths
+        } catch (cancelled: CancellationException) {
+            paths.forEach { File(it).delete() }
+            throw cancelled
+        } catch (_: Exception) {
+            paths.forEach { File(it).delete() }
+            emptyList()
+        } finally {
+            retriever.release()
+        }
+    }
+
+    private fun setRetrieverSource(retriever: MediaMetadataRetriever, source: String) {
+        when {
+            File(source).isAbsolute -> retriever.setDataSource(source)
+            source.startsWith("file:", ignoreCase = true) ->
+                retriever.setDataSource(File(URI(source)).absolutePath)
+            else -> retriever.setDataSource(app, Uri.parse(source))
+        }
+    }
 }

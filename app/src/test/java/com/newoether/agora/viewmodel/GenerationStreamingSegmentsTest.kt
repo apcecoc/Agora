@@ -1,14 +1,22 @@
 package com.newoether.agora.viewmodel
 
+import com.newoether.agora.api.LlamaGenerationEvent
+import com.newoether.agora.api.LOCAL_CONTEXT_CAPACITY_ERROR_CODE
+import com.newoether.agora.api.local.localGenerationFailure
+import com.newoether.agora.data.local.MessageEntity
 import com.newoether.agora.model.ChatMessage
 import com.newoether.agora.model.CitationAnchor
 import com.newoether.agora.model.CitationPolicy
 import com.newoether.agora.model.MessagePersistenceGuard
 import com.newoether.agora.model.MessageSegment
 import com.newoether.agora.model.MessageStatus
+import com.newoether.agora.model.StreamingTextDelta
 import com.newoether.agora.model.citationRecords
 import com.newoether.agora.model.toMessageSegment
+import com.newoether.agora.ui.chat.message.assistantErrorContent
+import java.io.File
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -34,6 +42,15 @@ class GenerationStreamingSegmentsTest {
         )
         assertEquals(2, signed.size)
         assertNull(buildLiveSegments(emptyList(), "", ""))
+    }
+
+    @Test
+    fun `live answer delta metadata is an immutable publication snapshot`() {
+        val deltas = mutableListOf(StreamingTextDelta(sequence = 0L, codePointCount = 3))
+        val published = checkNotNull(buildLiveSegments(emptyList(), "abc", "", answerDeltas = deltas))
+            .single().streamingTextDeltas
+        deltas += StreamingTextDelta(sequence = 1L, codePointCount = 2)
+        assertEquals(listOf(StreamingTextDelta(0L, 3)), published)
     }
 
     @Test
@@ -236,6 +253,34 @@ class GenerationStreamingSegmentsTest {
     }
 
     @Test
+    fun `output transform updates streaming text and answer segments together`() {
+        val wrapped = "<context_summary>\nsummary\n</context_"
+        val original = ChatMessage(
+            id = "compact",
+            text = wrapped,
+            participant = com.newoether.agora.model.Participant.MODEL,
+            status = MessageStatus.SENDING,
+            segments = listOf(
+                MessageSegment(
+                    type = "answer",
+                    content = wrapped,
+                    streamingTextDeltas = listOf(StreamingTextDelta(0L, wrapped.length)),
+                ),
+            ),
+        )
+
+        val transformed = original.withBoundedOutputTextTransform { text, _ ->
+            normalizeContextCompactOutput(text)
+        }
+
+        assertEquals("summary", transformed.text)
+        assertEquals("summary", transformed.segments?.single()?.content)
+        assertTrue(transformed.segments?.single()?.streamingTextDeltas?.isEmpty() == true)
+        assertFalse(transformed.text.contains("context_summary"))
+        assertFalse(transformed.segments.orEmpty().any { it.content.contains("context_summary") })
+    }
+
+    @Test
     fun `final text transform is field restricted and persistence bounded`() {
         val original = ChatMessage(
             id = "compact",
@@ -248,7 +293,7 @@ class GenerationStreamingSegmentsTest {
         )
         val oversizedSuffix = "x".repeat(2_000_000)
 
-        val transformed = original.withBoundedFinalTextTransform { text, status ->
+        val transformed = original.withBoundedOutputTextTransform { text, status ->
             assertEquals(MessageStatus.SUCCESS, status)
             text + oversizedSuffix
         }
@@ -258,6 +303,76 @@ class GenerationStreamingSegmentsTest {
             transformed.text,
         )
         assertEquals(original, transformed.copy(text = original.text))
+    }
+
+    @Test
+    fun `native context callback persists help eligibility through final UI projection`() {
+        val failure = localGenerationFailure(
+            event = LlamaGenerationEvent.Failed(
+                message = "LOCAL_CONTEXT_EXCEEDED:24636:8192",
+                inputTokenCount = 24_636,
+                outputTokenCount = 0,
+            ),
+            displayMessage = "This conversation needs 24636 prompt tokens",
+        )
+        val snapshot = GenerationFinalSnapshot(
+            messageId = "model",
+            parentId = "user",
+            text = "",
+            images = emptyList(),
+            thoughts = "",
+            thoughtTitle = null,
+            tokenCount = 24_636,
+            tokenUsage = null,
+            status = MessageStatus.ERROR,
+            timestamp = 10L,
+            thoughtTimeMs = null,
+            modelName = "Local: model.gguf",
+            flushedSegments = emptyList(),
+            answerBuffer = "",
+            thoughtBuffer = "",
+            thoughtSignature = null,
+            thoughtSignatureProvider = null,
+            thoughtDurationMs = null,
+            errorMessage = failure.message,
+            errorCode = failure.code,
+            runId = "run",
+            runSequence = 1L,
+        )
+        val finalMessage = snapshot.toMessage()
+        val encoded = MessagePersistenceGuard.encodeSegmentsBounded(finalMessage.segments)
+        val projected = MessageEntity(
+            id = finalMessage.id,
+            conversationId = "conversation",
+            parentId = finalMessage.parentId,
+            text = finalMessage.text,
+            images = finalMessage.images,
+            thoughts = finalMessage.thoughts,
+            thoughtTitle = finalMessage.thoughtTitle,
+            tokenCount = finalMessage.tokenCount,
+            status = finalMessage.status,
+            participant = finalMessage.participant,
+            timestamp = finalMessage.timestamp,
+            thoughtTimeMs = finalMessage.thoughtTimeMs,
+            modelName = finalMessage.modelName,
+            toolCallJson = encoded,
+            runId = checkNotNull(finalMessage.runId),
+            runSequence = checkNotNull(finalMessage.runSequence),
+        ).toUiChatMessage { it }
+        val errorContent = checkNotNull(
+            assistantErrorContent(
+                message = projected,
+                mergedSegments = projected.segments.orEmpty(),
+                fallbackErrorText = "Failed to generate",
+            )
+        )
+
+        assertEquals(LOCAL_CONTEXT_CAPACITY_ERROR_CODE, failure.code)
+        assertEquals(
+            LOCAL_CONTEXT_CAPACITY_ERROR_CODE,
+            projected.segments?.single { it.type == "error" }?.errorCode,
+        )
+        assertTrue(errorContent.showLocalContextHelp)
     }
 
     @Test
@@ -296,5 +411,46 @@ class GenerationStreamingSegmentsTest {
             "Connection closed before a valid terminator",
             message.segments?.last()?.content,
         )
+    }
+
+    @Test
+    fun `generation answer accumulation uses one mutable buffer and immutable snapshots`() {
+        val source = File(
+            locateMainSourceRoot(),
+            "com/newoether/agora/viewmodel/GenerationManager.kt",
+        ).readText()
+        val accumulator = File(
+            locateMainSourceRoot(),
+            "com/newoether/agora/viewmodel/GenerationOutputAccumulator.kt",
+        ).readText()
+
+        assertTrue(source.contains("val output = GenerationOutputAccumulator(toolExecutor, config.providerName)"))
+        assertTrue(source.contains("output.handleStreamEvent("))
+        assertEquals(1, Regex("""val totalText = StringBuilder\(\)""").findAll(accumulator).count())
+        assertTrue(
+            Regex("""output\.totalText\.clear\(\)\s+output\.totalText\.append\(snapshot\.text\)""")
+                .containsMatchIn(source),
+        )
+        assertTrue(accumulator.contains("totalText.append(answerText)"))
+        assertFalse((source + accumulator).contains("totalText += answerText"))
+        assertTrue(source.contains("text = output.totalText.toString(), thoughts ="))
+        assertTrue(accumulator.contains("finalAnswer = totalText.toString()"))
+        assertTrue(
+            Regex("""text = output\.totalText\.toString\(\),\s+images =""")
+                .containsMatchIn(source),
+        )
+        assertTrue(source.contains("val providerAnswerStart = output.totalText.length"))
+    }
+
+    private fun locateMainSourceRoot(): File {
+        var directory = File(requireNotNull(System.getProperty("user.dir"))).absoluteFile
+        repeat(8) {
+            listOf(
+                File(directory, "app/src/main/java"),
+                File(directory, "src/main/java"),
+            ).firstOrNull(File::isDirectory)?.let { return it }
+            directory = directory.parentFile ?: error("Reached filesystem root")
+        }
+        error("Unable to locate the main Java source directory")
     }
 }

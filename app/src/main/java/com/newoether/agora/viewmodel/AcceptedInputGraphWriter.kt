@@ -1,13 +1,18 @@
 package com.newoether.agora.viewmodel
 
+import com.newoether.agora.data.ConversationSettings
 import com.newoether.agora.data.local.ChatEntity
 import com.newoether.agora.data.local.MessageEntity
+import com.newoether.agora.data.local.NewChatPersistEntity
 import com.newoether.agora.data.local.RunEntity
 import com.newoether.agora.data.repository.ConversationRepository
+import com.newoether.agora.model.MessageSource
 import com.newoether.agora.model.MessageStatus
 import com.newoether.agora.model.Participant
 import com.newoether.agora.model.RunEffect
 import com.newoether.agora.model.RunStatus
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 
 /**
  * Exact durable boundary shared by foreground and headless ordinary sends.
@@ -29,7 +34,12 @@ internal class AcceptedInputGraphWriter(
         val attachmentMeta: String? = null,
         val modelId: String,
         val userTimestamp: Long,
+        val touchConversationOnAdmission: Boolean,
+        /** Set when automation (Task, Loop) sends on the user's behalf; null for typed input. */
+        val source: MessageSource? = null,
         val newConversation: ChatEntity? = null,
+        val newConversationSettings: ConversationSettings? = null,
+        val newChatPersistSnapshot: NewChatPersistEntity? = null,
     ) {
         val conversationId: String get() = inputEffect.identity.conversationId
         val runId: String get() = inputEffect.identity.runId
@@ -77,6 +87,7 @@ internal class AcceptedInputGraphWriter(
             runId = request.runId,
             runSequence = 0,
             consumedAtPass = 0,
+            sourceJson = MessageSource.encode(request.source),
         )
         val modelMessage = MessageEntity(
             id = request.modelMessageId,
@@ -113,12 +124,17 @@ internal class AcceptedInputGraphWriter(
                 messages = listOf(userMessage, modelMessage),
                 messageSelectionUpdates = selectionUpdates,
                 conversationModelId = request.modelId,
+                conversationSettingsJson = request.newConversationSettings?.let(Json::encodeToString),
+                expectedNewChatPersist = request.newChatPersistSnapshot,
+                at = request.userTimestamp,
             )
         } ?: conversations.createRunWithMessages(
             run = run,
             messages = listOf(userMessage, modelMessage),
             messageSelectionUpdates = selectionUpdates,
             conversationModelId = request.modelId,
+            at = request.userTimestamp,
+            touchConversationOnAdmission = request.touchConversationOnAdmission,
         )
         check(graph.messages.size == 2) {
             "Accepted-input graph must contain exactly one USER and one MODEL row"

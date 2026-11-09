@@ -12,7 +12,7 @@
     <string name="task_run_now">Jetzt ausführen</string>
     <string name="task_delete">Aufgabe löschen</string>
     <string name="task_delete_confirm">„%1$s“ und den gesamten Ausführungsverlauf löschen?</string>
-    <string name="import_conversation_graph_counts">Unterhaltungen (%1$d) · Aufgaben (%2$d) · Schleifen (%3$d)</string>
+    <string name="import_conversation_graph_counts">Unterhaltungen (%1$d) · Aufgaben (%2$d)</string>
     <string name="task_enabled">Nach Zeitplan ausführen</string>
     <string name="task_enabled_desc">Wenn deaktiviert, wird die Aufgabe nur über „Jetzt ausführen“ gestartet.</string>
     <string name="task_enabled_needs_schedule">Wähle zuerst einen Zeitplan aus.</string>
@@ -58,6 +58,7 @@
     <string name="task_status_unknown">Ausstehend</string>
     <string name="task_running_notification">Geplante Aufgabe wird ausgeführt…</string>
     <string name="loop_running_notification">Unterhaltungsschleife wird ausgeführt…</string>
+    <string name="auto_backup_running_notification">Datensicherung wird ausgeführt…</string>
     <string name="loop_running">Schleife läuft…</string>
     <string name="loop_next_in">Nächste Ausführung in %1$s</string>
     <string name="loop_cycle">Durchlauf %1$d/%2$d</string>
@@ -67,7 +68,12 @@
     <string name="settings_automation_desc">Aufgaben, Schleifen und Zeitplangenauigkeit</string>
     <string name="automation_ai_tools">Auf Aufgaben und Schleifen zugreifen</string>
     <string name="automation_ai_tools_desc">Dem Modell erlauben, Aufgaben zu erstellen und zu verwalten oder Unterhaltungsschleifen zu starten und zu stoppen. Standardmäßig deaktiviert.</string>
-    <string name="automation_scheduling">Zeitplanung</string>
+    <string name="automation_background_execution">Hintergrundausführung</string>
+    <string name="automation_wake_lock">Aktivierungssperre</string>
+    <string name="automation_wake_lock_desc">Jede Aufgaben- oder Schleifenausführung aktiv halten. WorkManager hält normale geplante Arbeit bereits wach; diese zusätzliche Aktivierungssperre kann den Akkuverbrauch erhöhen.</string>
+    <string name="automation_battery_optimization">Akkuoptimierung</string>
+    <string name="automation_battery_optimization_ignored_desc">Nicht optimiert; Android lässt eventuell mehr Hintergrundarbeit zu, aber Herstellerbeschränkungen können weiterhin gelten</string>
+    <string name="automation_battery_optimization_active_desc">Optimiert; Android kann Hintergrundarbeit verzögern, und Herstellerbeschränkungen können weiterhin gelten</string>
     <string name="automation_exact_execution">Genaue Ausführung</string>
     <string name="automation_exact_execution_on_desc">Genaue Alarme für Aufgaben und Schleifen verwenden. Android kann weiterhin Systembeschränkungen anwenden.</string>
     <string name="automation_exact_execution_off_desc">Akkuschonende ungenaue Alarme verwenden. Aktivieren, um den Zugriff auf Alarme und Erinnerungen anzufordern.</string>

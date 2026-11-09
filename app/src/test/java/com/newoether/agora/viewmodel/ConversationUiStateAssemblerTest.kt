@@ -1,23 +1,30 @@
 package com.newoether.agora.viewmodel
 
-import android.content.Context
 import com.newoether.agora.automation.ConversationExecutionCoordinator
+import com.newoether.agora.data.local.ChatDao
 import com.newoether.agora.data.local.ChatEntity
-import com.newoether.agora.data.local.MessageEntity
+import com.newoether.agora.data.local.MessageContextTopology
 import com.newoether.agora.data.repository.ConversationRepository
 import com.newoether.agora.model.ChatMessage
+import com.newoether.agora.model.MessageSegment
 import com.newoether.agora.model.MessageStatus
 import com.newoether.agora.model.Participant
 import com.newoether.agora.util.DebugLog
 import io.mockk.coEvery
 import io.mockk.coVerify
+import io.mockk.coVerifyOrder
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.mockkObject
 import io.mockk.unmockkObject
+import java.util.ArrayDeque
+import kotlin.coroutines.CoroutineContext
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -30,31 +37,123 @@ import org.junit.Test
 @OptIn(ExperimentalCoroutinesApi::class)
 class ConversationUiStateAssemblerTest {
     @Test
+    fun `streaming deltas and terminal handoff bypass blocked structural projection`() = runTest {
+        val pendingProjectionTasks = ArrayDeque<Runnable>()
+        var projectionBlocked = false
+        val projectionDelegate = StandardTestDispatcher(testScheduler)
+        val projectionDispatcher = object : CoroutineDispatcher() {
+            override fun dispatch(context: CoroutineContext, block: Runnable) {
+                if (projectionBlocked) {
+                    pendingProjectionTasks.addLast(block)
+                } else {
+                    projectionDelegate.dispatch(context, block)
+                }
+            }
+        }
+        val root = ChatMessage(
+            id = "root",
+            text = "request",
+            participant = Participant.USER,
+            timestamp = 1L,
+        )
+        val activeStub = ChatMessage(
+            id = "active",
+            parentId = root.id,
+            text = "",
+            participant = Participant.MODEL,
+            status = MessageStatus.SENDING,
+            timestamp = 2L,
+            runId = "run",
+        )
+        var latestStreaming = activeStub.copy(text = "partial")
+        val assembler = ConversationUiStateAssembler(
+            conversations = mockk(),
+            registry = mockk(),
+            executionCoordinator = mockk(),
+            currentConversationId = MutableStateFlow(CONVERSATION_ID),
+            scope = backgroundScope,
+            projectionDispatcher = projectionDispatcher,
+        )
+        assembler.renderStore.replaceConversation(
+            allMessages = listOf(root, activeStub),
+            streamingMessage = latestStreaming,
+            selectedChildren = emptyMap(),
+        )
+        runCurrent()
+        assertEquals(latestStreaming, assembler.messages.value.last())
+
+        projectionBlocked = true
+        assembler.renderStore.setSelectedChildren(
+            mapOf<String?, String>(null to root.id, root.id to activeStub.id),
+        )
+        runCurrent()
+        assertTrue(pendingProjectionTasks.isNotEmpty())
+
+        repeat(6) { zeroBasedIndex ->
+            val callCount = zeroBasedIndex + 1
+            latestStreaming = activeStub.copy(
+                text = "partial",
+                status = MessageStatus.TOOL_CALLING,
+                segments = (1..callCount).map { callIndex ->
+                    MessageSegment(
+                        type = "tool",
+                        toolCallId = "call-$callIndex",
+                        toolArgs = "",
+                    )
+                },
+            )
+            assembler.renderStore.setStreamingMessage(latestStreaming)
+            runCurrent()
+
+            assertEquals(
+                (1..callCount).map { callIndex -> "call-$callIndex" },
+                assembler.messages.value.last().segments.orEmpty().map(MessageSegment::toolCallId),
+            )
+        }
+
+        val stopped = latestStreaming.copy(
+            status = MessageStatus.STOPPED,
+            segments = latestStreaming.segments.orEmpty() +
+                MessageSegment(type = "answer", content = "terminal payload"),
+        )
+        assembler.commitTerminalStreamingMessage(CONVERSATION_ID, stopped)
+        runCurrent()
+
+        assertEquals(listOf(root.id, stopped.id), assembler.messages.value.map(ChatMessage::id))
+        assertEquals(stopped, assembler.messages.value.last())
+        assertEquals("terminal payload", assembler.messages.value.last().segments.orEmpty().last().content)
+
+        projectionBlocked = false
+        while (pendingProjectionTasks.isNotEmpty()) {
+            pendingProjectionTasks.removeFirst().run()
+        }
+        runCurrent()
+        assertEquals(stopped, assembler.messages.value.last())
+    }
+
+    @Test
     fun `room graph becomes ready atomically before runtime overlay is published`() = runTest {
         val conversations = mockk<ConversationRepository>()
+        stubOpenFamily(conversations)
         val registry = mockk<ConversationStateRegistry>()
-        val executionCoordinator = mockk<ConversationExecutionCoordinator>()
+        val executionCoordinator = ConversationExecutionCoordinator()
         val state = generationState(isLoading = true, generating = false)
-        val roomMessages = MutableSharedFlow<List<MessageEntity>>(replay = 1)
-        coEvery { conversations.ensureRunRecovery() } returns Unit
-        coEvery { conversations.fixStuckMessages(CONVERSATION_ID) } returns Unit
+        val roomMessages = MutableSharedFlow<List<MessageContextTopology>>(replay = 1)
+        coEvery { conversations.recoverConversationRuntime(CONVERSATION_ID, any()) } returns 0
         coEvery { conversations.getConversation(CONVERSATION_ID) } returns ChatEntity(
             id = CONVERSATION_ID,
             title = "Conversation",
             selectedBranchesJson = "{\"null\":\"root\"}",
         )
-        every { conversations.getUiMessagesForConversation(CONVERSATION_ID, null) } returns
+        every { conversations.observeMessageTopology(CONVERSATION_ID) } returns
             roomMessages
         every { registry.getOrCreate(CONVERSATION_ID) } returns state
-        every { executionCoordinator.activeAutomationConversationIds } returns
-            MutableStateFlow(emptySet())
         val currentConversationId = MutableStateFlow<String?>(null)
         val assembler = ConversationUiStateAssembler(
             conversations = conversations,
             registry = registry,
             executionCoordinator = executionCoordinator,
             currentConversationId = currentConversationId,
-            appContext = mockk<Context>(relaxed = true),
             scope = backgroundScope,
             projectionDispatcher = StandardTestDispatcher(testScheduler),
         )
@@ -72,8 +171,10 @@ class ConversationUiStateAssemblerTest {
         assertEquals(mapOf<String?, String>(null to "root"), assembler.renderStore.selectedChildren)
         assertTrue(assembler.isLoading.value)
         assertNull(assembler.generatingInConversationId.value)
-        coVerify(exactly = 1) { conversations.ensureRunRecovery() }
-        coVerify(exactly = 1) { conversations.fixStuckMessages(CONVERSATION_ID) }
+        coVerifyOrder {
+            conversations.recoverConversationRuntime(CONVERSATION_ID, any())
+            conversations.getConversation(CONVERSATION_ID)
+        }
 
         currentConversationId.value = null
         runCurrent()
@@ -84,28 +185,72 @@ class ConversationUiStateAssemblerTest {
     }
 
     @Test
+    fun `explicit parent open validates children before publishing its room graph`() = runTest {
+        val conversations = mockk<ConversationRepository>()
+        val dao = stubOpenFamily(conversations)
+        coEvery { dao.getSubagentIds(CONVERSATION_ID) } returns listOf("child")
+        coEvery { dao.getSubagentFamilyRootId("child") } returns CONVERSATION_ID
+        coEvery { conversations.recoverConversationRuntime(any(), any()) } returns 0
+        coEvery { conversations.getConversation(CONVERSATION_ID) } returns ChatEntity(
+            id = CONVERSATION_ID, title = "Conversation",
+        )
+        every { conversations.observeMessageTopology(CONVERSATION_ID) } returns
+            MutableStateFlow(emptyList())
+        val registry = mockk<ConversationStateRegistry>()
+        every { registry.getOrCreate(CONVERSATION_ID) } returns generationState(false, false)
+        val assembler = ConversationUiStateAssembler(
+            conversations = conversations,
+            registry = registry,
+            executionCoordinator = ConversationExecutionCoordinator(),
+            currentConversationId = MutableStateFlow(CONVERSATION_ID),
+            scope = backgroundScope,
+            projectionDispatcher = StandardTestDispatcher(testScheduler),
+        )
+        // This mocked repository must execute the production transaction wrapper.
+        coEvery { conversations.withProviderContextSnapshot<Unit>(any()) } coAnswers {
+            firstArg<suspend () -> Unit>().invoke()
+        }
+
+        assembler.start()
+        runCurrent()
+
+        assertEquals(CONVERSATION_ID, assembler.loadedMessagesConversationId.value)
+        coVerifyOrder {
+            conversations.recoverConversationRuntime(CONVERSATION_ID, any())
+            conversations.recoverConversationRuntime("child", any())
+            conversations.getConversation(CONVERSATION_ID)
+        }
+        io.mockk.verify(exactly = 0) { registry.getOrCreate("child") }
+    }
+
+    @Test
     fun `active automation prevents foreground recovery from stopping its live row`() = runTest {
         val conversations = mockk<ConversationRepository>()
+        stubOpenFamily(conversations)
         val registry = mockk<ConversationStateRegistry>()
-        val executionCoordinator = mockk<ConversationExecutionCoordinator>()
+        val executionCoordinator = ConversationExecutionCoordinator()
         val state = generationState(isLoading = false, generating = false)
-        coEvery { conversations.ensureRunRecovery() } returns Unit
         coEvery { conversations.getConversation(CONVERSATION_ID) } returns ChatEntity(
             id = CONVERSATION_ID,
             title = "Conversation",
         )
-        every { conversations.getUiMessagesForConversation(CONVERSATION_ID, null) } returns
+        every { conversations.observeMessageTopology(CONVERSATION_ID) } returns
             MutableStateFlow(emptyList())
         every { registry.getOrCreate(CONVERSATION_ID) } returns state
-        every { executionCoordinator.activeAutomationConversationIds } returns
-            MutableStateFlow(setOf(CONVERSATION_ID))
-        val currentConversationId = MutableStateFlow<String?>(CONVERSATION_ID)
+        val ownerEntered = CompletableDeferred<Unit>()
+        val releaseOwner = CompletableDeferred<Unit>()
+        val ownerJob = launch {
+            executionCoordinator.withAutomationConversationLock(CONVERSATION_ID) {
+                ownerEntered.complete(Unit)
+                releaseOwner.await()
+            }
+        }
+        ownerEntered.await()
         val assembler = ConversationUiStateAssembler(
             conversations = conversations,
             registry = registry,
             executionCoordinator = executionCoordinator,
-            currentConversationId = currentConversationId,
-            appContext = mockk<Context>(relaxed = true),
+            currentConversationId = MutableStateFlow(CONVERSATION_ID),
             scope = backgroundScope,
             projectionDispatcher = StandardTestDispatcher(testScheduler),
         )
@@ -114,7 +259,10 @@ class ConversationUiStateAssemblerTest {
         runCurrent()
 
         assertEquals(CONVERSATION_ID, assembler.loadedMessagesConversationId.value)
-        coVerify(exactly = 0) { conversations.fixStuckMessages(any()) }
+        coVerify(exactly = 0) { conversations.recoverConversationRuntime(any(), any()) }
+
+        releaseOwner.complete(Unit)
+        ownerJob.join()
     }
 
     @Test
@@ -125,7 +273,6 @@ class ConversationUiStateAssemblerTest {
             registry = mockk(),
             executionCoordinator = mockk(),
             currentConversationId = currentConversationId,
-            appContext = mockk(relaxed = true),
             scope = backgroundScope,
             projectionDispatcher = StandardTestDispatcher(testScheduler),
         )
@@ -146,14 +293,16 @@ class ConversationUiStateAssemblerTest {
         every { DebugLog.e(any(), any(), any()) } returns Unit
         try {
             val conversations = mockk<ConversationRepository>()
-            coEvery { conversations.ensureRunRecovery() } throws IllegalStateException("failed")
+            stubOpenFamily(conversations)
+            val executionCoordinator = ConversationExecutionCoordinator()
+            coEvery { conversations.recoverConversationRuntime(CONVERSATION_ID, any()) } throws
+                IllegalStateException("failed")
             val failedIds = mutableListOf<String>()
             val assembler = ConversationUiStateAssembler(
                 conversations = conversations,
                 registry = mockk(),
-                executionCoordinator = mockk(),
+                executionCoordinator = executionCoordinator,
                 currentConversationId = MutableStateFlow(CONVERSATION_ID),
-                appContext = mockk(relaxed = true),
                 scope = backgroundScope,
                 projectionDispatcher = StandardTestDispatcher(testScheduler),
                 onConversationLoadFailed = failedIds::add,
@@ -184,6 +333,76 @@ class ConversationUiStateAssemblerTest {
         } finally {
             unmockkObject(DebugLog)
         }
+    }
+
+    @Test
+    fun `initial readiness waits for structural projection and rejects cancelled owners`() = runTest {
+        val pending = ArrayDeque<Runnable>()
+        val delegate = StandardTestDispatcher(testScheduler)
+        var blocked = false
+        val dispatcher = object : CoroutineDispatcher() {
+            override fun dispatch(context: CoroutineContext, block: Runnable) {
+                if (blocked) pending.addLast(block) else delegate.dispatch(context, block)
+            }
+        }
+        val conversations = mockk<ConversationRepository>()
+        stubOpenFamily(conversations)
+        coEvery { conversations.recoverConversationRuntime(any(), any()) } returns 0
+        coEvery { conversations.getConversation(any()) } answers {
+            ChatEntity(id = firstArg(), title = "Conversation", selectedBranchesJson = "{\"null\":\"marker\"}")
+        }
+        every { conversations.observeMessageTopology(any()) } returns MutableStateFlow(emptyList())
+        val registry = mockk<ConversationStateRegistry>()
+        every { registry.getOrCreate(any()) } returns generationState(false, false)
+        val selected = MutableStateFlow<String?>(null)
+        val assembler = ConversationUiStateAssembler(
+            conversations, registry, ConversationExecutionCoordinator(), selected, backgroundScope,
+            projectionDispatcher = dispatcher,
+        )
+        assembler.start()
+        runCurrent()
+        blocked = true
+        selected.value = "abandoned"
+        runCurrent()
+        assertTrue(pending.isNotEmpty())
+        while (assembler.renderStore.selectedChildren.isEmpty()) {
+            assertTrue(pending.isNotEmpty())
+            pending.removeFirst().run()
+            runCurrent()
+        }
+        // Room's atomic graph is present, but the initial branch walk is still dispatched.
+        assertTrue(pending.isNotEmpty())
+        assertNull(assembler.loadedMessagesConversationId.value)
+        selected.value = "latest"
+        runCurrent()
+        assertNull(assembler.loadedMessagesConversationId.value)
+        blocked = false
+        while (pending.isNotEmpty()) pending.removeFirst().run()
+        runCurrent()
+        assertEquals("latest", assembler.loadedMessagesConversationId.value)
+        assertTrue(assembler.messages.value.isEmpty())
+
+        // Equal empty render snapshots still need a new owner-tagged structural projection.
+        selected.value = "empty-next"
+        runCurrent()
+        assertEquals("empty-next", assembler.loadedMessagesConversationId.value)
+        selected.value = null
+        runCurrent()
+        assertNull(assembler.loadedMessagesConversationId.value)
+    }
+
+    private fun stubOpenFamily(conversations: ConversationRepository): ChatDao {
+        val dao = mockk<ChatDao>()
+        every { conversations.chatDao } returns dao
+        every { conversations.subagentJobs } returns MutableStateFlow(emptyMap())
+        coEvery { dao.getSubagentFamilyRootId(any()) } answers { firstArg<String>() }
+        coEvery { dao.getSubagentIds(any()) } returns emptyList()
+        coEvery { dao.getLiveRun(any()) } returns null
+        coEvery { dao.getValidatedSubagentStatus(any()) } returns null
+        coEvery { conversations.withProviderContextSnapshot<Unit>(any()) } coAnswers {
+            firstArg<suspend () -> Unit>().invoke()
+        }
+        return dao
     }
 
     private fun generationState(

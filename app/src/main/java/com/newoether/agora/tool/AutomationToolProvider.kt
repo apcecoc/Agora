@@ -8,6 +8,7 @@ import com.newoether.agora.automation.CronExpression
 import com.newoether.agora.automation.LoopManager
 import com.newoether.agora.automation.LoopPolicy
 import com.newoether.agora.automation.TaskManager
+import com.newoether.agora.data.SystemPromptEntry
 import com.newoether.agora.data.local.LoopEntity
 import com.newoether.agora.data.local.TaskEntity
 import com.newoether.agora.viewmodel.GenerationContext
@@ -33,6 +34,8 @@ import kotlinx.serialization.json.putJsonArray
 class AutomationToolProvider(
     private val taskManager: TaskManager,
     private val loopManager: LoopManager,
+    /** Saved system prompts, read per call so a task can pin the prompt the user just added. */
+    private val savedSystemPrompts: suspend () -> List<SystemPromptEntry> = { emptyList() },
     private val isCurrentlyEnabled: suspend () -> Boolean = { true },
 ) : ToolProvider {
 
@@ -49,6 +52,7 @@ class AutomationToolProvider(
                             "prompt" to ToolProperty("string", "The complete prompt to run on every occurrence."),
                             "cron" to ToolProperty("string", "A valid 5-field cron expression: minute hour day-of-month month day-of-week."),
                             "model" to ToolProperty("string", "Optional provider-prefixed model id. Omit to use the app default model."),
+                            "system_prompt" to ToolProperty("string", "Optional saved system prompt, given as its id or its exact title. Omit to use the app default prompt."),
                         ),
                         required = listOf("name", "prompt", "cron"),
                     ),
@@ -97,7 +101,7 @@ class AutomationToolProvider(
         )
     }
 
-    override fun handles(name: String): Boolean = name in TOOL_NAMES
+    override fun handles(name: String): Boolean = BuiltInToolNames.canonical(name) in TOOL_NAMES
 
     override suspend fun execute(name: String, arguments: String, ctx: GenerationContext): String {
         if (!ctx.automationToolsEnabled || !isCurrentlyEnabled()) {
@@ -107,7 +111,7 @@ class AutomationToolProvider(
 
         return try {
             val args = Json.parseToJsonElement(arguments.ifBlank { "{}" }).jsonObject
-            when (name) {
+            when (BuiltInToolNames.canonical(name)) {
                 CREATE_TASK -> createTask(args)
                 LIST_TASKS -> listTasks()
                 DELETE_TASK -> deleteTask(args)
@@ -132,7 +136,23 @@ class AutomationToolProvider(
         if (!CronExpression.isValid(cron)) return error("Invalid 5-field cron expression: $cron")
         val model = args.string("model")?.trim()?.takeIf { it.isNotEmpty() }
 
-        val task = taskManager.createTask(name, prompt, cron, model)
+        val requestedPrompt = args.string("system_prompt")?.trim()?.takeIf { it.isNotEmpty() }
+        val systemPromptId = if (requestedPrompt == null) null else {
+            // Fail closed: silently falling back to the app default would hide the mismatch until
+            // the task runs with the wrong prompt.
+            val prompts = savedSystemPrompts()
+            val byTitle = prompts.filter { it.title.trim().equals(requestedPrompt, ignoreCase = true) }
+            when {
+                prompts.any { it.id == requestedPrompt } -> requestedPrompt
+                byTitle.size == 1 -> byTitle.first().id
+                byTitle.size > 1 -> return error(
+                    "Multiple saved system prompts are titled \"$requestedPrompt\"; pass the prompt id instead"
+                )
+                else -> return error("Saved system prompt not found: $requestedPrompt")
+            }
+        }
+
+        val task = taskManager.createTask(name, prompt, cron, model, systemPromptId)
         return buildJsonObject {
             put("type", CREATE_TASK)
             put("task", task.toJson())
@@ -169,7 +189,7 @@ class AutomationToolProvider(
 
     private suspend fun startLoop(args: JsonObject, ctx: GenerationContext): String {
         val conversationId = ctx.conversationId?.takeIf { it.isNotBlank() }
-            ?: return error("start_loop requires a current conversation")
+            ?: return error("loop_start requires a current conversation")
         val intervalSeconds = args.long("interval_seconds")
             ?: return error("interval_seconds must be an integer")
         if (intervalSeconds !in LoopPolicy.MIN_INTERVAL_SECONDS..LoopPolicy.MAX_INTERVAL_SECONDS) {
@@ -207,7 +227,7 @@ class AutomationToolProvider(
 
     private suspend fun stopLoop(ctx: GenerationContext): String {
         val conversationId = ctx.conversationId?.takeIf { it.isNotBlank() }
-            ?: return error("stop_loop requires a current conversation")
+            ?: return error("loop_stop requires a current conversation")
 
         return when (loopManager.stopLoop(conversationId)) {
             LoopManager.StopResult.Stopped -> stopLoopJson(conversationId, "stopped")
@@ -227,6 +247,7 @@ class AutomationToolProvider(
         put("name", name)
         put("prompt", prompt)
         modelId?.let { put("model", it) }
+        systemPromptId?.let { put("system_prompt_id", it) }
         put("cron", cronExpr)
         put("enabled", enabled)
         put("created_at", createdAt)
@@ -256,11 +277,11 @@ class AutomationToolProvider(
     private fun error(message: String): String = "Error: $message"
 
     private companion object {
-        const val CREATE_TASK = "create_task"
-        const val LIST_TASKS = "list_tasks"
-        const val DELETE_TASK = "delete_task"
-        const val START_LOOP = "start_loop"
-        const val STOP_LOOP = "stop_loop"
+        const val CREATE_TASK = "task_create"
+        const val LIST_TASKS = "task_list"
+        const val DELETE_TASK = "task_delete"
+        const val START_LOOP = "loop_start"
+        const val STOP_LOOP = "loop_stop"
 
         val TOOL_NAMES = setOf(CREATE_TASK, LIST_TASKS, DELETE_TASK, START_LOOP, STOP_LOOP)
     }

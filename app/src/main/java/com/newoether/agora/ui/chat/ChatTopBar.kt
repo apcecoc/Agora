@@ -1,6 +1,7 @@
 package com.newoether.agora.ui.chat
 
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.Crossfade
 import androidx.compose.animation.SizeTransform
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.tween
@@ -12,12 +13,15 @@ import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.GenericShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CallSplit
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Menu
@@ -25,8 +29,6 @@ import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Share
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -37,18 +39,133 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.RoundRect
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import com.newoether.agora.ui.theme.chatCompactWidth
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.res.stringResource
 import com.newoether.agora.R
 import com.newoether.agora.model.ChatConversation
+import com.newoether.agora.model.ContextBudget
 import com.newoether.agora.ui.motion.LocalAgoraMotionPolicy
+import com.newoether.agora.ui.motion.rememberIdentityClipWidth
 import com.newoether.agora.ui.theme.ChatType
+import com.newoether.agora.ui.components.AgoraDropdownMenu
+import com.newoether.agora.ui.components.AgoraDropdownMenuItem
+import com.newoether.agora.data.replaceCustomProviderIdsForDisplay
+import com.newoether.agora.ui.common.LocalAgoraHaptics
+import com.newoether.agora.viewmodel.ChatViewModel
+
+private const val TITLE_CAPSULE_MAX_WIDTH_DP = 260
+
+// Narrow windows (see CHAT_COMPACT_WIDTH_DP) use thinner capsules.
+private val chatTopBarCapsuleHeight get() = if (chatCompactWidth) 48.dp else 52.dp
+// Compact: 40 dp buttons with a 4 dp inset, so the 48 dp new-chat circle has equal padding on all sides.
+private val chatTopBarButtonInset get() = if (chatCompactWidth) 4.dp else 5.dp
+private val chatTopBarButtonSize get() = if (chatCompactWidth) 40.dp else 44.dp
+// Nudges the leading icon onto the capsule's vertical center line (regular: 5 + 22 - 1 = 26 = 52 / 2).
+private val chatTopBarLeadingNudge get() = chatTopBarCapsuleHeight / 2 - chatTopBarButtonInset - chatTopBarButtonSize / 2
+
+@Composable
+internal fun ChatTopBar(
+    viewModel: ChatViewModel,
+    dialogState: ChatAppDialogState,
+    conversationInteraction: ConversationInteractionProjection,
+    conversations: List<ChatConversation>,
+    totalTokens: Int,
+    contextTokenBudget: Int,
+    systemPromptEnabled: Boolean,
+    onNavigateBack: (() -> Unit)?,
+    onOpenDrawer: () -> Unit,
+    onForkConversation: () -> Unit,
+    onNewChat: () -> Unit,
+) {
+    val currentConversationId by viewModel.currentConversationId.collectAsState()
+    val currentConversation by viewModel.currentConversation.collectAsState()
+    val loadedOwnerId by viewModel.loadedMessagesConversationId.collectAsState()
+    val isNewChatMode by viewModel.isNewChatMode.collectAsState()
+    val isSwitching by viewModel.isSwitching.collectAsState()
+    val isTransitioningToNewChat by viewModel.isTransitioningToNewChat.collectAsState()
+    val isLoading by viewModel.isLoading.collectAsState()
+    val submittingOwnerIds by viewModel.conversationComposerSubmission.activeOwnerIds.collectAsState()
+    val customProviders by viewModel.settings.customProviders.collectAsState()
+    val focusManager = LocalFocusManager.current
+    val haptics = LocalAgoraHaptics.current
+    val metadataEnabled = !isNewChatMode && currentConversationId != null &&
+        currentConversation?.id == currentConversationId && loadedOwnerId == currentConversationId &&
+        !isSwitching && !isTransitioningToNewChat && !conversationInteraction.shareSelectionActive
+
+    // Recheck the source owner at dispatch; dialog state retains it after later navigation.
+    fun currentTarget(conversationId: String): ChatConversation? {
+        if (viewModel.isNewChatMode.value || viewModel.isSwitching.value ||
+            viewModel.isTransitioningToNewChat.value || conversationInteraction.shareSelectionActive ||
+            viewModel.currentConversationId.value != conversationId ||
+            viewModel.loadedMessagesConversationId.value != conversationId
+        ) return null
+        return viewModel.currentConversation.value?.takeIf { it.id == conversationId }
+    }
+
+    ChatTopBar(
+        isNewChatMode = isNewChatMode,
+        conversations = conversations,
+        currentConversationId = currentConversationId,
+        currentConversationTitle = currentConversation?.title?.let {
+            replaceCustomProviderIdsForDisplay(it, customProviders)
+        },
+        totalTokens = totalTokens,
+        contextTokenBudget = contextTokenBudget,
+        searchActive = conversationInteraction.searchActive,
+        searchQuery = conversationInteraction.searchQuery,
+        searchMatchIndex = conversationInteraction.searchMatchIndex,
+        searchMatchCount = conversationInteraction.searchMatches.size,
+        conversationActionsEnabled = !isNewChatMode && currentConversationId != null &&
+            !isLoading && !conversationInteraction.shareSelectionActive,
+        conversationMetadataActionsEnabled = metadataEnabled,
+        conversationDeleteEnabled = currentConversationId !in submittingOwnerIds,
+        systemPromptEnabled = systemPromptEnabled,
+        onNavigateBack = onNavigateBack,
+        onOpenDrawer = onOpenDrawer,
+        onSearchQueryChange = conversationInteraction::updateSearchQuery,
+        onSearchPrevious = { if (conversationInteraction.previousSearchMatch()) haptics.selection() },
+        onSearchNext = { if (conversationInteraction.nextSearchMatch()) haptics.selection() },
+        onSearchDismiss = {
+            conversationInteraction.dismissSearch()
+            focusManager.clearFocus()
+        },
+        onSearchClick = conversationInteraction::activateSearch,
+        onSystemPromptClick = dialogState::showPrompt,
+        onForkConversation = onForkConversation,
+        onShareConversation = {
+            conversationInteraction.dismissSearch()
+            focusManager.clearFocus()
+            conversationInteraction.activateShareSelection()
+        },
+        onRenameConversation = { conversationId ->
+            currentTarget(conversationId)?.let { conversation ->
+                dialogState.requestRename(conversationId, conversation.title)
+            }
+        },
+        onDeleteConversation = { conversationId ->
+            if (currentTarget(conversationId) != null && !viewModel.isConversationDeleteLocked(conversationId)) {
+                dialogState.requestDelete(conversationId)
+            }
+        },
+        onNewChat = onNewChat,
+    )
+}
 
 /**
  * The chat screen's top bar: a title capsule (drawer menu + brand/conversation
@@ -62,11 +179,18 @@ internal fun ChatTopBar(
     currentConversationId: String?,
     currentConversationTitle: String? = null,
     totalTokens: Int,
+    contextTokenBudget: Int,
+    contextAvailable: Boolean = totalTokens > 0,
+    subtitle: String? = null,
+    subtitleLeading: (@Composable () -> Unit)? = null,
     searchActive: Boolean = false,
     searchQuery: String = "",
     searchMatchIndex: Int = -1,
     searchMatchCount: Int = 0,
     conversationActionsEnabled: Boolean = false,
+    conversationMetadataActionsEnabled: Boolean = false,
+    conversationDeleteEnabled: Boolean = conversationMetadataActionsEnabled,
+    systemPromptEnabled: Boolean = true,
     onNavigateBack: (() -> Unit)? = null,
     onOpenDrawer: () -> Unit,
     onSearchQueryChange: (String) -> Unit = {},
@@ -77,9 +201,31 @@ internal fun ChatTopBar(
     onSystemPromptClick: () -> Unit,
     onForkConversation: () -> Unit = {},
     onShareConversation: () -> Unit = {},
+    onRenameConversation: (String) -> Unit = {},
+    onDeleteConversation: (String) -> Unit = {},
     onNewChat: () -> Unit,
+    trailingActions: (@Composable RowScope.() -> Unit)? = null,
+    newChatEnabled: Boolean = true,
+    newChatDescription: String? = null,
+    moreMenuContent: (@Composable ColumnScope.(dismiss: () -> Unit) -> Unit)? = null,
 ) {
-    var moreMenuOpen by remember { mutableStateOf(false) }
+    var moreMenuOpen by remember(
+        if (moreMenuContent == null) currentConversationId else null,
+        moreMenuContent == null && isNewChatMode,
+    ) { mutableStateOf(false) }
+    var moreMenuConversationId by remember { mutableStateOf<String?>(null) }
+    var moreMenuRequest by remember { mutableStateOf<Any?>(null) }
+    val menuRequest = moreMenuRequest
+    val menuConversationId = moreMenuConversationId
+    val latestConversationId by rememberUpdatedState(if (isNewChatMode) null else currentConversationId)
+    val hasConversationTarget = !isNewChatMode && currentConversationId != null &&
+        menuConversationId == currentConversationId
+    val renameEnabled = hasConversationTarget && conversationMetadataActionsEnabled
+    val deleteEnabled = hasConversationTarget && conversationMetadataActionsEnabled && conversationDeleteEnabled
+    val latestRenameEnabled by rememberUpdatedState(renameEnabled)
+    val latestMenuOpen by rememberUpdatedState(moreMenuOpen)
+    val latestDeleteEnabled by rememberUpdatedState(deleteEnabled)
+    val deleteColor = MaterialTheme.colorScheme.error.copy(alpha = if (deleteEnabled) 1f else 0.5f)
     val allowSpatialTransitions = LocalAgoraMotionPolicy.current.allowSpatialTransitions
     val searchFocusRequester = remember { FocusRequester() }
     LaunchedEffect(searchActive) {
@@ -95,6 +241,10 @@ internal fun ChatTopBar(
         modifier = Modifier
             .fillMaxWidth()
             .defaultMinSize(minHeight = 180.dp)
+            // An expanded composer fills the screen and paints a background gradient across it, and
+            // the Scaffold draws the bottom bar after the top one, so that fill would otherwise lie
+            // over this bar's title and action capsules. The composer's own layer sits at 1f.
+            .zIndex(1.5f)
             .background(
                 Brush.verticalGradient(
                     0.0f to MaterialTheme.colorScheme.background.copy(alpha = 0.98f),
@@ -148,7 +298,7 @@ internal fun ChatTopBar(
                 .fillMaxWidth()
                 .statusBarsPadding()
                 .padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 8.dp)
-                .height(52.dp),
+                .height(chatTopBarCapsuleHeight),
         ) { targetSearchActive ->
             Row(
                 modifier = Modifier
@@ -238,94 +388,193 @@ internal fun ChatTopBar(
                         }
                     }
                 } else {
-                // Resolve the active conversation's title; null in new-chat mode OR
-                // before the conversation/title has loaded. Both the brand TEXT and the
-                // brand font SIZE are gated on this single value, so the title never
-                // changes size before the text swaps (no transient "Agora at 17sp").
+                // New Chat keeps only the menu. Unloaded existing titles retain their brand fallback.
                 val resolvedTitle = if (isNewChatMode) null else {
                     currentConversationTitle?.takeIf { it.isNotBlank() }
                         ?: conversations.find { it.id == currentConversationId }?.title?.takeIf { it.isNotBlank() }
                 }
                 val showBrandTitle = resolvedTitle == null
+                val appName = stringResource(R.string.app_name)
+                val titlePresentation = Triple(
+                    isNewChatMode,
+                    if (showBrandTitle) null else currentConversationId,
+                    resolvedTitle,
+                )
+                val textMeasurer = rememberTextMeasurer()
+                val density = LocalDensity.current
+                val tokenSubtitle = if (!showBrandTitle && subtitle != null) subtitle
+                else if (!showBrandTitle && contextAvailable) {
+                    stringResource(
+                        R.string.context_usage_messages,
+                        ContextBudget.compactLabel(totalTokens),
+                        ContextBudget.compactLabel(contextTokenBudget),
+                    )
+                } else {
+                    null
+                }
+                val conversationTitleStyle =
+                    if (tokenSubtitle != null) ChatType.conversationTitle else ChatType.conversationTitleSolo
+                val targetTitleContentWidth = with(density) {
+                    val primaryWidth = textMeasurer.measure(
+                        text = AnnotatedString(if (showBrandTitle) appName else resolvedTitle.orEmpty()),
+                        style = if (showBrandTitle) ChatType.brandTitle else conversationTitleStyle,
+                        maxLines = 1,
+                        softWrap = false,
+                    ).size.width.toDp()
+                    val subtitleWidth = tokenSubtitle?.let { subtitle ->
+                        textMeasurer.measure(
+                            text = AnnotatedString(subtitle),
+                            style = ChatType.micro,
+                            maxLines = 1,
+                            softWrap = false,
+                        ).size.width.toDp()
+                    } ?: 0.dp
+                    val leadingWidth = if (subtitleLeading != null && tokenSubtitle != null) 14.dp else 0.dp
+                    minOf(maxOf(primaryWidth, subtitleWidth + leadingWidth), 180.dp)
+                }
+                val targetTitleCapsuleWidth = if (isNewChatMode) chatTopBarCapsuleHeight else minOf(
+                    chatTopBarButtonInset + chatTopBarButtonSize + 5.dp + targetTitleContentWidth + 20.dp,
+                    TITLE_CAPSULE_MAX_WIDTH_DP.dp,
+                )
+                // Only the rounded clip moves; the title content keeps its final layout.
+                val visibleTitleCapsuleWidth = rememberIdentityClipWidth(
+                    identity = titlePresentation,
+                    targetWidth = targetTitleCapsuleWidth,
+                    allowSpatialTransitions = allowSpatialTransitions,
+                )
+                val visibleTitleCapsuleWidthPx = with(density) {
+                    visibleTitleCapsuleWidth.toPx()
+                }
+                val titleCapsuleClipShape = GenericShape { size, _ ->
+                    val right = visibleTitleCapsuleWidthPx.coerceIn(0f, size.width)
+                    val cornerRadius = CornerRadius(size.height / 2f, size.height / 2f)
+                    addRoundRect(
+                        RoundRect(
+                            left = 0f,
+                            top = 0f,
+                            right = right,
+                            bottom = size.height,
+                            cornerRadius = cornerRadius,
+                        ),
+                    )
+                }
 
-                // Title capsule: menu + title
-                ChatTopBarCapsule(
-                    modifier = Modifier.fillMaxHeight().widthIn(max = 260.dp)
+                // Reserve the trailing capsule first; the title may only use the remaining width.
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight(),
+                    contentAlignment = Alignment.CenterStart,
                 ) {
-                    Row(
-                        modifier = Modifier.fillMaxHeight(),
-                        verticalAlignment = Alignment.CenterVertically
+                    ChatTopBarCapsule(
+                        modifier = Modifier
+                            .fillMaxHeight()
+                            .width(TITLE_CAPSULE_MAX_WIDTH_DP.dp)
+                            .graphicsLayer {
+                                shape = titleCapsuleClipShape
+                                clip = true
+                                shadowElevation = 4.dp.toPx()
+                            },
+                        shadowElevation = 0.dp,
                     ) {
-                        Spacer(modifier = Modifier.width(5.dp))
-                        IconButton(
-                            onClick = onNavigateBack ?: onOpenDrawer,
-                            modifier = Modifier.size(44.dp)
+                        Row(
+                            modifier = Modifier.fillMaxHeight(),
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Icon(
-                                imageVector = if (onNavigateBack != null) {
-                                    Icons.AutoMirrored.Filled.ArrowBack
-                                } else {
-                                    Icons.Default.Menu
-                                },
-                                contentDescription = stringResource(
-                                    if (onNavigateBack != null) R.string.back else R.string.menu
-                                ),
-                                modifier = Modifier.size(26.dp),
-                            )
-                        }
-                        Spacer(modifier = Modifier.width(5.dp))
-                        if (showBrandTitle) {
-                            Text(
-                                text = stringResource(R.string.app_name),
-                                style = ChatType.brandTitle,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.widthIn(max = 180.dp)
-                            )
-                        } else {
-                            Column(modifier = Modifier.widthIn(max = 180.dp)) {
-                                Text(
-                                    text = resolvedTitle,
-                                    // Single-line (no token subtitle) uses a slightly-smaller-than-brand
-                                    // solo size; with the token subtitle stacked below, the compact size.
-                                    style = if (totalTokens > 0) ChatType.conversationTitle else ChatType.conversationTitleSolo,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
+                            Spacer(modifier = Modifier.width(chatTopBarButtonInset))
+                            IconButton(
+                                onClick = onNavigateBack ?: onOpenDrawer,
+                                modifier = Modifier.size(chatTopBarButtonSize)
+                            ) {
+                                Icon(
+                                    imageVector = if (onNavigateBack != null) {
+                                        Icons.AutoMirrored.Filled.ArrowBack
+                                    } else {
+                                        Icons.Default.Menu
+                                    },
+                                    contentDescription = stringResource(
+                                        if (onNavigateBack != null) R.string.back else R.string.menu
+                                    ),
+                                    modifier = Modifier.size(26.dp).graphicsLayer {
+                                        translationX = if (onNavigateBack == null) chatTopBarLeadingNudge.toPx() else 0f
+                                    },
                                 )
-                                if (totalTokens > 0) {
+                            }
+                            Spacer(modifier = Modifier.width(5.dp))
+                            Crossfade(
+                                targetState = titlePresentation,
+                                animationSpec = tween(
+                                    durationMillis = 200,
+                                    easing = FastOutSlowInEasing,
+                                ),
+                                label = "chatTopBarTitle",
+                            ) { presentation ->
+                                if (presentation.first) {
+                                    // The menu remains while the outgoing title fades into the circular clip.
+                                } else if (presentation.third == null) {
                                     Text(
-                                        text = stringResource(R.string.total_tokens, totalTokens),
-                                        style = ChatType.micro,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
-                                        maxLines = 1
+                                        text = appName,
+                                        style = ChatType.brandTitle,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.padding(end = 20.dp).widthIn(max = 180.dp)
                                     )
+                                } else {
+                                    Column(
+                                        modifier = Modifier.padding(end = 20.dp).widthIn(max = 180.dp)
+                                    ) {
+                                        Text(
+                                            text = presentation.third.orEmpty(),
+                                            // Single-line (no token subtitle) uses a slightly-smaller-than-brand
+                                            // solo size; with the token subtitle stacked below, the compact size.
+                                            style = conversationTitleStyle,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        if (tokenSubtitle != null) {
+                                            Row(verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                                subtitleLeading?.invoke()
+                                                Text(
+                                                    text = tokenSubtitle,
+                                                    style = ChatType.micro,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                                                    maxLines = 1
+                                                )
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
-                        Spacer(modifier = Modifier.width(20.dp))
                     }
                 }
 
-                Spacer(modifier = Modifier.weight(1f))
+                Spacer(modifier = Modifier.width(16.dp))
 
                 // Actions capsule: system prompt + new chat
                 ChatTopBarCapsule(
-                    modifier = Modifier.fillMaxHeight()
+                    modifier = Modifier
+                        .fillMaxHeight()
+                        .width(chatTopBarButtonSize * 2 + chatTopBarButtonInset * 2)
                 ) {
                     Row(
                         modifier = Modifier.fillMaxHeight(),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Spacer(modifier = Modifier.width(5.dp))
-                        IconButton(onClick = onNewChat, modifier = Modifier.size(44.dp)) {
-                            Icon(Icons.Default.Add, contentDescription = stringResource(R.string.new_chat), modifier = Modifier.size(30.dp))
+                        Spacer(modifier = Modifier.width(chatTopBarButtonInset))
+                        if (trailingActions != null) trailingActions() else {
+                        IconButton(onClick = onNewChat, enabled = newChatEnabled, modifier = Modifier.size(chatTopBarButtonSize)) {
+                            Icon(Icons.Default.Add, contentDescription = newChatDescription ?: stringResource(R.string.new_chat), modifier = Modifier.size(30.dp))
                         }
                         Box {
                             IconButton(
                                 onClick = {
+                                    moreMenuConversationId = currentConversationId
+                                    moreMenuRequest = Any()
                                     moreMenuOpen = true
                                 },
-                                modifier = Modifier.size(44.dp),
+                                modifier = Modifier.size(chatTopBarButtonSize),
                             ) {
                                 Icon(
                                     Icons.Default.MoreVert,
@@ -333,14 +582,17 @@ internal fun ChatTopBar(
                                     modifier = Modifier.size(26.dp),
                                 )
                             }
-                            DropdownMenu(
+                            AgoraDropdownMenu(
                                 expanded = moreMenuOpen,
-                                onDismissRequest = { moreMenuOpen = false },
-                                shape = RoundedCornerShape(12.dp),
+                                onDismissRequest = {
+                                    moreMenuOpen = false
+                                    moreMenuRequest = null
+                                },
                                 containerColor = MaterialTheme.colorScheme.surfaceContainer,
                                 tonalElevation = 16.dp,
                             ) {
-                                DropdownMenuItem(
+                                if (moreMenuContent != null) moreMenuContent { moreMenuOpen = false } else {
+                                AgoraDropdownMenuItem(
                                     text = { Text(stringResource(R.string.conversation_search)) },
                                     leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
                                     enabled = conversationActionsEnabled,
@@ -349,17 +601,18 @@ internal fun ChatTopBar(
                                         onSearchClick()
                                     },
                                 )
-                                DropdownMenuItem(
+                                AgoraDropdownMenuItem(
                                     text = { Text(stringResource(R.string.system_prompt)) },
                                     leadingIcon = {
                                         Icon(Icons.Default.Psychology, contentDescription = null)
                                     },
+                                    enabled = systemPromptEnabled,
                                     onClick = {
                                         moreMenuOpen = false
                                         onSystemPromptClick()
                                     },
                                 )
-                                DropdownMenuItem(
+                                AgoraDropdownMenuItem(
                                     text = { Text(stringResource(R.string.conversation_fork_menu)) },
                                     leadingIcon = {
                                         Icon(Icons.Default.CallSplit, contentDescription = null)
@@ -370,7 +623,7 @@ internal fun ChatTopBar(
                                         onForkConversation()
                                     },
                                 )
-                                DropdownMenuItem(
+                                AgoraDropdownMenuItem(
                                     text = { Text(stringResource(R.string.conversation_share)) },
                                     leadingIcon = {
                                         Icon(Icons.Default.Share, contentDescription = null)
@@ -381,9 +634,41 @@ internal fun ChatTopBar(
                                         onShareConversation()
                                     },
                                 )
+                                AgoraDropdownMenuItem(
+                                    text = { Text(stringResource(R.string.rename)) },
+                                    leadingIcon = { Icon(Icons.Default.Edit, contentDescription = null) },
+                                    enabled = renameEnabled,
+                                    onClick = {
+                                        if (latestMenuOpen && menuRequest != null && menuRequest === moreMenuRequest &&
+                                            latestRenameEnabled && menuConversationId == latestConversationId
+                                        ) {
+                                            moreMenuOpen = false
+                                            moreMenuRequest = null
+                                            menuConversationId?.let(onRenameConversation)
+                                        }
+                                    },
+                                )
+                                AgoraDropdownMenuItem(
+                                    text = { Text(stringResource(R.string.delete), color = deleteColor) },
+                                    leadingIcon = {
+                                        Icon(Icons.Default.Delete, contentDescription = null, tint = deleteColor)
+                                    },
+                                    enabled = deleteEnabled,
+                                    onClick = {
+                                        if (latestMenuOpen && menuRequest != null && menuRequest === moreMenuRequest &&
+                                            latestDeleteEnabled && menuConversationId == latestConversationId
+                                        ) {
+                                            moreMenuOpen = false
+                                            moreMenuRequest = null
+                                            menuConversationId?.let(onDeleteConversation)
+                                        }
+                                    },
+                                )
+                                }
                             }
                         }
-                        Spacer(modifier = Modifier.width(5.dp))
+                        }
+                        Spacer(modifier = Modifier.width(chatTopBarButtonInset))
                     }
                 }
                 }
@@ -395,6 +680,7 @@ internal fun ChatTopBar(
 @Composable
 private fun ChatTopBarCapsule(
     modifier: Modifier = Modifier,
+    shadowElevation: Dp = 4.dp,
     content: @Composable () -> Unit,
 ) {
     val shape = RoundedCornerShape(50)
@@ -406,7 +692,7 @@ private fun ChatTopBarCapsule(
             modifier = Modifier.matchParentSize(),
             shape = shape,
             color = Color.Transparent,
-            shadowElevation = 4.dp,
+            shadowElevation = shadowElevation,
         ) {}
         Surface(
             shape = shape,

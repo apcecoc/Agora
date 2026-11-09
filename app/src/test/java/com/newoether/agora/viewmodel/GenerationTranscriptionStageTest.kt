@@ -43,6 +43,8 @@ class GenerationTranscriptionStageTest {
             manager.transcribe(
                 listOf(target),
                 "conversation",
+                "run",
+                2,
                 "provider",
                 "model",
                 "key",
@@ -51,10 +53,12 @@ class GenerationTranscriptionStageTest {
                 null,
                 "assistant",
                 10L,
+                false,
+                "5m",
                 any(),
             )
         } coAnswers {
-            val progress = arg<suspend (ChatMessage) -> Unit>(10)
+            val progress = arg<suspend (ChatMessage) -> Unit>(14)
             progress(snapshot)
             listOf(transcriptionSegment) to null
         }
@@ -83,6 +87,8 @@ class GenerationTranscriptionStageTest {
             manager.transcribe(
                 listOf(target),
                 "conversation",
+                "run",
+                2,
                 "provider",
                 "model",
                 "key",
@@ -91,10 +97,12 @@ class GenerationTranscriptionStageTest {
                 null,
                 "assistant",
                 10L,
+                false,
+                "5m",
                 any(),
             )
         } coAnswers {
-            arg<suspend (ChatMessage) -> Unit>(10)(snapshot)
+            arg<suspend (ChatMessage) -> Unit>(14)(snapshot)
             throw expected
         }
         val execution = GenerationTranscriptionStage(manager).newExecution()
@@ -110,8 +118,23 @@ class GenerationTranscriptionStageTest {
         assertNull(GenerationTranscriptionStage(manager).newExecution().incompleteSnapshot())
     }
 
+    @Test
+    fun `enabled transcription with image targets and no model reports a configuration failure`() = runTest {
+        val manager = mockk<TranscriptionManager>()
+        coEvery { manager.collectTargets("conversation", "user") } returns listOf(
+            TranscriptionManager.TranscriptionTarget("user", "image", 0),
+        )
+        val outcome = GenerationTranscriptionStage(manager).newExecution().execute(
+            request(enabledContext().copy(transcriptionModelId = "")),
+        ) { _, _ -> fail("No transcription request is configured") }
+        assertFalse(outcome.performed)
+        assertTrue(outcome.error!!.contains("no transcription model"))
+    }
+
     private fun request(context: GenerationContext) = GenerationTranscriptionStageRequest(
         conversationId = "conversation",
+        runId = "run",
+        pass = 2,
         parentId = "user",
         context = context,
         generationJob = null,
@@ -125,6 +148,8 @@ class GenerationTranscriptionStageTest {
         transcriptionModelId = "model",
         transcriptionApiKey = "key",
         imageTranscriptionPrompt = "prompt",
+        transcriptionAnthropicCacheEnabled = false,
+        transcriptionAnthropicCacheTtl = "5m",
     )
 
     private fun snapshot(text: String) = ChatMessage(

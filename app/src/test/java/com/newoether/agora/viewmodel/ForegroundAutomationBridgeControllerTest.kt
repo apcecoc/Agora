@@ -4,7 +4,6 @@ import com.newoether.agora.automation.TaskExecutionEngine.BridgeOutcome
 import com.newoether.agora.data.local.MessageEntity
 import com.newoether.agora.model.MessageStatus
 import com.newoether.agora.model.Participant
-import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertSame
@@ -31,7 +30,7 @@ class ForegroundAutomationBridgeControllerTest {
         val fixture = Fixture(currentConversationId = "other")
         fixture.controller.start()
 
-        val outcome = fixture.bridge()("conversation", "input", "model")
+        val outcome = fixture.bridge()("conversation", "input", "model", "loop")
 
         assertEquals(BridgeOutcome.NotDelegated, outcome)
         assertTrue(fixture.sendInputs.isEmpty())
@@ -43,10 +42,13 @@ class ForegroundAutomationBridgeControllerTest {
         val fixture = Fixture(sendOutcome = AutomationSendOutcome.SlotBusy)
         fixture.controller.start()
 
-        val outcome = fixture.bridge()("conversation", "input", "model")
+        val outcome = fixture.bridge()("conversation", "input", "model", "loop")
 
         assertEquals(BridgeOutcome.Busy(), outcome)
-        assertEquals(listOf(Triple("conversation", "input", "model")), fixture.sendInputs)
+        assertEquals(
+            listOf(listOf("conversation", "input", "model", "loop")),
+            fixture.sendInputs,
+        )
         assertTrue(fixture.loadedMessageIds.isEmpty())
     }
 
@@ -61,7 +63,7 @@ class ForegroundAutomationBridgeControllerTest {
         )
         fixture.controller.start()
 
-        val outcome = fixture.bridge()("conversation", "input", "model")
+        val outcome = fixture.bridge()("conversation", "input", "model", "loop")
 
         assertEquals(BridgeOutcome.Completed("expected", "answer"), outcome)
         assertEquals(listOf("expected"), fixture.loadedMessageIds)
@@ -75,7 +77,7 @@ class ForegroundAutomationBridgeControllerTest {
         )
         fixture.controller.start()
 
-        val outcome = fixture.bridge()("conversation", "input", "model")
+        val outcome = fixture.bridge()("conversation", "input", "model", "loop")
 
         assertEquals(BridgeOutcome.Failed("Generation row disappeared"), outcome)
     }
@@ -88,9 +90,9 @@ class ForegroundAutomationBridgeControllerTest {
         )
         fixture.controller.start()
 
-        val explicit = fixture.bridge()("conversation", "input", "model")
+        val explicit = fixture.bridge()("conversation", "input", "model", "loop")
         fixture.messages = listOf(modelMessage("failed", "", MessageStatus.STOPPED))
-        val fallback = fixture.bridge()("conversation", "input", "model")
+        val fallback = fixture.bridge()("conversation", "input", "model", "loop")
 
         assertEquals(BridgeOutcome.Failed("provider error"), explicit)
         assertEquals(BridgeOutcome.Failed("Generation failed"), fallback)
@@ -110,7 +112,7 @@ class ForegroundAutomationBridgeControllerTest {
         )
         fixture.controller.start()
 
-        val outcome = fixture.bridge()("conversation", "input", "model")
+        val outcome = fixture.bridge()("conversation", "input", "model", "loop")
 
         assertEquals(BridgeOutcome.Failed("Generation row disappeared"), outcome)
         assertEquals(listOf("foreign"), fixture.loadedMessageIds)
@@ -123,12 +125,12 @@ class ForegroundAutomationBridgeControllerTest {
     ) {
         val attachments = mutableListOf<Pair<Any, ForegroundSendBridge>>()
         val detachedOwners = mutableListOf<Any>()
-        val sendInputs = mutableListOf<Triple<String, String, String>>()
+        val sendInputs = mutableListOf<List<String>>()
         val loadedMessageIds = mutableListOf<String>()
         val controller = ForegroundAutomationBridgeController(
-            currentConversationId = MutableStateFlow(currentConversationId),
-            send = { conversationId, text, modelId ->
-                sendInputs += Triple(conversationId, text, modelId)
+            isConversationOpen = { it == currentConversationId },
+            send = { conversationId, text, modelId, requestKind ->
+                sendInputs += listOf(conversationId, text, modelId, requestKind)
                 sendOutcome
             },
             loadMessage = { messageId ->

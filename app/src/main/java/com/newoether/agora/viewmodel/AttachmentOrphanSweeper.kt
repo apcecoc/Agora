@@ -1,116 +1,72 @@
 package com.newoether.agora.viewmodel
 
-import com.newoether.agora.data.repository.ConversationRepository
-import com.newoether.agora.model.AttachmentMeta
-import com.newoether.agora.model.SelectedAttachment
-import kotlinx.serialization.json.Json
+import androidx.room.withTransaction
+import com.newoether.agora.data.local.AttachmentReferenceIndex
+import com.newoether.agora.data.local.ChatDatabase
+import com.newoether.agora.util.AttachmentFiles
 import java.io.File
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.yield
 
-/** Reclaims old private attachment files only after scanning every durable reference source. */
+/** Reclaims private attachments only while durable and live ownership are stable. */
 internal class AttachmentOrphanSweeper(
-    private val conversations: ConversationRepository,
+    private val database: ChatDatabase,
     private val filesDirectory: File,
     private val now: () -> Long = System::currentTimeMillis,
 ) {
-    suspend fun sweep() {
-        val referenced = HashSet<String>()
-        collectMessageReferences(referenced)
-        collectDraftReferences(referenced)
+    private val references = AttachmentReferenceIndex(database)
 
+    suspend fun sweep(): Boolean {
+        references.refresh()
+        var completed = true
         val cutoffNow = now()
-        deleteOldUnreferencedRootAttachments(referenced, cutoffNow)
-        deleteOldUnreferencedFiles(File(filesDirectory, "images"), "camera_", referenced, cutoffNow)
-        listOf(
-            File(filesDirectory, "run-inputs"),
-            File(filesDirectory, "fork-attachments"),
-        ).forEach { directory ->
-            deleteOldUnreferencedFiles(directory, requiredPrefix = null, referenced, cutoffNow)
-        }
-    }
-
-    private suspend fun collectMessageReferences(referenced: MutableSet<String>) {
-        var afterMessageId: String? = null
-        while (true) {
-            val page = conversations.getMessageAttachmentReferencesPage(
-                afterId = afterMessageId,
-                limit = DATABASE_SCAN_PAGE_SIZE,
-            )
-            page.forEach { message ->
-                message.images.forEach { referenced.add(it.removePrefix("file://")) }
-                message.attachmentMeta?.let { json ->
-                    runCatching { Json.decodeFromString<AttachmentMeta>(json) }.getOrNull()
-                        ?.items?.forEach { item ->
-                            item.originalUri?.takeIf { it.startsWith("file://") }
-                                ?.let { referenced.add(it.removePrefix("file://")) }
-                        }
-                }
-            }
-            afterMessageId = page.lastOrNull()?.id
-            if (page.size < DATABASE_SCAN_PAGE_SIZE) break
-        }
-    }
-
-    private suspend fun collectDraftReferences(referenced: MutableSet<String>) {
-        var afterConversationId: String? = null
-        while (true) {
-            val page = conversations.getConversationDraftAttachmentReferencesPage(
-                afterId = afterConversationId,
-                limit = DATABASE_SCAN_PAGE_SIZE,
-            )
-            page.forEach { conversation ->
-                runCatching {
-                    Json.decodeFromString<List<SelectedAttachment>>(conversation.draftAttachments)
-                }.getOrNull()?.forEach { attachment ->
-                    attachment.localPath?.let { referenced.add(it) }
-                    attachment.processedFrames?.forEach { referenced.add(it) }
-                    attachment.preRenderedPaths?.forEach { referenced.add(it) }
-                }
-            }
-            afterConversationId = page.lastOrNull()?.id
-            if (page.size < DATABASE_SCAN_PAGE_SIZE) break
-        }
-    }
-
-    private fun deleteOldUnreferencedRootAttachments(
-        referenced: Set<String>,
-        cutoffNow: Long,
-    ) {
         val prefixes = arrayOf("att_", "vid_", "img_", "pdf_")
-        filesDirectory.listFiles { file ->
-            file.isFile && prefixes.any { prefix -> file.name.startsWith(prefix) }
-        }?.forEach { file ->
-            deleteIfOldAndUnreferenced(file, referenced, cutoffNow)
+        val candidates = sequence {
+            yieldAll(filesDirectory.listFiles { file ->
+                file.isFile && prefixes.any { file.name.startsWith(it) }
+            }.orEmpty().asSequence())
+            yieldAll(File(filesDirectory, "images").listFiles { file ->
+                file.isFile && file.name.startsWith("camera_")
+            }.orEmpty().asSequence())
+            listOf("run-inputs", "fork-attachments").forEach { directory ->
+                yieldAll(File(filesDirectory, directory).listFiles { it.isFile }.orEmpty().asSequence())
+            }
         }
+        for (file in candidates) {
+            currentCoroutineContext().ensureActive()
+            if (cutoffNow - file.lastModified() > MINIMUM_FILE_AGE_MS) {
+                completed = deleteExact(file.absolutePath) && completed
+            }
+            yield()
+        }
+        return completed
     }
 
-    private fun deleteOldUnreferencedFiles(
-        directory: File,
-        requiredPrefix: String?,
-        referenced: Set<String>,
-        cutoffNow: Long,
-    ) {
-        directory.listFiles { file ->
-            file.isFile && (requiredPrefix == null || file.name.startsWith(requiredPrefix))
-        }?.forEach { file ->
-            deleteIfOldAndUnreferenced(file, referenced, cutoffNow)
+    suspend fun deleteExact(path: String): Boolean {
+        val normalized = AttachmentReferenceIndex.normalizePath(path)
+        val root = filesDirectory.canonicalFile
+        val file = File(normalized).canonicalFile
+        require(file != root && file.path.startsWith(root.path + File.separator)) {
+            "Attachment debt is outside app-private storage"
         }
-    }
-
-    private fun deleteIfOldAndUnreferenced(
-        file: File,
-        referenced: Set<String>,
-        cutoffNow: Long,
-    ) {
-        if (
-            file.absolutePath !in referenced &&
-            cutoffNow - file.lastModified() > MINIMUM_FILE_AGE_MS
-        ) {
-            runCatching { file.delete() }
+        val revision = references.prepareCheck(normalized)
+        val completed = database.withTransaction {
+            if (!references.isCurrent(revision)) return@withTransaction false
+            if (references.contains(normalized)) return@withTransaction true
+            // Send's durable transfer and the live-owner unlink fence remain atomic.
+            AttachmentFiles.deleteIfUnowned(file)
         }
+        val sandboxRoot = File(root, "sandbox-home").canonicalFile
+        val parent = file.parentFile?.canonicalFile
+        if (completed && parent != null && parent != sandboxRoot &&
+            parent.path.startsWith(sandboxRoot.path + File.separator)) {
+            runCatching { parent.takeIf { it.listFiles().isNullOrEmpty() }?.delete() }
+        }
+        return completed
     }
 
     private companion object {
-        const val DATABASE_SCAN_PAGE_SIZE = 64
         const val MINIMUM_FILE_AGE_MS = 60 * 60 * 1000L
     }
 }

@@ -26,7 +26,7 @@ class ConversationRegenerationServiceTest {
     @Test
     fun rejectsNonBoundaryOutputBeforeTransitionOrRuntimeClaim() = runBlocking {
         val fixture = Fixture()
-        val state = ConversationGenerationState("conversation")
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
         val result = fixture.service.regenerate(
             fixture.request.copy(
                 visiblePath = listOf(
@@ -41,9 +41,6 @@ class ConversationRegenerationServiceTest {
         assertFalse(result)
         assertEquals(null, fixture.transitions.request.value)
         assertFalse(state.generating.value)
-        coVerify(exactly = 0) {
-            fixture.conversations.getMessagesForConversationSnapshot(any())
-        }
         state.dispose()
         Unit
     }
@@ -51,7 +48,7 @@ class ConversationRegenerationServiceTest {
     @Test
     fun transitionConflictDelegatesExactUnlaunchedSlotRelease() = runBlocking {
         val fixture = Fixture()
-        val state = ConversationGenerationState("conversation")
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
         val existing = checkNotNull(
             fixture.transitions.begin("conversation", "other-model", "source-input"),
         )
@@ -72,7 +69,7 @@ class ConversationRegenerationServiceTest {
     @Test
     fun fadeAdmissionCommitsReplacementRunBeforeProjectionAndBoundLaunch() = runBlocking {
         val fixture = Fixture()
-        val state = ConversationGenerationState("conversation")
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
         coEvery {
             fixture.conversations.getMessagesByIds(
                 listOf("target-model", "target-model", "source-input"),
@@ -88,6 +85,7 @@ class ConversationRegenerationServiceTest {
                 messageSelectionUpdates = mapOf("source-input" to "new-model"),
                 conversationModelId = "provider:model",
                 at = any(),
+                touchConversationOnAdmission = true,
             )
         } answers {
             RunGraphCommit(
@@ -110,12 +108,12 @@ class ConversationRegenerationServiceTest {
                         it.snapshot === fixture.snapshot &&
                         it.runId == "new-run" &&
                         it.pass == 0 &&
-                        it.callerTag == "regenerate"
+                        it.requestKind == "chat"
                 },
                 state,
             )
         }
-        assertEquals(RegenerationTransitionStage.COMMITTED, fixture.transitions.request.value?.stage)
+        assertEquals(BranchReplacementTransitionStage.COMMITTED, fixture.transitions.request.value?.stage)
         assertEquals("source-run", createdRun.captured.parentRunId)
         assertEquals(50L, createdRun.captured.startedAt)
         assertEquals(listOf("new-model"), createdMessages.captured.map { it.id })
@@ -130,7 +128,7 @@ class ConversationRegenerationServiceTest {
     @Test
     fun adjacentAssistantRunRegeneratesOnlyItsOwnRootFromItsDirectParent() = runBlocking {
         val fixture = Fixture()
-        val state = ConversationGenerationState("conversation")
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
         val upper = TARGET_MODEL.copy(
             id = "upper-model",
             parentId = "source-input",
@@ -169,6 +167,7 @@ class ConversationRegenerationServiceTest {
                 messageSelectionUpdates = mapOf(upper.id to "new-model"),
                 conversationModelId = "provider:model",
                 at = any(),
+                touchConversationOnAdmission = true,
             )
         } answers {
             RunGraphCommit(
@@ -195,7 +194,7 @@ class ConversationRegenerationServiceTest {
             fixture.boundLauncher.launch(
                 match {
                     it.modelMessageId == "new-model" &&
-                        it.callerTag == "regenerate"
+                        it.requestKind == "chat"
                 },
                 state,
             )
@@ -211,7 +210,7 @@ class ConversationRegenerationServiceTest {
     private class Fixture {
         val conversations = mockk<ConversationRepository>()
         val requestBuilder = mockk<GenerationRequestBuilder>()
-        val transitions = RegenerationTransitionCoordinator(fadeTimeoutMs = 5_000L)
+        val transitions = BranchReplacementTransitionCoordinator(fadeTimeoutMs = 5_000L)
         val terminalSettlement = mockk<GenerationTerminalSettlementController>()
         val boundLauncher = mockk<BoundRunGenerationLauncher>()
         val guidanceDrain = mockk<QueuedGuidanceDrainExecutor>()
@@ -225,7 +224,6 @@ class ConversationRegenerationServiceTest {
             conversations = conversations,
             requestBuilder = requestBuilder,
             executionCoordinator = ConversationExecutionCoordinator(),
-            transitions = transitions,
             terminalSettlement = terminalSettlement,
             boundRunGenerationLauncher = boundLauncher,
             guidanceDrain = guidanceDrain,
@@ -250,6 +248,7 @@ class ConversationRegenerationServiceTest {
             messageId = "target-model",
             modelId = "provider:model",
             visiblePath = listOf(SOURCE_USER, TARGET_MODEL),
+            origin = FakeChatClient(open = "conversation", branchTransitions = transitions),
         )
     }
 

@@ -1,21 +1,34 @@
 package com.newoether.agora.ui.chat.bottombar
 
+import android.content.Context
+import android.net.Uri
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.res.stringResource
 import com.newoether.agora.R
-import com.newoether.agora.data.CustomProviderConfig
-import com.newoether.agora.data.providerDisplayName
+import com.newoether.agora.model.ModelThinkingCapability
+import com.newoether.agora.model.OpenAiServiceTiers
+import com.newoether.agora.model.SelectedAttachment
 import com.newoether.agora.ui.chat.PdfPageSelectDialog
 import com.newoether.agora.ui.chat.VideoSliceDialog
 import com.newoether.agora.ui.common.OpenAiServiceTierControlPanel
 import com.newoether.agora.ui.common.ThinkingControlPanel
 import com.newoether.agora.ui.components.DialogWindowEdgeToEdge
 import com.newoether.agora.ui.motion.MotionAwareModalBottomSheet as ModalBottomSheet
+import com.newoether.agora.util.FileValidator
+import com.newoether.agora.viewmodel.ConversationComposerController
+import com.newoether.agora.viewmodel.ConversationComposerSnapshot
+import com.newoether.agora.viewmodel.ConversationComposerSubmissionController
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -24,40 +37,90 @@ internal fun ChatBottomBarOverlayHost(
     onDismissThinkingSheet: () -> Unit,
     thinkingEnabled: Boolean,
     thinkingLevel: String,
+    thinkingCapability: ModelThinkingCapability,
     thinkingBudgetEnabled: Boolean,
     thinkingBudgetTokens: Int,
     onThinkingToggle: (Boolean) -> Unit,
     onThinkingLevelChange: (String) -> Unit,
     onThinkingBudgetEnabledChange: (Boolean) -> Unit,
     onThinkingBudgetTokensChange: (Int) -> Unit,
-    selectedModel: String,
-    customProviders: List<CustomProviderConfig>,
     showOpenAiServiceTierSheet: Boolean,
     openAiServiceTierAvailable: Boolean,
     onDismissOpenAiServiceTierSheet: () -> Unit,
     openAiServiceTierEnabled: Boolean,
     openAiServiceTier: String,
+    availableServiceTiers: List<String>,
     onOpenAiServiceTierToggle: (Boolean) -> Unit,
     onOpenAiServiceTierChange: (String) -> Unit,
     internalCameraPath: String?,
-    onInternalCameraPathChange: (String?) -> Unit,
+    internalCameraOwnerId: String?,
+    onInternalCameraCleared: () -> Unit,
+    composerOwnerId: String,
+    composerController: ConversationComposerController,
+    submissionController: ConversationComposerSubmissionController,
+    composerSnapshot: ConversationComposerSnapshot,
     composer: ChatComposerState,
     pdfViewerSelection: Set<Int>,
     onTogglePdfSelection: ((Int) -> Unit)?,
     onPdfPreviewSelect: ((List<String>, Int) -> Unit)?,
-    onInitPdfSelection: ((Set<Int>) -> Unit)?,
 ) {
+    val scope = rememberCoroutineScope()
+
+    suspend fun releaseOwner(ownerId: String) {
+        withContext(NonCancellable) { composerController.release(ownerId) }
+    }
+
+    fun isFrozen(ownerId: String) = submissionController.snapshot(ownerId).isFrozen
+
+    fun configurePdf(attachment: SelectedAttachment, selectedPages: Set<Int>) {
+        composer.showPdfPageDialog = false
+        val ownerId = attachmentOwner(composer, composerOwnerId, pdf = true)
+        if (isFrozen(ownerId)) {
+            composer.resetPendingPdfState()
+            return
+        }
+        scope.launch {
+            composerController.load(ownerId)
+            try {
+                if (!isFrozen(ownerId)) {
+                    composerController.configurePdf(ownerId, attachment.localId, selectedPages)
+                }
+            } finally {
+                composer.resetPendingPdfState()
+                releaseOwner(ownerId)
+            }
+        }
+    }
+
+    fun removePending(attachment: SelectedAttachment, pdf: Boolean) {
+        if (pdf) composer.showPdfPageDialog = false else composer.showVideoSliceDialog = false
+        val ownerId = attachmentOwner(composer, composerOwnerId, pdf)
+        if (isFrozen(ownerId)) {
+            if (pdf) composer.resetPendingPdfState() else composer.resetPendingVideoState()
+            return
+        }
+        scope.launch {
+            composerController.load(ownerId)
+            try {
+                if (!isFrozen(ownerId)) composerController.remove(ownerId, attachment.localId)
+            } finally {
+                if (pdf) composer.resetPendingPdfState() else composer.resetPendingVideoState()
+                releaseOwner(ownerId)
+            }
+        }
+    }
+
     if (showThinkingSheet) {
         ModalBottomSheet(
             onDismissRequest = onDismissThinkingSheet,
-            containerColor = MaterialTheme.colorScheme.surfaceContainer
+            containerColor = MaterialTheme.colorScheme.surfaceContainer,
         ) {
             DialogWindowEdgeToEdge()
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .navigationBarsPadding()
-                    .padding(horizontal = 16.dp, vertical = 16.dp)
+                    .padding(horizontal = 16.dp, vertical = 16.dp),
             ) {
                 ThinkingControlPanel(
                     enabled = thinkingEnabled,
@@ -68,11 +131,12 @@ internal fun ChatBottomBarOverlayHost(
                     onLevelChange = onThinkingLevelChange,
                     onBudgetEnabledChange = onThinkingBudgetEnabledChange,
                     onBudgetTokensChange = onThinkingBudgetTokensChange,
-                    providerName = providerDisplayName(
-                        com.newoether.agora.model.ModelId.parse(selectedModel).providerName,
-                        customProviders,
-                    ),
-                    animateSections = true
+                    // Keep the Budget entry discoverable while the shared model capability owns
+                    // which controls can change the effective request.
+                    availableEfforts = thinkingCapability.supportedEfforts,
+                    allowDisable = thinkingCapability.canDisableThinking,
+                    budgetControlsEnabled = thinkingCapability.supportsThinkingBudget,
+                    animateSections = true,
                 )
                 Spacer(modifier = Modifier.height(24.dp))
             }
@@ -96,32 +160,57 @@ internal fun ChatBottomBarOverlayHost(
                     tier = openAiServiceTier,
                     onEnabledChange = onOpenAiServiceTierToggle,
                     onTierChange = onOpenAiServiceTierChange,
+                    availableTiers = availableServiceTiers,
+                    tierLabels = mapOf(
+                        OpenAiServiceTiers.AUTO to stringResource(R.string.openai_service_tier_auto),
+                        OpenAiServiceTiers.DEFAULT to stringResource(R.string.openai_service_tier_default),
+                        OpenAiServiceTiers.FLEX to stringResource(R.string.openai_service_tier_flex),
+                        OpenAiServiceTiers.FAST to stringResource(R.string.openai_service_tier_fast),
+                        OpenAiServiceTiers.ULTRAFAST to stringResource(R.string.openai_service_tier_ultrafast),
+                    ),
                 )
                 Spacer(modifier = Modifier.height(24.dp))
             }
         }
     }
 
-    internalCameraPath?.let { privatePath ->
+    if (internalCameraPath != null && internalCameraOwnerId != null) {
         InternalCameraCaptureDialog(
-            targetPath = privatePath,
+            targetPath = internalCameraPath,
             onCaptured = {
-                onInternalCameraPathChange(null)
-                composer.completeCameraCapture(privatePath, captured = true)
+                onInternalCameraCleared()
+                composer.completeCameraCapture(
+                    internalCameraOwnerId,
+                    composerController,
+                    submissionController,
+                    internalCameraPath,
+                    captured = true,
+                )
             },
             onCancelled = {
-                onInternalCameraPathChange(null)
-                composer.completeCameraCapture(privatePath, captured = false)
+                onInternalCameraCleared()
+                composer.completeCameraCapture(
+                    internalCameraOwnerId,
+                    composerController,
+                    submissionController,
+                    internalCameraPath,
+                    captured = false,
+                )
             },
             onFailure = {
-                onInternalCameraPathChange(null)
-                composer.completeCameraCapture(privatePath, captured = false)
+                onInternalCameraCleared()
+                composer.completeCameraCapture(
+                    internalCameraOwnerId,
+                    composerController,
+                    submissionController,
+                    internalCameraPath,
+                    captured = false,
+                )
                 composer.reportCameraPreparationFailure()
             },
         )
     }
 
-    // Attachment rejection / camera failure dialog
     if (composer.rejectedMessage != null) {
         AlertDialog(
             containerColor = MaterialTheme.colorScheme.surfaceContainer,
@@ -132,54 +221,105 @@ internal fun ChatBottomBarOverlayHost(
                 TextButton(onClick = { composer.rejectedMessage = null }) {
                     Text(stringResource(R.string.provider_close))
                 }
-            }
+            },
         )
     }
 
-    // PDF page selection dialog
-    if (composer.showPdfPageDialog && composer.pendingPdfUri != null) {
+    val pendingPdf = composerSnapshot.attachments.firstOrNull { attachment ->
+        attachment.localId == composer.pendingPdfAttachmentId
+    }
+    if (composer.showPdfPageDialog && pendingPdf != null) {
+        val totalPages = pendingPdf.pageCount ?: 0
+        val renderedPaths = pendingPdf.preRenderedPaths.orEmpty()
+        val progress = composerSnapshot.pdfPreviewProgress[pendingPdf.localId] ?: (0 to totalPages)
         PdfPageSelectDialog(
-            totalPages = composer.pendingPdfPages,
-            thumbnailPaths = composer.pendingPdfRenderedPaths,
-            isLoading = composer.pendingPdfIsRendering,
-            renderProgress = composer.pendingPdfRenderProgress,
+            totalPages = totalPages,
+            thumbnailPaths = renderedPaths,
+            isLoading = renderedPaths.size < totalPages,
+            renderProgress = progress,
             selectedPages = pdfViewerSelection,
             onTogglePage = { onTogglePdfSelection?.invoke(it) },
-            onSelectAll = { select -> onTogglePdfSelection?.let { toggle ->
-                (0 until composer.pendingPdfPages.coerceAtLeast(1)).forEach { i ->
-                    if ((i in pdfViewerSelection) != select) toggle(i)
+            onSelectAll = { select ->
+                onTogglePdfSelection?.let { toggle ->
+                    (0 until totalPages.coerceAtLeast(1)).forEach { index ->
+                        if ((index in pdfViewerSelection) != select) toggle(index)
+                    }
                 }
-            }},
+            },
             onPreviewPage = { index ->
                 composer.showPdfPageDialog = false
                 composer.pdfDialogHiddenForPreview = true
-                onPdfPreviewSelect?.invoke(composer.pendingPdfRenderedPaths, index)
+                onPdfPreviewSelect?.invoke(renderedPaths, index)
             },
-            onConfirm = { selection ->
-                composer.confirmPendingPdfSelection(selection.selectedPages)
-            },
-            onDismiss = {
-                composer.dismissPendingPdf()
-            }
+            onConfirm = { selection -> configurePdf(pendingPdf, selection.selectedPages) },
+            onDismiss = { removePending(pendingPdf, pdf = true) },
         )
     }
 
-    // Video slice dialog
-    if (composer.showVideoSliceDialog && composer.pendingVideoUri != null) {
+    val pendingVideo = composerSnapshot.attachments.firstOrNull { attachment ->
+        attachment.localId == composer.pendingVideoAttachmentId
+    }
+    if (composer.showVideoSliceDialog && pendingVideo != null) {
+        val previewUri = pendingVideo.localPath
+            ?.let { path -> Uri.fromFile(File(path)).toString() }
+            ?: pendingVideo.uri
         VideoSliceDialog(
-            videoUri = composer.pendingVideoUri!!,
-            durationMs = composer.pendingVideoDurationMs,
+            videoUri = previewUri,
+            durationMs = pendingVideo.videoDurationMs ?: 0L,
             onConfirm = { result ->
                 composer.showVideoSliceDialog = false
-                composer.addSlicedVideo(result.uri, result.frameCount, result.intervalMs)
-                // Process next video in queue
-                composer.processNextVideo()
+                val ownerId = attachmentOwner(composer, composerOwnerId, pdf = false)
+                if (isFrozen(ownerId)) {
+                    composer.resetPendingVideoState()
+                } else scope.launch {
+                    composerController.load(ownerId)
+                    try {
+                        if (!isFrozen(ownerId)) {
+                            composerController.configureVideo(
+                                ownerId,
+                                pendingVideo.localId,
+                                result.frameCount,
+                                result.intervalMs,
+                            )
+                        }
+                    } finally {
+                        composer.resetPendingVideoState()
+                        releaseOwner(ownerId)
+                    }
+                }
             },
-            onDismiss = {
-                composer.showVideoSliceDialog = false
-                // Process next video in queue
-                composer.processNextVideo()
-            }
+            onDismiss = { removePending(pendingVideo, pdf = false) },
         )
     }
+}
+
+internal suspend fun inspectAttachmentIngress(
+    context: Context,
+    uris: List<Uri>,
+    forcedType: String?,
+    allowLocalSandbox: Boolean,
+): Pair<List<SelectedAttachment>, List<String?>> = withContext(Dispatchers.IO) {
+    val rejected = mutableListOf<String?>()
+    val attachments = uris.mapNotNull { uri ->
+        val mimeType = FileValidator.resolveMimeType(context, uri.toString())
+        FileValidator.inspectAttachment(
+            source = uri.toString(),
+            fileName = FileValidator.resolveFileName(context, uri),
+            mimeType = mimeType,
+            fileSize = FileValidator.resolveFileSize(context, uri),
+            forcedType = forcedType,
+            allowLocalSandbox = allowLocalSandbox,
+        ).also { if (it == null) rejected += mimeType }
+    }
+    attachments to rejected
+}
+
+private fun attachmentOwner(
+    composer: ChatComposerState,
+    fallbackOwnerId: String,
+    pdf: Boolean,
+): String = if (pdf) {
+    composer.pendingPdfOwnerId ?: fallbackOwnerId
+} else {
+    composer.pendingVideoOwnerId ?: fallbackOwnerId
 }

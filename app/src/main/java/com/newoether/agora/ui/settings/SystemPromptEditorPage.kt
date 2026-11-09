@@ -23,7 +23,9 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.PlaylistAdd
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CalendarMonth
+import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Extension
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
@@ -46,21 +48,31 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.newoether.agora.R
 import com.newoether.agora.ui.components.DialogWindowEdgeToEdge
+import com.newoether.agora.data.HtmlPreviewGuidance
 import com.newoether.agora.data.PredefinedVariables
 import com.newoether.agora.data.PromptItemType
 import com.newoether.agora.data.PromptTemplateItem
 import com.newoether.agora.data.SystemPromptEntry
 import com.newoether.agora.ui.motion.LocalAgoraMotionPolicy
 import com.newoether.agora.ui.motion.MotionAwareModalBottomSheet as ModalBottomSheet
+import com.newoether.agora.ui.components.AgoraDropdownMenu
+import com.newoether.agora.ui.components.AgoraDropdownMenuItem
+import com.newoether.agora.ui.components.rememberUnsavedChangesBack
+import com.newoether.agora.ui.components.sheetOptionClickable
 
+@Composable
 private fun variableDisplayName(key: String): String = when (key) {
     PredefinedVariables.TIME -> "Current Time"
     PredefinedVariables.DATE -> "Current Date"
     PredefinedVariables.SENT_TIME -> "Send Time"
     PredefinedVariables.SENT_DATE -> "Send Date"
     PredefinedVariables.ACTIVE_MEMORY -> "Active Memory"
-    PredefinedVariables.MODEL_ID -> "Model ID"
-    else -> key
+    PredefinedVariables.SKILL_CATALOG -> "Skill Catalog"
+    PredefinedVariables.CURRENT_MODEL_ID -> "Current Model ID"
+    PredefinedVariables.MESSAGE_MODEL_ID -> "Message Model ID"
+    PredefinedVariables.MODEL_ID -> "Current Model ID (Legacy)"
+    PredefinedVariables.PROMPT -> "Prompt"
+    else -> stringResource(R.string.unknown)
 }
 
 private fun variableIcon(key: String): ImageVector = when (key) {
@@ -69,7 +81,11 @@ private fun variableIcon(key: String): ImageVector = when (key) {
     PredefinedVariables.SENT_TIME -> Icons.Default.History
     PredefinedVariables.SENT_DATE -> Icons.Default.CalendarMonth
     PredefinedVariables.ACTIVE_MEMORY -> Icons.Default.Memory
+    PredefinedVariables.SKILL_CATALOG -> Icons.Default.Extension
+    PredefinedVariables.CURRENT_MODEL_ID,
+    PredefinedVariables.MESSAGE_MODEL_ID,
     PredefinedVariables.MODEL_ID -> Icons.Default.Info
+    PredefinedVariables.PROMPT -> Icons.Default.TextFields
     else -> Icons.Default.Info
 }
 
@@ -79,17 +95,19 @@ private fun variableIcon(key: String): ImageVector = when (key) {
 @Composable
 fun SystemPromptEditorPage(
     entry: SystemPromptEntry?,
+    isNew: Boolean = false,
+    saveEnabled: Boolean = true,
     onSave: (
         title: String,
         systemItems: List<PromptTemplateItem>,
-        userPrependItems: List<PromptTemplateItem>,
-        userPostpendItems: List<PromptTemplateItem>
+        userItems: List<PromptTemplateItem>,
+        assistantItems: List<PromptTemplateItem>,
     ) -> Unit,
     onBack: () -> Unit,
     showDocFab: Boolean = true
 ) {
     val allowSpatialTransitions = LocalAgoraMotionPolicy.current.allowSpatialTransitions
-    val isEdit = entry != null
+    val isEdit = entry != null && !isNew
     var title by remember { mutableStateOf(entry?.title ?: "") }
     var selectedTab by remember { mutableIntStateOf(0) }
 
@@ -98,14 +116,14 @@ fun SystemPromptEditorPage(
             entry?.resolvedSystemItems?.let { list.addAll(it) }
         }
     }
-    val userPrependItems = remember {
+    val userItems = remember {
         mutableStateListOf<PromptTemplateItem>().also { list ->
-            entry?.userPrependItems?.let { list.addAll(it) }
+            list.addAll(entry?.resolvedUserItems ?: PredefinedVariables.normalizeMessageTemplate(emptyList()))
         }
     }
-    val userPostpendItems = remember {
+    val assistantItems = remember {
         mutableStateListOf<PromptTemplateItem>().also { list ->
-            entry?.userPostpendItems?.let { list.addAll(it) }
+            list.addAll(entry?.resolvedAssistantItems ?: PredefinedVariables.normalizeMessageTemplate(emptyList()))
         }
     }
 
@@ -115,28 +133,50 @@ fun SystemPromptEditorPage(
 
     val currentItems: MutableList<PromptTemplateItem> = when (selectedTab) {
         0 -> systemItems
-        1 -> userPrependItems
-        else -> userPostpendItems
+        1 -> userItems
+        else -> assistantItems
     }
+
+    val hasHtmlPreviewGuidance = HtmlPreviewGuidance.isPresent(systemItems)
+    val initialTitle = remember { title }
+    val initialSystemItems = remember { systemItems.toList() }
+    val initialUserItems = remember { userItems.toList() }
+    val initialAssistantItems = remember { assistantItems.toList() }
+    val hasUnsavedChanges = title != initialTitle ||
+        systemItems.toList() != initialSystemItems ||
+        userItems.toList() != initialUserItems ||
+        assistantItems.toList() != initialAssistantItems
+    val guardedBack = rememberUnsavedChangesBack(
+        hasUnsavedChanges = hasUnsavedChanges,
+        onBack = onBack,
+    )
 
     BackHandler(enabled = showVariablePicker) {
         showVariablePicker = false
     }
     BackHandler(enabled = !showVariablePicker) {
-        onBack()
+        guardedBack()
     }
 
     CollapsingSettingsScaffold(
         title = if (isEdit) stringResource(R.string.prompts_edit_title) else stringResource(R.string.prompts_add_title),
-        onBack = onBack,
+        onBack = guardedBack,
         actions = {
-            IconButton(onClick = {
-                if (title.isBlank()) {
-                    titleError = true
-                    return@IconButton
-                }
-                onSave(title, systemItems.toList(), userPrependItems.toList(), userPostpendItems.toList())
-            }) {
+            IconButton(
+                enabled = saveEnabled,
+                onClick = {
+                    if (title.isBlank()) {
+                        titleError = true
+                        return@IconButton
+                    }
+                    onSave(
+                        title,
+                        systemItems.toList(),
+                        PredefinedVariables.normalizeMessageTemplate(userItems),
+                        PredefinedVariables.normalizeMessageTemplate(assistantItems),
+                    )
+                },
+            ) {
                 Icon(Icons.Default.Save, contentDescription = stringResource(R.string.provider_save))
             }
         },
@@ -159,13 +199,13 @@ fun SystemPromptEditorPage(
 
             val tabLabels = listOf(
                 stringResource(R.string.template_tab_system),
-                stringResource(R.string.template_tab_prepend),
-                stringResource(R.string.template_tab_postpend),
+                stringResource(R.string.template_tab_user),
+                stringResource(R.string.template_tab_assistant),
             )
             val tabDescriptions = listOf(
                 stringResource(R.string.template_tab_system_desc),
-                stringResource(R.string.template_tab_prepend_desc),
-                stringResource(R.string.template_tab_postpend_desc),
+                stringResource(R.string.template_tab_user_desc),
+                stringResource(R.string.template_tab_assistant_desc),
             )
             PillTabSwitcher(
                 tabs = tabLabels,
@@ -245,6 +285,7 @@ fun SystemPromptEditorPage(
 
                     for (i in currentItems.indices) {
                         val item = currentItems[i]
+                        val isPrompt = PredefinedVariables.isPromptItem(item)
 
                         InsertBetweenButton(
                             onInsertText = {
@@ -253,29 +294,31 @@ fun SystemPromptEditorPage(
                                     PromptTemplateItem(type = PromptItemType.CUSTOM, value = "")
                                 )
                             },
-                            onInsertVariable = { insertAtIndex = i; showVariablePicker = true }
+                            onInsertVariable = { insertAtIndex = i; showVariablePicker = true },
+                            onInsertHtmlPreview = if (selectedTab == 0) ({
+                                if (!HtmlPreviewGuidance.isPresent(systemItems)) {
+                                    systemItems.add(i, HtmlPreviewGuidance.item())
+                                }
+                            }) else null,
+                            htmlPreviewEnabled = !hasHtmlPreviewGuidance,
                         )
 
                         TemplateItemRow(
                             item = item,
                             onChange = { updated -> currentItems[i] = updated },
-                            onDelete = { currentItems.removeAt(i) },
-                            onMoveUp = if (i > 0) {
+                            onDelete = if (isPrompt) null else ({ currentItems.removeAt(i) }),
+                            onMoveUp = if (!isPrompt && i > 0) {
                                 {
-                                    val moved = currentItems.removeAt(i); currentItems.add(
-                                    i - 1,
-                                    moved
-                                )
+                                    val moved = currentItems.removeAt(i)
+                                    currentItems.add(i - 1, moved)
                                 }
                             } else null,
-                            onMoveDown = if (i < currentItems.lastIndex) {
+                            onMoveDown = if (!isPrompt && i < currentItems.lastIndex) {
                                 {
-                                    val moved = currentItems.removeAt(i); currentItems.add(
-                                    i + 1,
-                                    moved
-                                )
+                                    val moved = currentItems.removeAt(i)
+                                    currentItems.add(i + 1, moved)
                                 }
-                            } else null
+                            } else null,
                         )
                     }
 
@@ -290,7 +333,13 @@ fun SystemPromptEditorPage(
                         },
                         onInsertVariable = {
                             insertAtIndex = currentItems.size; showVariablePicker = true
-                        }
+                        },
+                        onInsertHtmlPreview = if (selectedTab == 0) ({
+                            if (!HtmlPreviewGuidance.isPresent(systemItems)) {
+                                systemItems.add(HtmlPreviewGuidance.item())
+                            }
+                        }) else null,
+                        htmlPreviewEnabled = !hasHtmlPreviewGuidance,
                     )
 
                     Spacer(modifier = Modifier.height(4.dp))
@@ -338,7 +387,6 @@ fun SystemPromptEditorPage(
         val targetIndex = insertAtIndex
         ModalBottomSheet(
             onDismissRequest = { showVariablePicker = false; insertAtIndex = -1 },
-            shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp),
             containerColor = MaterialTheme.colorScheme.surfaceContainer
         ) {
             DialogWindowEdgeToEdge()
@@ -350,26 +398,30 @@ fun SystemPromptEditorPage(
             )
             Spacer(modifier = Modifier.height(8.dp))
             val availableVars = if (selectedTab == 0) PredefinedVariables.ALL.filter { it !in PredefinedVariables.PER_MESSAGE_VARS } else PredefinedVariables.ALL
-            for (key in availableVars) {
-                SettingsItem(
-                    headlineContent = { Text(variableDisplayName(key)) },
-                    supportingContent = { Text("{${key}}") },
-                    leadingContent = {
-                        Icon(variableIcon(key), contentDescription = null, tint = MaterialTheme.colorScheme.primary)
-                    },
-                    modifier = Modifier.fillMaxWidth().clickable {
-                        val item = PromptTemplateItem(type = PromptItemType.PREDEFINED, value = key)
-                        if (targetIndex >= 0 && targetIndex <= currentItems.size) {
-                            currentItems.add(targetIndex, item)
-                        } else {
-                            currentItems.add(item)
+            Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState())) {
+                for (key in availableVars) {
+                    SettingsItem(
+                        headlineContent = { Text(variableDisplayName(key)) },
+                        supportingContent = { Text("{${key}}") },
+                        leadingContent = {
+                            Icon(variableIcon(key), contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                        },
+                        startPadding = SETTINGS_ITEM_SHEET_PADDING,
+                        endPadding = SETTINGS_ITEM_SHEET_PADDING,
+                        modifier = Modifier.fillMaxWidth().sheetOptionClickable {
+                            val item = PromptTemplateItem(type = PromptItemType.PREDEFINED, value = key)
+                            if (targetIndex >= 0 && targetIndex <= currentItems.size) {
+                                currentItems.add(targetIndex, item)
+                            } else {
+                                currentItems.add(item)
+                            }
+                            showVariablePicker = false
+                            insertAtIndex = -1
                         }
-                        showVariablePicker = false
-                        insertAtIndex = -1
-                    }
-                )
+                    )
+                }
+                Spacer(modifier = Modifier.height(16.dp))
             }
-            Spacer(modifier = Modifier.height(16.dp))
         }
     }
 }
@@ -377,7 +429,9 @@ fun SystemPromptEditorPage(
 @Composable
 private fun InsertBetweenButton(
     onInsertText: () -> Unit,
-    onInsertVariable: () -> Unit
+    onInsertVariable: () -> Unit,
+    onInsertHtmlPreview: (() -> Unit)? = null,
+    htmlPreviewEnabled: Boolean = true,
 ) {
     var expanded by remember { mutableStateOf(false) }
     Box(
@@ -401,23 +455,30 @@ private fun InsertBetweenButton(
                     modifier = Modifier.size(12.dp)
                 )
             }
-            DropdownMenu(
+            AgoraDropdownMenu(
                 containerColor = MaterialTheme.colorScheme.surfaceContainer,
                 tonalElevation = 16.dp,
                 expanded = expanded,
-                onDismissRequest = { expanded = false },
-                shape = RoundedCornerShape(12.dp)
+                onDismissRequest = { expanded = false }
             ) {
-                DropdownMenuItem(
+                AgoraDropdownMenuItem(
                     text = { Text(stringResource(R.string.template_add_text)) },
                     leadingIcon = { Icon(Icons.Default.TextFields, null) },
                     onClick = { expanded = false; onInsertText() }
                 )
-                DropdownMenuItem(
+                AgoraDropdownMenuItem(
                     text = { Text(stringResource(R.string.template_add_variable)) },
                     leadingIcon = { Icon(Icons.AutoMirrored.Outlined.PlaylistAdd, null) },
                     onClick = { expanded = false; onInsertVariable() }
                 )
+                if (onInsertHtmlPreview != null) {
+                    AgoraDropdownMenuItem(
+                        text = { Text(stringResource(R.string.html_preview_insert)) },
+                        leadingIcon = { Icon(Icons.Default.Code, null) },
+                        enabled = htmlPreviewEnabled,
+                        onClick = { expanded = false; onInsertHtmlPreview() },
+                    )
+                }
             }
 
         }
@@ -428,27 +489,31 @@ private fun InsertBetweenButton(
 private fun TemplateItemRow(
     item: PromptTemplateItem,
     onChange: (PromptTemplateItem) -> Unit,
-    onDelete: () -> Unit,
+    onDelete: (() -> Unit)?,
     onMoveUp: (() -> Unit)? = null,
     onMoveDown: (() -> Unit)? = null
 ) {
     Column(modifier = Modifier.fillMaxWidth()) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.End
-        ) {
-            if (onMoveUp != null) {
-                IconButton(onClick = onMoveUp, modifier = Modifier.size(28.dp)) {
-                    Icon(Icons.Default.KeyboardArrowUp, contentDescription = stringResource(R.string.template_move_up), modifier = Modifier.size(18.dp))
+        if (onMoveUp != null || onMoveDown != null || onDelete != null) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End
+            ) {
+                if (onMoveUp != null) {
+                    IconButton(onClick = onMoveUp, modifier = Modifier.size(28.dp)) {
+                        Icon(Icons.Default.KeyboardArrowUp, contentDescription = stringResource(R.string.template_move_up), modifier = Modifier.size(18.dp))
+                    }
                 }
-            }
-            if (onMoveDown != null) {
-                IconButton(onClick = onMoveDown, modifier = Modifier.size(28.dp)) {
-                    Icon(Icons.Default.KeyboardArrowDown, contentDescription = stringResource(R.string.template_move_down), modifier = Modifier.size(18.dp))
+                if (onMoveDown != null) {
+                    IconButton(onClick = onMoveDown, modifier = Modifier.size(28.dp)) {
+                        Icon(Icons.Default.KeyboardArrowDown, contentDescription = stringResource(R.string.template_move_down), modifier = Modifier.size(18.dp))
+                    }
                 }
-            }
-            IconButton(onClick = onDelete, modifier = Modifier.size(28.dp)) {
-                Icon(Icons.Default.Close, contentDescription = stringResource(R.string.provider_delete), modifier = Modifier.size(18.dp))
+                if (onDelete != null) {
+                    IconButton(onClick = onDelete, modifier = Modifier.size(28.dp)) {
+                        Icon(Icons.Default.Close, contentDescription = stringResource(R.string.provider_delete), modifier = Modifier.size(18.dp))
+                    }
+                }
             }
         }
         when (item.type) {

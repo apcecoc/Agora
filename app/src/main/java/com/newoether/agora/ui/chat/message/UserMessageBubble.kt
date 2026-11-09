@@ -34,14 +34,21 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.graphics.Shape
 import com.newoether.agora.R
 import com.newoether.agora.util.noOpBringIntoView
+import com.newoether.agora.model.AttachmentItem
 import com.newoether.agora.model.ChatMessage
+import com.newoether.agora.model.ImageArtifact
+import com.newoether.agora.model.MessageSource
+import com.newoether.agora.model.subagentResultDisplay
 import com.newoether.agora.ui.chat.AttachmentThumbnailItem
 import com.newoether.agora.ui.chat.ThumbnailClickHandlers
-import com.newoether.agora.ui.chat.findMetaForIndex
+import com.newoether.agora.ui.chat.USER_BUBBLE_CONTENT_PADDING
 import com.newoether.agora.ui.chat.resolveAttachmentType
 import com.newoether.agora.ui.common.LocalAgoraHaptics
 import com.newoether.agora.ui.motion.LocalAgoraMotionPolicy
 import com.newoether.agora.ui.theme.ChatType
+import com.newoether.agora.ui.theme.chatCompactWidth
+import com.newoether.agora.ui.components.AgoraDropdownMenu
+import com.newoether.agora.ui.components.AgoraDropdownMenuItem
 
 /**
  * The right-aligned user message bubble: attachment thumbnails, the message text
@@ -49,6 +56,56 @@ import com.newoether.agora.ui.theme.ChatType
  * Extracted from [MessageItem]; the parent owns the info/delete dialogs, triggered
  * here via [onShowInfo] / [onShowDelete].
  */
+internal fun userBubbleSizeAnimationEnabled(
+    sizeAnimationReady: Boolean,
+    allowSpatialTransitions: Boolean,
+): Boolean = sizeAnimationReady && allowSpatialTransitions
+
+internal data class StoredMediaOccurrenceProjection(
+    val urls: List<String>,
+    val indexByDisplayItem: List<Int?>,
+)
+
+private fun storedMediaUnavailable(
+    imagePath: String,
+    item: AttachmentItem?,
+    imageArtifacts: Map<String, ImageArtifact>,
+): Boolean {
+    val occurrences = item?.imageArtifacts.orEmpty()
+    if (item?.type == "pdf" && occurrences.isNotEmpty()) {
+        return occurrences.all { it.unavailable || it.path.isBlank() }
+    }
+    if (item?.unavailable == true) return true
+    return if (occurrences.isNotEmpty()) {
+        occurrences.any(ImageArtifact::unavailable)
+    } else imageArtifacts[imagePath]?.unavailable == true
+}
+
+internal fun projectStoredMediaOccurrences(
+    displayItems: List<Pair<String, AttachmentItem?>>,
+    imageArtifacts: Map<String, ImageArtifact> = emptyMap(),
+): StoredMediaOccurrenceProjection {
+    val urls = mutableListOf<String>()
+    val indices = displayItems.map { (imagePath, item) ->
+        val unavailable = storedMediaUnavailable(imagePath, item, imageArtifacts)
+        val url = when (resolveAttachmentType(imagePath, item)) {
+            "image" -> imagePath.takeIf {
+                it.isNotEmpty() && !unavailable
+            }
+            "video" -> item
+                ?.takeUnless { unavailable }
+                ?.originalUri
+                ?.takeIf(String::isNotBlank)
+            else -> null
+        }
+        url?.let {
+            urls += it
+            urls.lastIndex
+        }
+    }
+    return StoredMediaOccurrenceProjection(urls, indices)
+}
+
 @Composable
 internal fun UserMessageBubble(
     message: ChatMessage,
@@ -57,6 +114,7 @@ internal fun UserMessageBubble(
     textColor: Color,
     contextAlpha: Modifier,
     isEditing: Boolean,
+    sizeAnimationReady: Boolean,
     isLoading: Boolean,
     isEditingAllowed: Boolean,
     showActions: Boolean,
@@ -75,28 +133,46 @@ internal fun UserMessageBubble(
     onShowInfo: () -> Unit,
     onShowDelete: () -> Unit,
     searchHighlight: SearchHighlightSpec?,
+    allowMutations: Boolean = true,
 ) {
     @Suppress("DEPRECATION")
     val clipboardManager = LocalClipboardManager.current
     val haptics = LocalAgoraHaptics.current
     val allowSpatialTransitions = LocalAgoraMotionPolicy.current.allowSpatialTransitions
+    val showEditor = isEditing && message.source == null
+    val editEnabled = isEditingAllowed && message.source == null
+    val subagentResult = remember(message.source, message.text) {
+        message.source?.subagentResultDisplay(message.text)
+    }
     var showMenu by remember { mutableStateOf(false) }
     val editFocusRequester = remember(message.id) { FocusRequester() }
-    LaunchedEffect(isEditing, editFocusRequester) {
-        if (isEditing) editFocusRequester.requestFocus()
+    LaunchedEffect(showEditor, editFocusRequester) {
+        if (showEditor) editFocusRequester.requestFocus()
     }
 
-    Column(horizontalAlignment = Alignment.End) {
+    Column(
+        horizontalAlignment = Alignment.End,
+        modifier = Modifier.then(
+            if (userBubbleSizeAnimationEnabled(sizeAnimationReady, allowSpatialTransitions)) {
+                Modifier.animateContentSize(animationSpec = tween(durationMillis = 500))
+            } else {
+                Modifier
+            },
+        ),
+    ) {
+        message.source?.let { source ->
+            MessageSourceLabel(source = source, modifier = contextAlpha)
+        }
         Box {
             Surface(
             shape = shape,
             color = backgroundColor,
             modifier = Modifier
-                .widthIn(max = 300.dp)
+                .widthIn(min = USER_BUBBLE_MIN_WIDTH, max = USER_BUBBLE_MAX_WIDTH)
                 .then(contextAlpha)
                 .clip(shape)
                 .combinedClickable(
-                    enabled = !isEditing && showActions,
+                    enabled = !showEditor && showActions,
                     hapticFeedbackEnabled = false,
                     onClick = {},
                     onLongClick = {
@@ -104,30 +180,35 @@ internal fun UserMessageBubble(
                         showMenu = true
                     },
                 )
-                // Keep size interpolation local to the stable user-bubble surface. Initial
-                // measurement is immediate; subsequent editor enter/exit changes animate
-                // without involving the message row or assistant streaming layout.
-                .then(
-                    if (allowSpatialTransitions) {
-                        Modifier.animateContentSize(
-                            animationSpec = tween(durationMillis = 500),
-                        )
-                    } else {
-                        Modifier
-                    },
-                )
         ) {
-            if (isEditing) {
+            if (showEditor) {
                 val editState = rememberTextFieldState(message.text)
                 val editScrollState = rememberScrollState()
-                Column(modifier = Modifier.padding(8.dp)) {
+                // Same inset as the read-only bubble, so the text stays put when editing starts;
+                // the field keeps only a bottom gap above its indicator line.
+                // The action buttons are 40dp tall around a 20sp label, so each carries 10dp of
+                // invisible height below its text; the bottom inset drops by that amount (and 1dp
+                // more, tuned by eye) so the visible gap under Cancel/Send matches the other sides.
+                Column(
+                    modifier = Modifier.padding(
+                        start = USER_BUBBLE_CONTENT_PADDING,
+                        top = USER_BUBBLE_CONTENT_PADDING,
+                        end = USER_BUBBLE_CONTENT_PADDING,
+                        bottom = EDIT_BOTTOM_INSET,
+                    ),
+                ) {
                     Box(modifier = Modifier.noOpBringIntoView()) {
                         TextField(
                             state = editState,
                             scrollState = editScrollState,
+                            // TextField applies a 56dp default min height only when no min
+                            // height is set; any explicit min lets the text decide the height, so a
+                            // single line keeps its indicator 8dp below the text.
                             modifier = Modifier
                                 .fillMaxWidth()
+                                .heightIn(min = 1.dp)
                                 .focusRequester(editFocusRequester),
+                            contentPadding = PaddingValues(bottom = 8.dp),
                             colors = TextFieldDefaults.colors(
                                 focusedContainerColor = Color.Transparent,
                                 unfocusedContainerColor = Color.Transparent
@@ -149,8 +230,11 @@ internal fun UserMessageBubble(
                     }
                 }
             } else {
+                // Content narrower than the minimum width sits centered; wider content fills the
+                // bubble and keeps its start alignment.
+                Box(contentAlignment = Alignment.Center) {
                 Column(
-                    modifier = Modifier.padding(16.dp).noOpBringIntoView(),
+                    modifier = Modifier.padding(USER_BUBBLE_CONTENT_PADDING).noOpBringIntoView(),
                     horizontalAlignment = Alignment.Start
                 ) {
                     val hasMetaItems = message.attachmentMeta?.items?.isNotEmpty() == true
@@ -158,74 +242,64 @@ internal fun UserMessageBubble(
                         val meta = remember(message.attachmentMeta) {
                             message.attachmentMeta
                         }
-                        // Build display items: skip non-first video/PDF frames, add meta-only items
+                        // Metadata owns attachment order. Images not claimed by metadata are legacy
+                        // entries and are appended in their stored order.
                         val displayItems = remember(message.images, meta) {
-                            val skipIndices = mutableSetOf<Int>()
-                            if (meta != null) {
-                                for (item in meta.items) {
-                                    val count = item.pageCount ?: 1
-                                    if (item.imageIndex != null && count > 1 && (item.type == "video" || item.type == "pdf")) {
-                                        for (i in item.imageIndex + 1 until item.imageIndex + count) {
-                                            skipIndices.add(i)
-                                        }
-                                    }
+                            val claimedImageIndices = mutableSetOf<Int>()
+                            val metadataItems = meta?.items.orEmpty().map { item ->
+                                val start = item.imageIndex
+                                if (start != null) {
+                                    val count = item.pageCount?.coerceAtLeast(1) ?: 1
+                                    claimedImageIndices += start until start + count
                                 }
+                                Triple(
+                                    start ?: -1,
+                                    start?.let(message.images::getOrNull).orEmpty(),
+                                    item,
+                                )
                             }
-                            // Image-backed items
-                            val imageItems = message.images.mapIndexedNotNull { index, path ->
-                                if (index in skipIndices) null
-                                else {
-                                    val item = findMetaForIndex(meta, index)
-                                    Triple(index, path, item)
-                                }
+                            val legacyItems = message.images.mapIndexedNotNull { index, path ->
+                                if (index in claimedImageIndices) null else Triple(index, path, null)
                             }
-                            // Meta-only items (file/PDF without image representation)
-                            val metaOnlyItems = meta?.items
-                                ?.filter { it.imageIndex == null && (it.type == "file" || it.type == "pdf" || it.type == "image") }
-                                ?.map { Triple(-1, "", it) }
-                                ?: emptyList()
-                            imageItems + metaOnlyItems
+                            metadataItems + legacyItems
                         }
 
-                        // Collect all image/video URLs for the pager
-                        val allMediaUrls = remember(displayItems) {
-                            displayItems.mapNotNull { (_, imagePath, metaItem) ->
-                                val t = resolveAttachmentType(imagePath, metaItem)
-                                when (t) {
-                                    "image" -> if (imagePath.isNotEmpty()) imagePath else null
-                                    "video" -> metaItem?.originalUri
-                                    else -> null
-                                }
-                            }
+                        val mediaProjection = remember(displayItems, message.imageArtifacts) {
+                            projectStoredMediaOccurrences(
+                                displayItems.map { (_, imagePath, metaItem) ->
+                                    imagePath to metaItem
+                                },
+                                message.imageArtifacts,
+                            )
                         }
+                        val allMediaUrls = mediaProjection.urls
 
                         LazyRow(
                             modifier = Modifier.padding(bottom = if (message.text.isNotEmpty()) 8.dp else 0.dp),
                             horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            itemsIndexed(displayItems) { itemIdx, (index, imagePath, metaItem) ->
+                            itemsIndexed(displayItems) { displayIndex, (_, imagePath, metaItem) ->
                                 val type = remember(imagePath, metaItem?.type) {
                                     resolveAttachmentType(imagePath, metaItem)
                                 }
-                                val isVideo = type == "video"
                                 val isPdf = type == "pdf"
-                                val isFileType = type == "file"
 
                                 val fileName = metaItem?.fileName ?: imagePath.substringAfterLast("/")
                                 val pdfPages = if (type == "pdf") {
                                     metaItem?.imageIndex?.let { start ->
                                         val count = metaItem.pageCount ?: 1
                                         val end = (start + count).coerceAtMost(message.images.size)
-                                        if (start in 0 until message.images.size) message.images.subList(start, end) else emptyList()
+                                        if (start in 0 until message.images.size) {
+                                            message.images.subList(start, end).mapIndexed { index, path ->
+                                                val artifact = metaItem.imageArtifacts.getOrNull(index) ?: message.imageArtifacts[path]
+                                                path.takeUnless { artifact?.unavailable == true } ?: ""
+                                            }
+                                        } else emptyList()
                                     } ?: emptyList()
                                 } else emptyList()
 
-                                val mediaIndex = allMediaUrls.indexOf(
-                                    when (type) {
-                                        "video" -> metaItem?.originalUri
-                                        else -> imagePath
-                                    }
-                                ).coerceAtLeast(0)
+                                val mediaIndex =
+                                    mediaProjection.indexByDisplayItem[displayIndex] ?: 0
 
                                 AttachmentThumbnailItem(
                                     type = type,
@@ -233,6 +307,9 @@ internal fun UserMessageBubble(
                                     fileName = fileName,
                                     originalUri = metaItem?.originalUri,
                                     textContent = metaItem?.textContent,
+                                    unavailable = storedMediaUnavailable(
+                                        imagePath, metaItem, message.imageArtifacts,
+                                    ),
                                     pdfPages = pdfPages,
                                     allMediaUrls = allMediaUrls,
                                     mediaIndex = mediaIndex,
@@ -242,13 +319,25 @@ internal fun UserMessageBubble(
                                         onPdfClick = onPdfPagesClick
                                     )
                                 )
-                                if (type == "pdf" && metaItem?.warning != null) {
-                                    Text(metaItem.warning, style = MaterialTheme.typography.labelSmall, color = Color(0xFFE53935), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                val warning = metaItem?.warning
+                                if (type == "pdf" && warning != null) {
+                                    Text(warning, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                 }
                             }
                         }
                     }
-                    if (message.text.isNotEmpty()) {
+                    val askUser = message.source?.takeIf { it.kind == MessageSource.Kind.ASK_USER }
+                    if (subagentResult != null) {
+                        SubagentResultSummary(result = subagentResult, textColor = textColor)
+                    } else if (askUser != null) {
+                        AskUserAnswerBlocks(
+                            source = askUser,
+                            unansweredLabel = stringResource(R.string.message_source_unanswered),
+                            bodyStyle = ChatType.userBody,
+                            textColor = textColor,
+                            searchHighlight = searchHighlight,
+                        )
+                    } else if (message.text.isNotEmpty()) {
                         SearchHighlightedPlainText(
                             text = message.text,
                             style = ChatType.userBody,
@@ -257,18 +346,18 @@ internal fun UserMessageBubble(
                         )
                     }
                 }
+                }
             }
         }
 
-            DropdownMenu(
+            AgoraDropdownMenu(
                 containerColor = MaterialTheme.colorScheme.surfaceContainer,
                 tonalElevation = 16.dp,
-                shape = RoundedCornerShape(12.dp),
-                expanded = showMenu && showActions && !isEditing,
+                expanded = showMenu && showActions && !showEditor,
                 onDismissRequest = { showMenu = false },
             ) {
                 if (!actionCopyText.isNullOrBlank()) {
-                    DropdownMenuItem(
+                    AgoraDropdownMenuItem(
                         text = { Text(stringResource(R.string.copy)) },
                         onClick = {
                             clipboardManager.setText(AnnotatedString(actionCopyText))
@@ -278,17 +367,17 @@ internal fun UserMessageBubble(
                         leadingIcon = { Icon(Icons.Default.ContentCopy, null) },
                     )
                 }
-                DropdownMenuItem(
+                if (allowMutations) AgoraDropdownMenuItem(
                     text = { Text(stringResource(R.string.edit)) },
                     onClick = {
                         showMenu = false
-                        onStartEdit()
+                        if (editEnabled) onStartEdit()
                     },
-                    enabled = isEditingAllowed,
+                    enabled = editEnabled,
                     leadingIcon = { Icon(Icons.Default.Edit, null) },
                 )
                 if (message.text.isNotBlank()) {
-                    DropdownMenuItem(
+                    AgoraDropdownMenuItem(
                         text = { Text(stringResource(R.string.select_text)) },
                         onClick = {
                             showMenu = false
@@ -297,7 +386,7 @@ internal fun UserMessageBubble(
                         leadingIcon = { Icon(Icons.Default.SelectAll, null) },
                     )
                 }
-                DropdownMenuItem(
+                AgoraDropdownMenuItem(
                     text = { Text(stringResource(R.string.info)) },
                     onClick = {
                         showMenu = false
@@ -305,7 +394,7 @@ internal fun UserMessageBubble(
                     },
                     leadingIcon = { Icon(Icons.Default.Info, null) },
                 )
-                DropdownMenuItem(
+                if (allowMutations) AgoraDropdownMenuItem(
                     text = {
                         Text(
                             stringResource(R.string.delete),
@@ -335,7 +424,7 @@ internal fun UserMessageBubble(
                 )
             }
         }
-        if (showBranchSelector && totalBranches > 1 && !isEditing) {
+        if (showBranchSelector && totalBranches > 1 && !showEditor) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier
@@ -358,3 +447,15 @@ internal fun UserMessageBubble(
 
     }
 }
+
+/**
+ * Bottom inset of the edit-mode bubble: the 15dp content padding minus the 10dp a Material
+ * TextButton (40dp min height, 20sp label) leaves below its label, minus 1dp tuned by eye.
+ */
+private val EDIT_BOTTOM_INSET = 4.dp
+
+/** Width of a single-line bubble's height (15dp padding twice plus one 24.2sp line), so the
+ * shortest message is a circle rather than a pinched capsule. Compact: 30 dp + 23.2 sp * 15/16. */
+private val USER_BUBBLE_MIN_WIDTH get() = if (chatCompactWidth) 52.dp else 54.dp
+// Narrow windows (see CHAT_COMPACT_WIDTH_DP) cap the bubble at roughly three quarters of the width.
+private val USER_BUBBLE_MAX_WIDTH get() = if (chatCompactWidth) 256.dp else 300.dp

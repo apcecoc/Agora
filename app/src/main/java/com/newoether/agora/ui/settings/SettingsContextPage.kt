@@ -24,6 +24,7 @@ import com.newoether.agora.data.providerDisplayName
 import com.newoether.agora.model.ModelId
 import com.newoether.agora.model.ContextBudget
 import com.newoether.agora.ui.common.PersistedSliderFeedbackGate
+import com.newoether.agora.ui.components.optionClickable
 import com.newoether.agora.viewmodel.ChatViewModel
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -36,9 +37,11 @@ fun SettingsContextPage(viewModel: ChatViewModel, onBack: () -> Unit) {
         viewModel.settings.contextCompactThresholdPercent.collectAsState()
     val compactModel by viewModel.settings.contextCompactModel.collectAsState()
     val compactPrompt by viewModel.settings.contextCompactPrompt.collectAsState()
+    val preserveSystemPrompt by viewModel.settings.contextCompactPreserveSystemPrompt.collectAsState()
     val retainCount by viewModel.settings.contextCompactRetainCount.collectAsState()
     val enabledModels by viewModel.settings.enabledModels.collectAsState()
     val aliases by viewModel.settings.modelAliases.collectAsState()
+    val modelProviderNames by viewModel.settings.modelProviderNames.collectAsState()
     val customProviders by viewModel.settings.customProviders.collectAsState()
     val showDocFab by viewModel.settings.showDocumentationFab.collectAsState()
     var modelDialog by remember { mutableStateOf(false) }
@@ -121,7 +124,7 @@ fun SettingsContextPage(viewModel: ChatViewModel, onBack: () -> Unit) {
                             supportingContent = {
                                 Text(
                                     compactModel?.let {
-                                        modelDisplayName(it, aliases, customProviders)
+                                        modelDisplayName(it, aliases, customProviders, modelProviderNames[it] != false)
                                     } ?: stringResource(R.string.title_gen_current_model)
                                 )
                             },
@@ -229,6 +232,33 @@ fun SettingsContextPage(viewModel: ChatViewModel, onBack: () -> Unit) {
                         )
                     }
                     add {
+                        SettingsItem(
+                            headlineContent = {
+                                Text(stringResource(R.string.context_compact_preserve_system))
+                            },
+                            supportingContent = {
+                                Text(stringResource(R.string.context_compact_preserve_system_desc))
+                            },
+                            leadingContent = {
+                                Icon(
+                                    Icons.Default.Compress,
+                                    null,
+                                    tint = MaterialTheme.colorScheme.primary,
+                                )
+                            },
+                            trailingContent = {
+                                Switch(
+                                    checked = preserveSystemPrompt,
+                                    onCheckedChange = viewModel.settings::setContextCompactPreserveSystemPrompt,
+                                )
+                            },
+                            modifier = Modifier.clickable {
+                                viewModel.settings
+                                    .setContextCompactPreserveSystemPrompt(!preserveSystemPrompt)
+                            },
+                        )
+                    }
+                    add {
                         PromptSettingItem(
                             title = stringResource(R.string.context_compact_prompt),
                             description = stringResource(R.string.context_compact_prompt_desc),
@@ -301,7 +331,7 @@ fun SettingsContextPage(viewModel: ChatViewModel, onBack: () -> Unit) {
 }
 
 @Composable
-private fun CompactModelItem(
+internal fun CompactModelItem(
     label: String,
     provider: String?,
     selected: Boolean,
@@ -319,7 +349,7 @@ private fun CompactModelItem(
             }
         },
         leadingContent = { RadioButton(selected = selected, onClick = onClick) },
-        modifier = Modifier.clickable(onClick = onClick),
+        modifier = Modifier.optionClickable(onClick = onClick),
     )
 }
 

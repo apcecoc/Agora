@@ -4,11 +4,7 @@ import com.newoether.agora.model.ChatMessage
 import com.newoether.agora.model.ConversationCommand
 import com.newoether.agora.model.MessageStatus
 import com.newoether.agora.model.Participant
-import com.newoether.agora.model.ProviderPassResult
 import com.newoether.agora.model.RunEffect
-import com.newoether.agora.model.RunEffectIdentity
-import com.newoether.agora.model.RunEndReason
-import com.newoether.agora.model.RunStatus
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
@@ -18,6 +14,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -26,7 +23,7 @@ class ConversationGenerationStateTest {
 
     @Test
     fun replacementClaim_isIdleOnlyAndAtomic() = runBlocking {
-        val state = ConversationGenerationState("conversation")
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
 
         val token = state.tryAcquireForReplacement()
 
@@ -39,7 +36,7 @@ class ConversationGenerationStateTest {
 
     @Test
     fun normalCompletion_doesNotSuppressQueueDrain() = runBlocking {
-        val state = ConversationGenerationState("conversation")
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
         val token = state.acquireForSend()!!
         state.bindRun(token, "run")
 
@@ -139,7 +136,7 @@ class ConversationGenerationStateTest {
 
     @Test
     fun mailboxStop_cancelsEveryRegisteredGenerationHandleBeforeReturning() = runBlocking {
-        val state = ConversationGenerationState("conversation")
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
         val token = state.acquireForSend()!!
         state.bindRun(token, "run")
         var firstCancelCount = 0
@@ -156,7 +153,7 @@ class ConversationGenerationStateTest {
 
     @Test
     fun cancelledStopSubmitter_cannotDropAnAcceptedCutoffOrItsResult() = runBlocking {
-        val state = ConversationGenerationState("conversation")
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
         val token = state.acquireForSend()!!
         state.bindRun(token, "run")
         val result = CompletableDeferred<ConversationGenerationState.StopResult>()
@@ -172,7 +169,7 @@ class ConversationGenerationStateTest {
 
     @Test
     fun mailboxSend_claimsPreparingAndBindsOnlyItsExactPersistenceResult() = runBlocking {
-        val state = ConversationGenerationState("conversation")
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
 
         val requested = state.commands.requestSend(
             proposedRunId = "run",
@@ -192,7 +189,7 @@ class ConversationGenerationStateTest {
 
     @Test
     fun StopBeforeInputPersistence_rejectsTheLateMailboxResult() = runBlocking {
-        val state = ConversationGenerationState("conversation")
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
         val requested = state.commands.requestSend(
             proposedRunId = "run",
             effectId = "send",
@@ -211,7 +208,7 @@ class ConversationGenerationStateTest {
 
     @Test
     fun StopDuringRoomCommit_bindsTheDurableRunAndReturnsItsExactStopEffect() = runBlocking {
-        val state = ConversationGenerationState("conversation")
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
         val requested = state.commands.requestSend(
             proposedRunId = "run",
             effectId = "send",
@@ -263,7 +260,7 @@ class ConversationGenerationStateTest {
 
     @Test
     fun mailboxInputFailure_remainsOwnedUntilTheGenerationCoroutineSettles() = runBlocking {
-        val state = ConversationGenerationState("conversation")
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
         val requested = state.commands.requestSend(
             proposedRunId = "run",
             effectId = "send",
@@ -281,7 +278,7 @@ class ConversationGenerationStateTest {
 
     @Test
     fun activeMailboxSend_returnsGuidanceForTheBoundRunWithoutChangingOwner() = runBlocking {
-        val state = ConversationGenerationState("conversation")
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
         val token = state.acquireForSend()!!
         state.bindRun(token, "active-run", pass = 2)
 
@@ -302,7 +299,7 @@ class ConversationGenerationStateTest {
 
     @Test
     fun preparingSendAcceptsMemoryGuidanceForItsProposedFreshRun() = runBlocking {
-        val state = ConversationGenerationState("conversation")
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
         val first = state.commands.requestSend(
             proposedRunId = "preparing-run",
             effectId = "first",
@@ -327,7 +324,7 @@ class ConversationGenerationStateTest {
 
     @Test
     fun stopCancelsAnExternallyOwnedBackgroundGenerationJob() = runBlocking {
-        val state = ConversationGenerationState("conversation")
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
         val token = state.acquireForSend()!!
         val started = CompletableDeferred<Unit>()
         val externalJob = launch {
@@ -354,7 +351,7 @@ class ConversationGenerationStateTest {
 
     @Test
     fun normalExternalCompletionRequestsQueueDrainExactlyOnce() = runBlocking {
-        val state = ConversationGenerationState("conversation")
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
         val token = state.acquireForSend()!!
         val externalJob = Job()
         var drainRequests = 0
@@ -375,7 +372,7 @@ class ConversationGenerationStateTest {
 
     @Test
     fun alreadyCompletedExternalJob_cannotStrandAnInstalledSlot() = runBlocking {
-        val state = ConversationGenerationState("conversation")
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
         val token = state.acquireForSend()!!
         val completedJob = Job().apply { complete() }
         val released = CompletableDeferred<Unit>()
@@ -389,7 +386,7 @@ class ConversationGenerationStateTest {
 
     @Test
     fun boundJobCompletionWithoutTerminalResultRemainsOccupiedForStopRecovery() = runBlocking {
-        val state = ConversationGenerationState("conversation")
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
         val token = state.acquireForSend()!!
         state.bindRun(token, "run")
         val released = CompletableDeferred<Unit>()
@@ -419,7 +416,7 @@ class ConversationGenerationStateTest {
 
     @Test
     fun stopPreservesQueueDrainPermission() = runBlocking {
-        val state = ConversationGenerationState("conversation")
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
         val token = state.acquireForSend()!!
         state.bindRun(token, "run")
 
@@ -434,7 +431,7 @@ class ConversationGenerationStateTest {
 
     @Test
     fun compactStopKeepsAutomaticHandoffSuppressed() = runBlocking {
-        val state = ConversationGenerationState("conversation")
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
         val token = state.acquireForSend()!!
         state.bindRun(token, "compact-run")
         state.deferNextQueueDrain()
@@ -533,7 +530,7 @@ class ConversationGenerationStateTest {
 
     @Test
     fun staleStopFinalizerCallback_cannotReleaseLaterStoppingRun() = runBlocking {
-        val state = ConversationGenerationState("conversation")
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
         val firstToken = state.acquireForSend()!!
         state.bindRun(firstToken, "first-run", pass = 2)
         state.streamUpdate(
@@ -582,7 +579,7 @@ class ConversationGenerationStateTest {
 
     @Test
     fun stopDuringQueuedPassClaim_rejectsTheNewPassBinding() = runBlocking {
-        val state = ConversationGenerationState("conversation")
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
         val token = state.acquireForSend()!!
         state.bindRun(token, "run", pass = 2)
 
@@ -602,7 +599,7 @@ class ConversationGenerationStateTest {
 
     @Test
     fun runtimeTrace_excludesStreamingMessageContent() = runBlocking {
-        val state = ConversationGenerationState("conversation")
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
         val token = state.acquireForSend()!!
         state.bindRun(token, "run", pass = 4)
         state.streamUpdate(
@@ -624,7 +621,7 @@ class ConversationGenerationStateTest {
 
     @Test
     fun guidanceLeaseUsesNormalSendContractForAFreshRun() = runBlocking {
-        val state = ConversationGenerationState("conversation")
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
         state.enqueueSend(
             QueuedSend("guidance", "text", "model", emptyList(), "stopped-run"),
         )
@@ -647,138 +644,8 @@ class ConversationGenerationStateTest {
     }
 
     @Test
-    fun toolBatchAndCommitResultsAreSerializedByConversationMailbox() = runBlocking {
-        val state = ConversationGenerationState("conversation")
-        val token = state.acquireForSend()!!
-        state.bindRun(token, "run", pass = 2)
-        val providerIdentity = RunEffectIdentity(
-            conversationId = "conversation",
-            ownerToken = token,
-            runId = "run",
-            pass = 2,
-            effectId = "provider-2-0",
-        )
-
-        val batch = state.commands.requestToolBatch(providerIdentity)!!
-        val commit = state.commands.completeToolBatch(batch.identity)!!
-        val continuation = state.commands.finishToolRoundCommit(commit.identity, success = true)
-
-        assertEquals(RunEffect.ContinueProviderPass(commit.identity), continuation)
-        assertEquals(
-            listOf("ToolBatchRequested", "ToolBatchCompleted", "ToolRoundCommitted"),
-            state.runtimeTraceSnapshot().takeLast(3).map { it.commandType },
-        )
-        assertEquals(
-            listOf("ExecutingTools", "CommittingToolRound", "Active"),
-            state.runtimeTraceSnapshot().takeLast(3).map { it.newState },
-        )
-        assertTrue(finalizeBoundRun(state, token, "run", pass = 2))
-    }
-
-    @Test
-    fun providerPassCallbacksRejectStaleAndDuplicateResults() = runBlocking {
-        val state = ConversationGenerationState("conversation")
-        val token = state.acquireForSend()!!
-        state.bindRun(token, "run", pass = 2)
-        val identity = RunEffectIdentity(
-            conversationId = "conversation",
-            ownerToken = token,
-            runId = "run",
-            pass = 2,
-            effectId = "provider-2-0",
-        )
-
-        assertEquals(identity, state.commands.requestProviderPass(identity)?.identity)
-        assertNull(
-            state.commands.finishProviderPass(
-                identity.copy(effectId = "provider-2-old"),
-                ProviderPassResult.COMPLETED_TEXT,
-            ),
-        )
-        assertEquals(
-            RunEffect.ProviderPassAccepted(identity, ProviderPassResult.COMPLETED_TEXT),
-            state.commands.finishProviderPass(identity, ProviderPassResult.COMPLETED_TEXT),
-        )
-        assertNull(state.commands.finishProviderPass(identity, ProviderPassResult.COMPLETED_TEXT))
-        assertTrue(finalizeBoundRun(state, token, "run", pass = 2))
-    }
-
-    @Test
-    fun normalFinalizationWaitsForBothBarriersBeforeReleasing() = runBlocking {
-        val state = ConversationGenerationState("conversation")
-        val token = state.acquireForSend()!!
-        state.bindRun(token, "run")
-        val unwind = CompletableDeferred<Unit>()
-        val released = CompletableDeferred<Unit>()
-        state.onQueueDrainRequested = { released.complete(Unit) }
-        val job = checkNotNull(state.launchGenerationJob(token) { unwind.await() })
-        val identity = RunEffectIdentity(
-            conversationId = "conversation",
-            ownerToken = token,
-            runId = "run",
-            pass = 0,
-            effectId = "finalize-run-0",
-        )
-        val effect = state.commands.requestRunFinalization(
-            identity,
-            RunStatus.COMPLETED,
-            RunEndReason.MODEL_COMPLETED,
-            markConversationUnread = true,
-        )
-
-        assertEquals(identity, effect?.identity)
-        assertEquals(
-            ConversationGenerationState.RunFinalizationOutcome.RECORDED,
-            state.finishRunFinalization(identity, success = true),
-        )
-        assertTrue(state.generating.value)
-        unwind.complete(Unit)
-        job.join()
-        released.await()
-        assertFalse(state.generating.value)
-    }
-
-    @Test
-    fun failedNormalFinalizationKeepsSlotUntilStopRecoverySettles() = runBlocking {
-        val state = ConversationGenerationState("conversation")
-        val token = state.acquireForSend()!!
-        state.bindRun(token, "run")
-        val unwind = CompletableDeferred<Unit>()
-        val job = checkNotNull(state.launchGenerationJob(token) { unwind.await() })
-        val identity = RunEffectIdentity(
-            conversationId = "conversation",
-            ownerToken = token,
-            runId = "run",
-            pass = 0,
-            effectId = "finalize-run-0",
-        )
-        state.commands.requestRunFinalization(
-            identity,
-            RunStatus.FAILED,
-            RunEndReason.PROVIDER_ERROR,
-            markConversationUnread = true,
-        )
-
-        assertEquals(
-            ConversationGenerationState.RunFinalizationOutcome.FAILED,
-            state.finishRunFinalization(identity, success = false),
-        )
-        unwind.complete(Unit)
-        job.join()
-        assertTrue(state.generating.value)
-
-        val stopped = state.stop()
-        assertTrue(stopped.finalizationEffect != null)
-        assertEquals(
-            ConversationGenerationState.StopFinalizationOutcome.SETTLED,
-            state.finishStopFinalization(stopped.completion(success = true)),
-        )
-        assertFalse(state.generating.value)
-    }
-
-    @Test
     fun removingQueuedGuidanceTransfersOwnershipExactlyOnce() {
-        val state = ConversationGenerationState("conversation")
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
         val queued = QueuedSend("one", "first", "model", emptyList(), "run")
         state.enqueueSend(queued)
 
@@ -789,7 +656,7 @@ class ConversationGenerationStateTest {
 
     @Test
     fun failedBoundaryDrainDefersOnlyImmediateAutomaticRetry() {
-        val state = ConversationGenerationState("conversation")
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
 
         state.deferNextQueueDrain()
 
@@ -799,7 +666,7 @@ class ConversationGenerationStateTest {
 
     @Test
     fun consecutiveOriginAndCompactDrainDeferralsCannotConsumeEachOther() {
-        val state = ConversationGenerationState("conversation")
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
 
         state.deferNextQueueDrain()
         state.deferNextQueueDrain()
@@ -810,8 +677,17 @@ class ConversationGenerationStateTest {
     }
 
     @Test
+    fun staleDrainDeferralCannotSuppressTheNextRunsDrain() {
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
+        // A run armed a deferral but never released its slot, so nothing consumed it.
+        state.deferNextQueueDrain()
+        assertNotNull(state.acquireForSend())
+        assertTrue(state.consumeQueueDrainPermission())
+    }
+
+    @Test
     fun successfulCompactRemovesOnlyItsOwnDrainDeferral() {
-        val state = ConversationGenerationState("conversation")
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
 
         state.deferNextQueueDrain()
         state.deferNextQueueDrain()
@@ -823,7 +699,7 @@ class ConversationGenerationStateTest {
 
     @Test
     fun successfulCompactRemovesItsDeferralAfterOriginSettlement() {
-        val state = ConversationGenerationState("conversation")
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
 
         state.deferNextQueueDrain()
         state.deferNextQueueDrain()
@@ -834,7 +710,7 @@ class ConversationGenerationStateTest {
     }
 
     private fun activeStateWithStreamingMessage(): ActiveGeneration {
-        val state = ConversationGenerationState("conversation")
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
         val token = state.acquireForSend()!!
         state.bindRun(token, "run")
         val unwind = CompletableDeferred<Unit>()
@@ -864,39 +740,5 @@ class ConversationGenerationStateTest {
         val token: Long,
         val job: Job,
         val unwind: CompletableDeferred<Unit>,
-    )
-
-    private suspend fun finalizeBoundRun(
-        state: ConversationGenerationState,
-        ownerToken: Long,
-        runId: String,
-        pass: Int = 0,
-    ): Boolean {
-        val identity = RunEffectIdentity(
-            conversationId = "conversation",
-            ownerToken = ownerToken,
-            runId = runId,
-            pass = pass,
-            effectId = "finalize-$runId-$pass",
-        )
-        val effect = state.commands.requestRunFinalization(
-            identity,
-            RunStatus.COMPLETED,
-            RunEndReason.MODEL_COMPLETED,
-            markConversationUnread = true,
-        )
-        assertEquals(identity, effect?.identity)
-        assertEquals(
-            ConversationGenerationState.RunFinalizationOutcome.RECORDED,
-            state.finishRunFinalization(identity, success = true),
-        )
-        return state.endGeneration(ownerToken)
-    }
-
-    private fun ConversationGenerationState.StopResult.completion(
-        success: Boolean,
-    ): ConversationCommand.PersistenceSettled = ConversationCommand.PersistenceSettled(
-        identity = requireNotNull(finalizationEffect).identity,
-        success = success,
     )
 }

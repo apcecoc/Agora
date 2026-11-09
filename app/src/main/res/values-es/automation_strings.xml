@@ -12,7 +12,7 @@
     <string name="task_run_now">Ejecutar ahora</string>
     <string name="task_delete">Eliminar tarea</string>
     <string name="task_delete_confirm">¿Eliminar «%1$s» y todo su historial de ejecuciones?</string>
-    <string name="import_conversation_graph_counts">Conversaciones (%1$d) · Tareas (%2$d) · Bucles (%3$d)</string>
+    <string name="import_conversation_graph_counts">Conversaciones (%1$d) · Tareas (%2$d)</string>
     <string name="task_enabled">Ejecutar según programación</string>
     <string name="task_enabled_desc">Si está desactivado, la tarea solo se ejecuta al tocar «Ejecutar ahora».</string>
     <string name="task_enabled_needs_schedule">Elige primero una programación.</string>
@@ -58,6 +58,7 @@
     <string name="task_status_unknown">Pendiente</string>
     <string name="task_running_notification">Ejecutando tarea programada…</string>
     <string name="loop_running_notification">Ejecutando bucle de conversación…</string>
+    <string name="auto_backup_running_notification">Creando copia de seguridad…</string>
     <string name="loop_running">Bucle en ejecución…</string>
     <string name="loop_next_in">Siguiente en %1$s</string>
     <string name="loop_cycle">Ciclo %1$d/%2$d</string>
@@ -67,7 +68,12 @@
     <string name="settings_automation_desc">Tareas, bucles y precisión de programación</string>
     <string name="automation_ai_tools">Acceder a tareas y bucles</string>
     <string name="automation_ai_tools_desc">Permite que el modelo cree y administre tareas o inicie y detenga bucles de conversación. Desactivado de forma predeterminada.</string>
-    <string name="automation_scheduling">Programación</string>
+    <string name="automation_background_execution">Ejecución en segundo plano</string>
+    <string name="automation_wake_lock">Bloqueo de activación</string>
+    <string name="automation_wake_lock_desc">Mantiene activo cada proceso de tarea o bucle. WorkManager ya gestiona el trabajo programado normal; este bloqueo adicional puede aumentar el consumo de batería.</string>
+    <string name="automation_battery_optimization">Optimización de batería</string>
+    <string name="automation_battery_optimization_ignored_desc">Sin optimizar; Android puede permitir más trabajo en segundo plano, pero aún pueden aplicarse restricciones del fabricante</string>
+    <string name="automation_battery_optimization_active_desc">Optimizada; Android puede retrasar el trabajo en segundo plano y aún pueden aplicarse restricciones del fabricante</string>
     <string name="automation_exact_execution">Ejecución exacta</string>
     <string name="automation_exact_execution_on_desc">Usar alarmas exactas para tareas y bucles. Android aún puede aplicar límites del sistema.</string>
     <string name="automation_exact_execution_off_desc">Usar alarmas inexactas que ahorran batería. Activa esta opción para solicitar acceso a Alarmas y recordatorios.</string>

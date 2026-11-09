@@ -7,7 +7,9 @@ import com.newoether.agora.data.MemoryManager
 import com.newoether.agora.data.SkillManager
 import com.newoether.agora.data.repository.ConversationRepository
 import com.newoether.agora.data.repository.SettingsRepository
+import com.newoether.agora.diagnostics.DeveloperDiagnostics
 import com.newoether.agora.model.ChatMessage
+import com.newoether.agora.model.MessageSource
 import com.newoether.agora.model.MessageStatus
 import com.newoether.agora.model.Participant
 import com.newoether.agora.model.RunEffect
@@ -17,29 +19,24 @@ import com.newoether.agora.model.RunStatus
 import com.newoether.agora.sandbox.SandboxManagerFactory
 import com.newoether.agora.util.DebugLog
 import com.newoether.agora.viewmodel.AutomaticCompactContinuationRequest
-import com.newoether.agora.viewmodel.BoundRunGenerationLauncher
+import com.newoether.agora.viewmodel.AskUserController
 import com.newoether.agora.viewmodel.BoundRunGenerationRequest
 import com.newoether.agora.viewmodel.AcceptedInputGraphWriter
-import com.newoether.agora.viewmodel.ContextCompactor
-import com.newoether.agora.viewmodel.ConversationCompactController
 import com.newoether.agora.viewmodel.ConversationTitleGenerator
 import com.newoether.agora.viewmodel.GenerationManager
 import com.newoether.agora.viewmodel.GenerationFinalizer
-import com.newoether.agora.viewmodel.GenerationTerminalSettlementController
 import com.newoether.agora.viewmodel.ConversationStateRegistry
 import com.newoether.agora.viewmodel.ConversationGenerationState
 import com.newoether.agora.viewmodel.GenerationRequestBuilder
 import com.newoether.agora.viewmodel.ToolRoundBoundaryDecision
-import com.newoether.agora.viewmodel.StandardGenerationContinuationLauncher
-import com.newoether.agora.viewmodel.StandardGenerationContinuationRequest
 import com.newoether.agora.viewmodel.automaticCompactAllowsHandoff
-import com.newoether.agora.viewmodel.launchStandardContinuationAfterGuidance
 import com.newoether.agora.viewmodel.ProviderRegistry
 import com.newoether.agora.viewmodel.RagManager
 import com.newoether.agora.viewmodel.RunFinalizationEffectCoordinator
 import com.newoether.agora.viewmodel.ShellConfirmationController
 import com.newoether.agora.viewmodel.fallbackConversationTitle
 import com.newoether.agora.viewmodel.toUiChatMessage
+import com.newoether.agora.tool.AskUserToolProvider
 import com.newoether.agora.tool.McpToolProvider
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableJob
@@ -48,10 +45,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
-import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.withContext
 import java.util.UUID
-import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Headless single-shot generation engine (process-scoped).
@@ -80,14 +75,19 @@ class TaskExecutionEngine(
     private val executionCoordinator: ConversationExecutionCoordinator,
     shellConfirmation: ShellConfirmationController,
     mcpToolProvider: McpToolProvider,
+    askUser: AskUserController,
     private val generationRegistry: ConversationStateRegistry,
     private val automationExecutionGate: AutomationExecutionGate = AutomationExecutionGate(),
+    private val automationWakeLockOwner: AutomationWakeLockOwner =
+        AutomationWakeLockOwner(appContext),
     private val pauseConversationLoop: suspend (String) -> Unit = {},
+    private val additionalTools: () -> List<com.newoether.agora.tool.ToolProvider> = { emptyList() },
+    private val phoneReady: suspend (String) -> Boolean = { false },
 ) {
     sealed interface Result {
         data class Success(val modelMessageId: String, val text: String) : Result
         data class Busy(val reason: String = "Conversation is already generating") : Result
-        data class Failure(val reason: String) : Result
+        data class Failure(val reason: String, val modelMessageId: String? = null) : Result
     }
 
     /**
@@ -102,12 +102,22 @@ class TaskExecutionEngine(
      */
     private val foregroundBridgeLock = Any()
     private var foregroundBridgeOwner: Any? = null
-    private var foregroundSendBridge: (suspend (conversationId: String, userText: String, modelId: String) -> BridgeOutcome)? = null
+    private var foregroundSendBridge: (suspend (
+        conversationId: String,
+        userText: String,
+        modelId: String,
+        requestKind: String,
+    ) -> BridgeOutcome)? = null
 
     /** Owner-token binding prevents an older ViewModel's late onCleared from erasing a newer one. */
     fun attachForegroundSendBridge(
         owner: Any,
-        bridge: suspend (conversationId: String, userText: String, modelId: String) -> BridgeOutcome,
+        bridge: suspend (
+            conversationId: String,
+            userText: String,
+            modelId: String,
+            requestKind: String,
+        ) -> BridgeOutcome,
     ) = synchronized(foregroundBridgeLock) {
         foregroundBridgeOwner = owner
         foregroundSendBridge = bridge
@@ -136,195 +146,63 @@ class TaskExecutionEngine(
     private val ragManager = RagManager(
         conversations = convRepo,
         settings = settings,
-        localProvider = localProvider,
         appContext = appContext,
         scope = appScope,
         emitSnackbar = {},
     )
     private val stopFinalizer = GenerationFinalizer(convRepo, ragManager::indexMessageForRag)
+    internal suspend fun stopConversationAndAwait(conversationId: String) {
+        val state = generationRegistry.get(conversationId) ?: return
+        val stopped = state.stop()
+        stopped.finalizationEffect?.let { effect ->
+            stopFinalizer.settleTaskStopEffect(
+                state, effect, stopped.stoppedMessage?.let(::listOf).orEmpty(),
+            )
+        }
+        state.awaitSendAvailable()
+    }
+
     private val runFinalizationEffects = RunFinalizationEffectCoordinator()
     private val titleGenerator = ConversationTitleGenerator(convRepo, settings, providerRegistry)
-    private val contextCompactor = ContextCompactor(conversations = convRepo)
     private val acceptedInputGraphWriter = AcceptedInputGraphWriter(convRepo)
-    private val terminalSettlement = GenerationTerminalSettlementController(
+    private val compactPipeline = HeadlessCompactPipeline(
         conversations = convRepo,
-        stopFinalizer = GenerationFinalizer(convRepo) { _, _ -> },
-        runFinalizationEffects = RunFinalizationEffectCoordinator(),
-        failureText = { "Generation failed" },
-        toUiMessage = { it.toUiChatMessage(appContext) },
-        onSnackbar = {},
-    )
-    private val compactBoundRunGenerationLauncher = BoundRunGenerationLauncher(
-        conversations = convRepo,
-        generationManagerProvider = { generationManager },
-        automaticCompactNeeded = contextCompactor::automaticNeeded,
-        terminalSettlement = terminalSettlement,
-        toUiMessage = { it.toUiChatMessage(appContext) },
-    )
-    private val compactContinuationLauncher = StandardGenerationContinuationLauncher(
-        conversations = convRepo,
+        appContext = appContext,
         executionCoordinator = executionCoordinator,
-        terminalSettlement = terminalSettlement,
-        boundRunGenerationLauncher = { compactBoundRunGenerationLauncher },
-        toUiMessage = { it.toUiChatMessage(appContext) },
-        isConversationOpen = { false },
-        projectGraph = { _, _, _, _ -> },
-    )
-    private val compactController = ConversationCompactController(
-        conversations = convRepo,
-        operation = contextCompactor,
-        requestBuilder = null,
         generationManagerProvider = { generationManager },
-        continuationLauncher = { compactContinuationLauncher },
     )
-
-    private suspend fun settleStopEffect(
-        state: ConversationGenerationState,
-        effect: RunEffect.FinalizeStop,
-        messages: List<ChatMessage>,
-    ) = withContext(NonCancellable) {
-        stopFinalizer.launchStopFinalization(
-            scope = state.scope,
-            identity = effect.identity,
-            messages = messages,
-        ) { completion ->
-            val result = state.finishStopFinalization(completion)
-            if (result.accepted && completion.success) state.clearStoppedOverlay()
-        }.join()
-    }
-
-    private data class StandardCompactContinuationResult(
-        val modelMessageId: String?,
-        val aborted: Boolean = false,
-    )
-
-    /**
-     * Runs every post-tool boundary as ordinary generations: terminal Assistant -> Compact Run ->
-     * fresh Assistant Run. No provider stream, Assistant row, or Run identity is resumed.
-     */
-    private suspend fun continueThroughStandardCompactGenerations(
-        initialRequest: AutomaticCompactContinuationRequest,
-        state: ConversationGenerationState,
-    ): StandardCompactContinuationResult {
-        val pendingRequest = AtomicReference<AutomaticCompactContinuationRequest?>()
-        lateinit var boundLauncher: BoundRunGenerationLauncher
-        val continuationLauncher = StandardGenerationContinuationLauncher(
-            conversations = convRepo,
-            executionCoordinator = executionCoordinator,
-            terminalSettlement = terminalSettlement,
-            boundRunGenerationLauncher = { boundLauncher },
-            toUiMessage = { it.toUiChatMessage(appContext) },
-            isConversationOpen = { false },
-            projectGraph = { _, _, _, _ -> },
-        )
-        boundLauncher = BoundRunGenerationLauncher(
-            conversations = convRepo,
-            generationManagerProvider = { generationManager },
-            automaticCompactNeeded = contextCompactor::automaticNeeded,
-            terminalSettlement = terminalSettlement,
-            toUiMessage = { it.toUiChatMessage(appContext) },
-            onAutomaticCompactContinuation = { request, generationState ->
-                generationState.deferNextQueueDrain()
-                check(pendingRequest.compareAndSet(null, request)) {
-                    "A standard generation produced overlapping continuation requests"
-                }
-            },
-        )
-
-        var request: AutomaticCompactContinuationRequest? = initialRequest
-        var lastModelMessageId: String? = null
-        while (request != null) {
-            val current = request
-            val guidanceClaimRevision = state.guidanceClaimRevision()
-            val compactLaunch = compactController.startAutomaticStandard(
-                conversationId = current.generationRequest.conversationId,
-                contextLimit = current.generationRequest.snapshot.config.maxContextWindow,
-                config = current.config,
-                state = state,
-            ) ?: return StandardCompactContinuationResult(lastModelMessageId, aborted = true)
-            try {
-                compactLaunch.job.join()
-            } catch (cancelled: CancellationException) {
-                withContext(NonCancellable) {
-                    compactLaunch.job.cancel(cancelled)
-                    compactLaunch.job.join()
-                }
-                throw cancelled
-            }
-            val compactMessageId = compactLaunch.messageId
-            val compactStatus = convRepo.getMessage(compactMessageId)?.status
-            if (!automaticCompactAllowsHandoff(compactStatus)) {
-                return StandardCompactContinuationResult(lastModelMessageId, aborted = true)
-            }
-            val launch = launchStandardContinuationAfterGuidance(
-                state = state,
-                guidanceClaimRevision = guidanceClaimRevision,
-            ) {
-                pendingRequest.set(null)
-                continuationLauncher.launch(
-                    request = StandardGenerationContinuationRequest(
-                        conversationId = current.generationRequest.conversationId,
-                        parentMessageId = compactMessageId,
-                        snapshot = current.generationRequest.snapshot,
-                        alreadyHoldsConversationLock = true,
-                    ),
-                    state = state,
-                )
-            } ?: return StandardCompactContinuationResult(lastModelMessageId)
-            launch.job.join()
-            state.awaitSendAvailable()
-            val continuationMessage = convRepo.getMessage(launch.modelMessageId)
-            if (continuationMessage?.status == MessageStatus.STOPPED) {
-                return StandardCompactContinuationResult(lastModelMessageId, aborted = true)
-            }
-            if (continuationMessage != null) lastModelMessageId = launch.modelMessageId
-            request = pendingRequest.getAndSet(null)
-        }
-        return StandardCompactContinuationResult(lastModelMessageId)
-    }
+    private val contextCompactor get() = compactPipeline.compactor
+    private val terminalSettlement get() = compactPipeline.terminalSettlement
+    private val compactController get() = compactPipeline.controller
 
     /**
      * Task-only post-processing. Loop runs share this engine but never call this method, so a
      * conversation loop cannot repeatedly retitle itself after every cycle.
      */
     suspend fun updateTaskExecutionTitle(conversationId: String, response: String) {
-        settings.awaitInitialLoad()
-        providerRegistry.awaitInitialSync()
-        if (settings.titleGenerationEnabled.value) {
-            when (val result = titleGenerator.generateAndPersist(conversationId)) {
-                is ConversationTitleGenerator.Result.Success -> return
-                is ConversationTitleGenerator.Result.Failure ->
-                    DebugLog.w(
-                        "TaskExecutionEngine",
-                        "Task title generation failed; using response fallback",
-                    )
-            }
-        }
-        val fallback = fallbackConversationTitle(response)
-        if (fallback.isBlank()) return
-        convRepo.getConversation(conversationId)?.let { conversation ->
-            convRepo.updateConversationTitleIfUnchanged(
-                id = conversationId,
-                expectedTitle = conversation.title,
-                newTitle = fallback,
-            )
-        }
+        titleGenerator.updateTaskTitle(conversationId, response)
     }
 
-    private val generationManager = GenerationManager(
+    private val generationManager by lazy { GenerationManager(
         app = application,
         conversations = convRepo,
         memoryManager = memoryManager,
         skillManager = skillManager,
         context = appContext,
         sandboxFactory = sandboxFactory,
-        additionalToolProviders = listOf(mcpToolProvider),
+        // A background run can ask the user too: the question surfaces in the chat screen's
+        // interaction bar, or as a notification while that screen is not showing.
+        additionalToolProviders = listOf(mcpToolProvider, AskUserToolProvider(askUser)) + additionalTools(),
         customProviders = { settings.customProviders.value },
+        generatingConversationIds = {
+            generationRegistry.activeConversationIds.value + executionCoordinator.activeAutomationConversationIds.value
+        },
     ).also {
         // Foreground Task/Loop executions share the exact same prompt and session trust state as
-        // Chat. ShellConfirmationController itself fails fast when no Activity is visible.
+        // Chat, including the notification-backed wait when no Activity is visible.
         it.onConfirmShellCommand = shellConfirmation::confirm
-    }
+        it.onMessagePersisted = ragManager::indexMessageForRag
+    } }
 
     /**
      * Injects [userText] as a new user turn at the leaf of [conversationId] and runs
@@ -343,15 +221,18 @@ class TaskExecutionEngine(
         systemPromptOverride: String? = null,
         foregroundServiceManagedExternally: Boolean = false,
         precondition: suspend () -> Boolean = { true },
+        requestKind: String = "task",
     ): Result = automationExecutionGate.withExecution {
         executionCoordinator.withAutomationConversationLock(conversationId) {
-            runOnceLocked(
+            convRepo.recoverConversationRuntime(conversationId)
+            runOnceWithAutomationGuardsHeld(
                 conversationId = conversationId,
                 userText = userText,
                 modelId = modelId,
                 systemPromptOverride = systemPromptOverride,
                 foregroundServiceManagedExternally = foregroundServiceManagedExternally,
                 precondition = precondition,
+                requestKind = requestKind,
             )
         }
     }
@@ -368,14 +249,25 @@ class TaskExecutionEngine(
         systemPromptOverride: String? = null,
         foregroundServiceManagedExternally: Boolean = false,
         precondition: suspend () -> Boolean = { true },
-    ): Result = runOnceLocked(
-        conversationId = conversationId,
-        userText = userText,
-        modelId = modelId,
-        systemPromptOverride = systemPromptOverride,
-        foregroundServiceManagedExternally = foregroundServiceManagedExternally,
-        precondition = precondition,
-    )
+        requestKind: String = "loop",
+        source: MessageSource? = null,
+        contextOverride: com.newoether.agora.viewmodel.GenerationContext? = null,
+    ): Result = executionCoordinator.withGenerationAdmission(conversationId) {
+        settings.awaitInitialLoad()
+        automationWakeLockOwner.whileHeld(settings.automationWakeLockEnabled.value) {
+            runOnceLocked(
+                conversationId = conversationId,
+                userText = userText,
+                modelId = modelId,
+                systemPromptOverride = systemPromptOverride,
+                foregroundServiceManagedExternally = foregroundServiceManagedExternally,
+                precondition = precondition,
+                requestKind = requestKind,
+                source = source,
+                contextOverride = contextOverride,
+            )
+        }
+    }
 
     private suspend fun runOnceLocked(
         conversationId: String,
@@ -384,10 +276,13 @@ class TaskExecutionEngine(
         systemPromptOverride: String?,
         foregroundServiceManagedExternally: Boolean,
         precondition: suspend () -> Boolean,
+        requestKind: String,
+        source: MessageSource?,
+        contextOverride: com.newoether.agora.viewmodel.GenerationContext?,
     ): Result {
+        require(requestKind.isNotBlank())
         settings.awaitInitialLoad()
         providerRegistry.awaitInitialSync()
-        convRepo.ensureRunRecovery()
         if (!precondition()) return Result.Failure("Execution cancelled")
         val conversation = convRepo.getConversation(conversationId)
             ?: return Result.Failure("Conversation not found: $conversationId")
@@ -402,8 +297,15 @@ class TaskExecutionEngine(
         // conversation lease still spans the whole generation and the Result reflects what
         // actually happened rather than merely "the send was accepted".
         val bridge = currentForegroundSendBridge()
-        if (bridge != null) {
-            when (val outcome = bridge(conversationId, userText, effectiveModelId)) {
+        if (bridge != null && requestKind != "subagent") {
+            when (
+                val outcome = bridge(
+                    conversationId,
+                    userText,
+                    effectiveModelId,
+                    requestKind,
+                )
+            ) {
                 is BridgeOutcome.Completed ->
                     return Result.Success(outcome.modelMessageId, outcome.text)
                 is BridgeOutcome.Busy -> return Result.Busy(outcome.reason)
@@ -438,6 +340,7 @@ class TaskExecutionEngine(
             }
 
             val builder = GenerationRequestBuilder(
+                phoneReady = phoneReady,
                 settings = settings,
                 convRepo = convRepo,
                 memoryManager = memoryManager,
@@ -445,13 +348,12 @@ class TaskExecutionEngine(
                 providerRegistry = providerRegistry,
                 ragManager = ragManager,
                 appContext = appContext,
-                pendingConversationSettings = MutableStateFlow(null),
-                onSnackbar = {},
             )
             val captured = builder.captureAdmissionSnapshot(
                 conversationId = conversationId,
                 runId = runId,
                 modelId = effectiveModelId,
+                automationCaller = requestKind == "task" || requestKind == "loop",
                 resolvedPromptOverride = systemPromptOverride?.let {
                     GenerationRequestBuilder.ResolvedPrompt(
                         it.ifBlank { null },
@@ -460,10 +362,14 @@ class TaskExecutionEngine(
                     )
                 },
             )
-            val taskContext = captured.context.copy(
-                // Automation tools are intentionally foreground-only: a scheduled run must
-                // not recursively create more tasks/loops without a user in the loop.
-                automationToolsEnabled = false,
+            val taskContext = (contextOverride ?: captured.context).copy(
+                conversationId = conversationId,
+                toolEffectIdentity = null,
+                todoEnabled = (contextOverride?.todoEnabled ?: true) && captured.context.todoEnabled,
+                subagentToolsEnabled = captured.context.subagentToolsEnabled && contextOverride == null,
+                accessPastConversations = captured.context.accessPastConversations && contextOverride == null,
+                // Subagents retain the parent's admitted tools except recursive delegation/history.
+                automationToolsEnabled = contextOverride?.automationToolsEnabled ?: false,
                 foregroundServiceManagedExternally = foregroundServiceManagedExternally,
             )
             val generationSnapshot = captured.copy(
@@ -478,6 +384,7 @@ class TaskExecutionEngine(
             )
             val automaticCompactConfig = generationSnapshot.automaticCompact.copy(
                 fixedTokenCost = fixedTokenCost,
+                mainModelId = generationSnapshot.config.modelId,
             )
 
             // Pre-send Compact is an isolated standard generation. Only a fresh durable SUCCESS
@@ -493,6 +400,8 @@ class TaskExecutionEngine(
                     contextLimit = generationSnapshot.config.maxContextWindow,
                     config = automaticCompactConfig,
                     state = generationState,
+                    // runOnce already holds this conversation's automation lease.
+                    alreadyHoldsConversationLock = true,
                 ) ?: return Result.Failure("Compact generation did not start")
             } else {
                 null
@@ -544,6 +453,11 @@ class TaskExecutionEngine(
                 }
                 return Result.Failure("Conversation generation slot was revoked")
             }
+            if (!generationState.acquireGenerationAdmission(uiToken, executionCoordinator)) {
+                ownerJob.complete()
+                ownerJob.join()
+                return Result.Failure("Conversation generation slot was revoked")
+            }
             val persistToken = generationState.nextPersistId()
             val graphCommit = acceptedInputGraphWriter.commit(
                 AcceptedInputGraphWriter.Request(
@@ -553,9 +467,21 @@ class TaskExecutionEngine(
                     userText = userText,
                     modelId = generationSnapshot.selectedModelId,
                     userTimestamp = now,
+                    touchConversationOnAdmission = false,
+                    source = source ?: MessageSource.forAutomationRequestKind(requestKind),
                 ),
             )
             runCreated = true
+            if (userText.isNotBlank()) {
+                runCatching { ragManager.indexMessageForRag(userMessageId, userText) }
+                    .onFailure { error ->
+                        DebugLog.w(
+                            "TaskExecutionEngine",
+                            "Failed to enqueue user-message indexing for $userMessageId",
+                            error,
+                        )
+                    }
+            }
             bindingOutcome = withContext(NonCancellable) {
                 generationState.finishInputPersistence(acceptedInputEffect.identity)
             }
@@ -564,7 +490,7 @@ class TaskExecutionEngine(
                 val stopping = bindingOutcome as?
                     ConversationGenerationState.RunBindingOutcome.Stopping
                 if (stopping != null) {
-                    settleStopEffect(
+                    stopFinalizer.settleTaskStopEffect(
                         state = generationState,
                         effect = stopping.finalizationEffect,
                         messages = emptyList(),
@@ -579,7 +505,7 @@ class TaskExecutionEngine(
                 }
                 ownerJob.complete()
                 ownerJob.join()
-                generationState.awaitSendAvailable()
+                generationState.awaitGenerationSettled(uiToken)
                 currentCoroutineContext().ensureActive()
                 return Result.Failure("Execution cancelled")
             }
@@ -587,6 +513,19 @@ class TaskExecutionEngine(
             generationState.loadingChange(uiToken, true)
             generationState.streamUpdate(uiToken, placeholder)
 
+            val requestTrace = DeveloperDiagnostics.newRequestTrace(
+                requestId = modelMessageId,
+                origin = requestKind,
+                diagnosticContext = DeveloperDiagnostics.newRequestContext(
+                    requestId = modelMessageId,
+                    conversationId = conversationId,
+                    runId = runId,
+                    pass = 0,
+                    provider = generationSnapshot.config.providerName,
+                    model = generationSnapshot.selectedModelId,
+                    requestKind = requestKind,
+                ),
+            )
             val baseCallbacks = generationState.callbacksFor(uiToken, persistToken)
             val generationResult = withContext(ownerJob) {
                 generationManager.generate(
@@ -621,16 +560,26 @@ class TaskExecutionEngine(
                     },
                 ),
                 streamScope = generationState.streamScope,
+                requestTrace = requestTrace,
                 )
             }
             val boundaryParentId = generationResult.followUpParentMessageId
-            if (boundaryParentId != null) generationState.deferNextQueueDrain()
+            if (boundaryParentId != null) {
+                generationState.retainRunHandoff(uiToken)
+                generationState.deferNextQueueDrain()
+            }
             ownerJob.complete()
             ownerJob.join()
-            generationState.awaitSendAvailable()
+            generationState.awaitGenerationSettled(uiToken)
 
             if (boundaryParentId != null) {
-                val continuationResult = continueThroughStandardCompactGenerations(
+                val continuationResult = compactController.continueTaskGenerations(
+                    convRepo = convRepo,
+                    executionCoordinator = executionCoordinator,
+                    terminalSettlement = terminalSettlement,
+                    generationManager = generationManager,
+                    contextCompactor = contextCompactor,
+                    appContext = appContext,
                     initialRequest = AutomaticCompactContinuationRequest(
                         generationRequest = BoundRunGenerationRequest(
                             conversationId = conversationId,
@@ -641,7 +590,7 @@ class TaskExecutionEngine(
                             persistId = persistToken,
                             runId = runId,
                             pass = 0,
-                            callerTag = "automation",
+                            requestKind = requestKind,
                         ),
                         parentMessageId = boundaryParentId,
                         config = automaticCompactConfig,
@@ -658,7 +607,7 @@ class TaskExecutionEngine(
             if (finalMsg != null && finalMsg.status == MessageStatus.SUCCESS) {
                 Result.Success(finalModelMessageId, finalMsg.text)
             } else {
-                Result.Failure(finalMsg?.text?.takeIf { it.isNotBlank() } ?: "Generation failed")
+                Result.Failure(finalMsg?.text?.takeIf { it.isNotBlank() } ?: "Generation failed", finalModelMessageId)
             }
         } catch (e: CancellationException) {
             withContext(NonCancellable) {
@@ -690,7 +639,7 @@ class TaskExecutionEngine(
                 when (val binding = bindingOutcome) {
                     is ConversationGenerationState.RunBindingOutcome.Stopping -> {
                         if (!stopEffectHandled) {
-                            settleStopEffect(
+                            stopFinalizer.settleTaskStopEffect(
                                 state = generationState,
                                 effect = binding.finalizationEffect,
                                 messages = emptyList(),
@@ -704,7 +653,7 @@ class TaskExecutionEngine(
                         if (!generationState.stopping.value) {
                             val stopped = generationState.stop()
                             stopped.finalizationEffect?.let { effect ->
-                                settleStopEffect(
+                                stopFinalizer.settleTaskStopEffect(
                                     state = generationState,
                                     effect = effect,
                                     messages = stopped.stoppedMessage?.let(::listOf).orEmpty(),
@@ -773,7 +722,7 @@ class TaskExecutionEngine(
                     ConversationGenerationState.RunBindingOutcome.Stopping
                 if (stopping != null) {
                     if (!stopEffectHandled) {
-                        settleStopEffect(
+                        stopFinalizer.settleTaskStopEffect(
                             state = generationState,
                             effect = stopping.finalizationEffect,
                             messages = emptyList(),
@@ -829,7 +778,9 @@ class TaskExecutionEngine(
                     )
                 }
             }
-            Result.Failure(reason)
+            Result.Failure(reason, modelMessageId.takeIf { runCreated })
+        } finally {
+            generationState.finishRunHandoff(inputEffect?.identity?.ownerToken)
         }
     }
 }

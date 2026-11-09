@@ -23,6 +23,7 @@ import com.newoether.agora.data.modelAliasDisplayName
 import com.newoether.agora.data.modelDisplayName
 import com.newoether.agora.data.providerDisplayName
 import com.newoether.agora.viewmodel.ChatViewModel
+import com.newoether.agora.ui.components.optionClickable
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -33,6 +34,7 @@ fun SettingsTitleGenPage(viewModel: ChatViewModel, onBack: () -> Unit) {
     val titleGenNotificationsEnabled by
         viewModel.settings.titleGenerationNotificationsEnabled.collectAsState()
     val modelAliases by viewModel.settings.modelAliases.collectAsState()
+    val modelProviderNames by viewModel.settings.modelProviderNames.collectAsState()
     val enabledModels by viewModel.settings.enabledModels.collectAsState()
     val customProviders by viewModel.settings.customProviders.collectAsState()
     var showTitleModelDialog by remember { mutableStateOf(false) }
@@ -65,7 +67,7 @@ fun SettingsTitleGenPage(viewModel: ChatViewModel, onBack: () -> Unit) {
                                     headlineContent = { Text(stringResource(R.string.title_gen_model)) },
                                     supportingContent = {
                                         val displayName = if (titleGenModel == null) stringResource(R.string.title_gen_current_model) else {
-                                            modelDisplayName(titleGenModel!!, modelAliases, customProviders)
+                                            modelDisplayName(titleGenModel!!, modelAliases, customProviders, modelProviderNames[titleGenModel] != false)
                                         }
                                         Text(displayName)
                                     },
@@ -137,7 +139,7 @@ fun SettingsTitleGenPage(viewModel: ChatViewModel, onBack: () -> Unit) {
                                     showTitleModelDialog = false
                                 })
                             },
-                            modifier = Modifier.clickable {
+                            modifier = Modifier.optionClickable {
                                 viewModel.settings.setTitleGenerationModel(null)
                                 showTitleModelDialog = false
                             }
@@ -159,7 +161,7 @@ fun SettingsTitleGenPage(viewModel: ChatViewModel, onBack: () -> Unit) {
                                     showTitleModelDialog = false
                                 })
                             },
-                            modifier = Modifier.clickable {
+                            modifier = Modifier.optionClickable {
                                 viewModel.settings.setTitleGenerationModel(model)
                                 showTitleModelDialog = false
                             }

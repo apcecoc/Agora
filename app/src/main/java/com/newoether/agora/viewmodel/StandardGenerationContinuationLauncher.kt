@@ -24,23 +24,37 @@ internal data class StandardGenerationContinuationRequest(
     val alreadyHoldsConversationLock: Boolean = false,
     val modelMessageId: String? = null,
     val replacementMessageId: String? = null,
-    val callerTag: String = "standardContinuation",
+    val requestKind: String = "chat",
+    val touchConversationOnAdmission: Boolean,
+    /** Null keeps the conversation preference; the request and output still use the snapshot model. */
+    val conversationModelId: String? = snapshot.selectedModelId,
     val queueDrainRequiresSuccess: Boolean = false,
+    val continuesAfterSuccess: Boolean = false,
     val transformFinalText: (String, MessageStatus) -> String = { text, _ -> text },
 )
 
 internal suspend fun launchStandardContinuationAfterGuidance(
     state: ConversationGenerationState,
     guidanceClaimRevision: Long,
+    handoffOwnerToken: Long? = null,
     launch: () -> StandardGenerationContinuationLaunch?,
 ): StandardGenerationContinuationLaunch? = state.queueMutationMutex.withLock {
-    if (state.hasPendingOrClaimedGuidanceSince(guidanceClaimRevision)) null else launch()
+    if (state.hasPendingOrClaimedGuidanceSince(guidanceClaimRevision)) {
+        if (state.queuedSends.value.isNotEmpty()) state.releaseRunHandoffRetention(handoffOwnerToken)
+        else state.finishRunHandoff(handoffOwnerToken)
+        null
+    } else try {
+        launch()
+    } finally {
+        state.finishRunHandoff(handoffOwnerToken)
+    }
 }
 
 internal data class StandardGenerationContinuationLaunch(
     val job: Job,
     val modelMessageId: String,
     val started: Deferred<Boolean>,
+    val uiToken: Long,
 )
 
 /**
@@ -76,6 +90,7 @@ internal class StandardGenerationContinuationLauncher(
         val generationJob = state.launchGenerationJob(
             uiToken = uiToken,
             suppressAutomaticQueueDrain = request.queueDrainRequiresSuccess,
+            retainHandoff = request.continuesAfterSuccess,
         ) generation@{
             var runCreated = false
             var runBound = false
@@ -88,6 +103,7 @@ internal class StandardGenerationContinuationLauncher(
                 }
 
             try {
+                if (!state.acquireGenerationAdmission(uiToken, executionCoordinator)) return@generation
                 val persistId = state.nextPersistId()
                 val launchAtBoundary: suspend () -> Unit = boundary@{
                     if (!state.isCurrentToken(uiToken)) return@boundary
@@ -148,7 +164,8 @@ internal class StandardGenerationContinuationLauncher(
                             ),
                             messages = listOf(modelEntity),
                             messageSelectionUpdates = mapOf(parent.id to messageId),
-                            conversationModelId = generationSnapshot.selectedModelId,
+                            conversationModelId = request.conversationModelId,
+                            touchConversationOnAdmission = request.touchConversationOnAdmission,
                         )
                         messageSelections = graphCommit.messageSelections
                     }
@@ -188,7 +205,8 @@ internal class StandardGenerationContinuationLauncher(
                             persistId = persistId,
                             runId = runId,
                             pass = 0,
-                            callerTag = request.callerTag,
+                            requestKind = request.requestKind,
+                            continuesAfterSuccess = request.continuesAfterSuccess,
                             transformFinalText = request.transformFinalText,
                         ),
                         state,
@@ -245,6 +263,7 @@ internal class StandardGenerationContinuationLauncher(
             job = generationJob,
             modelMessageId = modelMessageId,
             started = started,
+            uiToken = uiToken,
         )
     }
 }

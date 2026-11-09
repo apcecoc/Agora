@@ -16,9 +16,15 @@ import io.mockk.coVerify
 import io.mockk.just
 import io.mockk.mockk
 import io.mockk.slot
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.yield
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -26,7 +32,7 @@ class ConversationEditServiceTest {
     @Test
     fun rejectsAssistantBeforeClaimingRuntimeOrReadingRoom() = runBlocking {
         val fixture = Fixture()
-        val state = ConversationGenerationState("conversation")
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
         val result = fixture.service.edit(
             fixture.request.copy(
                 messageId = "assistant",
@@ -45,9 +51,7 @@ class ConversationEditServiceTest {
 
         assertFalse(result)
         assertFalse(state.generating.value)
-        coVerify(exactly = 0) {
-            fixture.conversations.getMessagesForConversationSnapshot(any())
-        }
+        coVerify(exactly = 0) { fixture.conversations.getMessage(any()) }
         coVerify(exactly = 0) {
             fixture.boundLauncher.launch(any(), any())
         }
@@ -56,12 +60,53 @@ class ConversationEditServiceTest {
     }
 
     @Test
+    fun rejectsEveryAutomaticSourceBeforeClaimingRuntimeOrReadingRoom() = runBlocking {
+        val sources = listOf(
+            com.newoether.agora.model.MessageSource.TASK,
+            com.newoether.agora.model.MessageSource.LOOP,
+            com.newoether.agora.model.MessageSource.askUser(listOf(
+                com.newoether.agora.model.MessageSource.AskUserItem("Question", "Answer"))),
+            com.newoether.agora.model.MessageSource(com.newoether.agora.model.MessageSource.Kind.SUBAGENT),
+        )
+        for (source in sources) {
+            val fixture = Fixture()
+            val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
+            val request = fixture.request.copy(visiblePath = listOf(SOURCE_MESSAGE.copy(source = source)))
+            assertFalse(fixture.service.edit(request, state))
+            assertFalse(state.generating.value)
+            assertNull(fixture.transitions.request.value)
+            coVerify(exactly = 0) { fixture.conversations.getMessage(any()) }
+            coVerify(exactly = 0) { fixture.boundLauncher.launch(any(), any()) }
+            state.dispose()
+        }
+        Unit
+    }
+
+    @Test
+    fun durableAutomaticSourceRejectsAStaleUnmarkedProjectionBeforeCloning() = runBlocking {
+        val fixture = Fixture()
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
+        coEvery { fixture.conversations.getMessage("source-input") } returns SOURCE_ENTITY.copy(
+            sourceJson = com.newoether.agora.model.MessageSource.encode(com.newoether.agora.model.MessageSource.LOOP))
+        val result = async(start = CoroutineStart.UNDISPATCHED) {
+            fixture.service.edit(fixture.request, state)
+        }
+        val transition = checkNotNull(fixture.transitions.request.value)
+        fixture.transitions.acknowledgeFade(transition.id)
+        assertFalse(withTimeout(5_000L) { result.await() })
+        coVerify(exactly = 0) { fixture.inputCloner.clone(any(), any(), any()) }
+        coVerify(exactly = 0) { fixture.conversations.createRunWithMessages(any(), any(), any(), any(), any(), any()) }
+        coVerify(exactly = 0) { fixture.boundLauncher.launch(any(), any()) }
+        state.dispose()
+        Unit
+    }
+
+    @Test
     fun commitsEditedGraphBeforeProjectionSettlementAndBoundLaunch() = runBlocking {
         val fixture = Fixture()
-        val state = ConversationGenerationState("conversation")
-        coEvery {
-            fixture.conversations.getMessagesForConversationSnapshot("conversation")
-        } returns listOf(SOURCE_ENTITY)
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
+        coEvery { fixture.conversations.getMessage("source-input") } returns SOURCE_ENTITY
+        coEvery { fixture.conversations.getMessage("previous") } returns null
         coEvery { fixture.conversations.getRun("source-run") } returns SOURCE_RUN
         coEvery {
             fixture.inputCloner.clone(
@@ -79,6 +124,7 @@ class ConversationEditServiceTest {
                 messageSelectionUpdates = EXPECTED_SELECTIONS,
                 conversationModelId = "provider:model",
                 at = any(),
+                touchConversationOnAdmission = true,
             )
         } returns RunGraphCommit(
             messages = listOf(EDITED_ENTITY, MODEL_ENTITY),
@@ -87,9 +133,16 @@ class ConversationEditServiceTest {
         )
         coEvery { fixture.boundLauncher.launch(any(), state) } just Runs
 
-        val result = fixture.service.edit(fixture.request, state)
+        val result = async(start = CoroutineStart.UNDISPATCHED) {
+            fixture.service.edit(fixture.request, state)
+        }
+        val transition = checkNotNull(fixture.transitions.request.value)
+        assertEquals("source-assistant", transition.oldMessageId)
+        assertEquals("source-input", transition.sourceUserMessageId)
+        coVerify(exactly = 0) { fixture.conversations.createRunWithMessages(any(), any(), any(), any(), any(), any()) }
 
-        assertTrue(result)
+        fixture.transitions.acknowledgeFade(transition.id)
+        assertTrue(result.await())
         coVerify(timeout = 5_000, exactly = 1) {
             fixture.boundLauncher.launch(
                 match {
@@ -98,7 +151,7 @@ class ConversationEditServiceTest {
                         it.snapshot === fixture.snapshot &&
                         it.runId == "new-run" &&
                         it.pass == 0 &&
-                        it.callerTag == "editMessage"
+                        it.requestKind == "chat"
                 },
                 state,
             )
@@ -110,22 +163,82 @@ class ConversationEditServiceTest {
             listOf(
                 "indexed:new-user:edited text",
                 "project:new-user,new-model",
-                "scroll:new-user",
                 "await:new-user",
             ),
             fixture.events,
         )
         assertEquals("new-model", state.streamingMessage.value?.id)
+        assertEquals(
+            BranchReplacementTransitionStage.COMMITTED,
+            fixture.transitions.request.value?.stage,
+        )
+        assertEquals("new-user", fixture.transitions.request.value?.targetUserMessageId)
+        fixture.transitions.complete(transition.id)
         state.dispose()
         Unit
     }
 
-    private class Fixture {
+    @Test
+    fun fadeTimeoutAbortsTransitionWithoutPersisting() = runBlocking {
+        val fixture = Fixture(fadeTimeoutMs = 0L)
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
+
+        val result = withTimeout(5_000L) {
+            fixture.service.edit(fixture.request, state)
+        }
+
+        assertFalse(result)
+        assertNull(fixture.transitions.request.value)
+        coVerify(exactly = 0) { fixture.conversations.getMessage(any()) }
+        state.dispose()
+        Unit
+    }
+
+    @Test
+    fun abortWhileWaitingForConversationLockDoesNotPersist() = runBlocking {
+        val fixture = Fixture()
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
+        val lockHeld = CompletableDeferred<Unit>()
+        val releaseLock = CompletableDeferred<Unit>()
+        val lockHolder = async(start = CoroutineStart.UNDISPATCHED) {
+            fixture.executionCoordinator.withConversationLock("conversation") {
+                lockHeld.complete(Unit)
+                releaseLock.await()
+            }
+        }
+        lockHeld.await()
+
+        val result = async(start = CoroutineStart.UNDISPATCHED) {
+            fixture.service.edit(fixture.request, state)
+        }
+        val transition = checkNotNull(fixture.transitions.request.value)
+        fixture.transitions.acknowledgeFade(transition.id)
+        withTimeout(5_000L) {
+            while (!state.isLatestPersist(1L)) yield()
+        }
+
+        fixture.transitions.abort(transition.id)
+        releaseLock.complete(Unit)
+
+        assertFalse(result.await())
+        lockHolder.await()
+        assertNull(fixture.transitions.request.value)
+        coVerify(exactly = 0) { fixture.conversations.getMessage(any()) }
+        state.dispose()
+        Unit
+    }
+
+    private class Fixture(
+        fadeTimeoutMs: Long = 5_000L,
+    ) {
         val conversations = mockk<ConversationRepository>()
         val requestBuilder = mockk<GenerationRequestBuilder>()
+        val executionCoordinator = ConversationExecutionCoordinator()
         val inputCloner = mockk<EditedRunInputCloner>()
         val terminalSettlement = mockk<GenerationTerminalSettlementController>()
         val boundLauncher = mockk<BoundRunGenerationLauncher>()
+        val transitions = BranchReplacementTransitionCoordinator(fadeTimeoutMs = fadeTimeoutMs)
+        val guidanceDrain = mockk<QueuedGuidanceDrainExecutor>(relaxed = true)
         val events = mutableListOf<String>()
         val snapshot = testGenerationAdmissionSnapshot(
             conversationId = "conversation",
@@ -135,20 +248,19 @@ class ConversationEditServiceTest {
         val service = ConversationEditService(
             conversations = conversations,
             requestBuilder = requestBuilder,
-            executionCoordinator = ConversationExecutionCoordinator(),
+            executionCoordinator = executionCoordinator,
             inputCloner = inputCloner,
             terminalSettlement = terminalSettlement,
             boundRunGenerationLauncher = boundLauncher,
+            guidanceDrain = guidanceDrain,
             toUiMessage = ::toUiMessage,
             isConversationOpen = { true },
             projectGraph = { _, messages, _, _ ->
                 events += "project:${messages.joinToString(",") { it.id }}"
             },
-            awaitProjectedPath = { _, messageId -> events += "await:$messageId" },
             onUserMessagePersisted = { messageId, text ->
                 events += "indexed:$messageId:$text"
             },
-            onScrollToMessage = { events += "scroll:$it" },
             idFactory = ids::removeFirst,
         )
 
@@ -164,7 +276,10 @@ class ConversationEditServiceTest {
             messageId = "source-input",
             newText = "edited text",
             modelId = "provider:model",
-            visiblePath = listOf(SOURCE_MESSAGE),
+            visiblePath = listOf(SOURCE_MESSAGE, SOURCE_ASSISTANT),
+            origin = FakeChatClient(open = "conversation", branchTransitions = transitions).apply {
+                onAwaitProjectedPath = { _, messageId -> events += "await:$messageId" }
+            },
         )
     }
 
@@ -178,6 +293,16 @@ class ConversationEditServiceTest {
             timestamp = 1L,
             runId = "source-run",
             runSequence = 0,
+        )
+        val SOURCE_ASSISTANT = ChatMessage(
+            id = "source-assistant",
+            parentId = SOURCE_MESSAGE.id,
+            text = "answer",
+            participant = Participant.MODEL,
+            status = MessageStatus.SUCCESS,
+            timestamp = 2L,
+            runId = "source-run",
+            runSequence = 1,
         )
         val SOURCE_ENTITY = MessageEntity(
             id = "source-input",

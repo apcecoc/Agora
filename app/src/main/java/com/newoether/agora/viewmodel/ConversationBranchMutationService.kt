@@ -7,10 +7,12 @@ import com.newoether.agora.model.ChatMessage
 import com.newoether.agora.util.Constants
 import com.newoether.agora.util.DebugLog
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.withLock
 
 /** Executes one idle-only durable message-branch or Compact-boundary deletion. */
 internal class ConversationBranchMutationService(
@@ -19,20 +21,31 @@ internal class ConversationBranchMutationService(
     private val executionCoordinator: ConversationExecutionCoordinator,
     private val toUiMessage: (MessageEntity) -> ChatMessage,
     private val isConversationOpen: (String) -> Boolean,
-    private val projectGraph: (List<ChatMessage>, Map<String?, String>) -> Unit,
-    private val onMutationStart: suspend (scrollToTarget: Boolean) -> Long?,
-    private val onMutationSettling: (Long?, String?) -> Unit,
-    private val onMutationFailed: (Long?) -> Unit,
+    private val projectGraph: (
+        conversationId: String,
+        messages: List<ChatMessage>,
+        selectedChildren: Map<String?, String>,
+    ) -> Unit,
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val resultDispatcher: CoroutineDispatcher = Dispatchers.Main,
 ) {
     fun delete(
         conversationId: String,
         messageId: String,
         state: ConversationGenerationState,
         snapshot: List<ChatMessage>,
+        /** Client that issued the delete; it covers the tree mutation until its path settles. */
+        origin: ChatClient,
+        onResult: ((Boolean) -> Unit)? = null,
     ): Int {
-        if (state.generating.value) return 0
-        if (snapshot.none { it.id == messageId }) return 0
+        if (state.generating.value) {
+            onResult?.invoke(false)
+            return 0
+        }
+        if (snapshot.none { it.id == messageId }) {
+            onResult?.invoke(false)
+            return 0
+        }
         val compactOnly = messageId.startsWith(Constants.COMPACT_MSG_PREFIX)
         val previewIds = if (compactOnly) {
             setOf(messageId)
@@ -41,62 +54,74 @@ internal class ConversationBranchMutationService(
         }
 
         scope.launch(ioDispatcher) {
-            val switchingRequestId = onMutationStart(!compactOnly)
+            var switchingRequestId: Long? = null
             var committed = false
             try {
-                state.queueMutationMutex.withLock {
+                switchingRequestId = origin.beginTreeMutation(conversationId, !compactOnly)
+                val queueLocked = timedDeleteStage("queue-lock", messageId) {
+                    state.queueMutationMutex.tryLock()
+                }
+                if (!queueLocked) return@launch
+                try {
                     // Recheck after the overlay fade and under the same mutex that accepts Send.
-                    if (state.generating.value) return@withLock
-                    executionCoordinator.withConversationLock(conversationId) lock@ {
+                    if (state.generating.value) return@launch
+                    executionCoordinator.tryWithConversationLock(conversationId) lock@ {
                         if (conversations.getLiveRun(conversationId) != null) return@lock
                         if (compactOnly) {
-                            check(conversations.removeContextCompact(messageId))
-                            val remaining =
-                                conversations.getMessagesForConversationSnapshot(conversationId)
-                            val remainingChatMessages = remaining.map(toUiMessage)
-                            val selections = conversations.restoreBranchSelections(conversationId)
-                            onMutationSettling(switchingRequestId, null)
+                            timedDeleteStage("delete-transaction", messageId) {
+                                check(conversations.removeContextCompact(messageId))
+                            }
+                            val (remainingChatMessages, selections) =
+                                timedDeleteStage("topology-reload", messageId) {
+                                    val messages = conversations
+                                        .getMessageTopologySnapshot(conversationId)
+                                        .map { message -> message.toUiChatMessageStub() }
+                                    messages to conversations.restoreBranchSelections(conversationId)
+                                }
+                            origin.settleTreeMutation(switchingRequestId, null)
                             if (isConversationOpen(conversationId)) {
-                                projectGraph(remainingChatMessages, selections)
+                                projectGraph(conversationId, remainingChatMessages, selections)
                             }
                             committed = true
                             return@lock
                         }
 
                         val runs = conversations.getRunsForConversationSnapshot(conversationId)
-                        val allMessages =
-                            conversations.getMessagesForConversationSnapshot(conversationId)
-                        val allChatMessages = allMessages.map(toUiMessage)
+                        val topology = timedDeleteStage("topology-reload", messageId) {
+                            conversations.getMessageTopologySnapshot(conversationId)
+                        }
+                        val allChatMessages = topology.map { message ->
+                            message.toUiChatMessageStub()
+                        }
                         val previousSelected =
                             conversations.restoreBranchSelections(conversationId)
                         val previousRunSelections =
                             conversations.restoreRunBranchSelections(conversationId)
-                        val plan = BranchDeletionPlanner.plan(
+                        val plan = BranchDeletionPlanner.planTopology(
                             rootMessageId = messageId,
-                            messages = allMessages,
+                            messages = topology,
                             runs = runs,
                             messageSelections = previousSelected,
                             runSelections = previousRunSelections,
                         )
-                        val staleList = allMessages.filter { it.id in plan.deletedMessageIds }
-                        val remainingMessages =
-                            allMessages.filter { it.id !in plan.deletedMessageIds }
-                        check(
-                            conversations.deleteMessageSubtree(
-                                conversationId = conversationId,
-                                rootMessageId = messageId,
-                                staleMessageIds = plan.deletedMessageIds.toList(),
-                                rootRunIdsToDelete = plan.rootRunIdsToDelete.toList(),
-                                messageSelections = plan.messageSelections,
-                                runSelections = plan.runSelections,
-                            )
-                        ) { "Message $messageId disappeared during delete" }
+                        val remainingMessages = topology
+                            .filter { it.id !in plan.deletedMessageIds }
+                            .map { message -> message.toUiChatMessageStub() }
+                        timedDeleteStage("delete-transaction", messageId) {
+                            check(
+                                conversations.deleteMessageSubtree(
+                                    conversationId = conversationId,
+                                    rootMessageId = messageId,
+                                    staleMessageIds = plan.deletedMessageIds.toList(),
+                                    rootRunIdsToDelete = plan.rootRunIdsToDelete.toList(),
+                                    messageSelections = plan.messageSelections,
+                                    runSelections = plan.runSelections,
+                                )
+                            ) { "Message $messageId disappeared during delete" }
+                        }
 
-                        // Files are external to Room, so remove them only after graph commit.
-                        conversations.deleteMessageFiles(staleList)
-                        val remainingChatMessages = remainingMessages.map(toUiMessage)
                         val remainingPath = ConversationUiState.resolvePath(
-                            allMessages = remainingChatMessages,
+                            allMessages = remainingMessages,
                             streamingMsg = null,
                             selectedChildren = plan.messageSelections,
                         )
@@ -105,21 +130,42 @@ internal class ConversationBranchMutationService(
                             deletedRootMessageId = messageId,
                             remainingPath = remainingPath,
                         )
-                        onMutationSettling(switchingRequestId, targetAfterDelete)
+                        origin.settleTreeMutation(switchingRequestId, targetAfterDelete)
                         if (isConversationOpen(conversationId)) {
-                            projectGraph(remainingChatMessages, plan.messageSelections)
+                            projectGraph(conversationId, remainingMessages, plan.messageSelections)
                         }
                         committed = true
                     }
+                } finally {
+                    state.queueMutationMutex.unlock()
                 }
+            } catch (error: CancellationException) {
+                throw error
             } catch (error: Exception) {
                 DebugLog.e("AgoraVM", "Failed to delete message branch $messageId", error)
             } finally {
-                if (!committed) onMutationFailed(switchingRequestId)
+                timedDeleteStage("main-callback", messageId) {
+                    withContext(NonCancellable + resultDispatcher) {
+                        if (!committed) origin.failTreeMutation(switchingRequestId)
+                        onResult?.invoke(committed)
+                    }
+                }
             }
         }
 
         return previewIds.size
+    }
+
+    private inline fun <T> timedDeleteStage(stage: String, messageId: String, block: () -> T): T {
+        val startedAt = System.nanoTime()
+        try {
+            return block()
+        } finally {
+            val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L
+            runCatching {
+                DebugLog.d("AgoraVM", "delete stage=$stage message=$messageId elapsedMs=$elapsedMs")
+            }
+        }
     }
 
     private fun structuralDescendantIds(

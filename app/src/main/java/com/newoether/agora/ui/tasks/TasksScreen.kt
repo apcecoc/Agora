@@ -1,6 +1,8 @@
 package com.newoether.agora.ui.tasks
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -26,8 +28,6 @@ import androidx.compose.material.icons.filled.Repeat
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ButtonDefaults
 import com.newoether.agora.ui.motion.MotionAwareCircularProgressIndicator as CircularProgressIndicator
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -57,9 +57,18 @@ import com.newoether.agora.ui.settings.GuardedAnimatedContent
 import com.newoether.agora.ui.settings.SettingsGroup
 import com.newoether.agora.ui.settings.SettingsItem
 import com.newoether.agora.viewmodel.ChatViewModel
+import com.newoether.agora.viewmodel.deleteTask
+import com.newoether.agora.viewmodel.executionSummariesForTask
+import com.newoether.agora.viewmodel.getTask
+import com.newoether.agora.viewmodel.runTaskNow
+import com.newoether.agora.viewmodel.runningTaskIds
+import com.newoether.agora.viewmodel.saveTask
+import com.newoether.agora.viewmodel.tasks
 import kotlinx.coroutines.delay
 import java.util.Locale
 import java.util.UUID
+import com.newoether.agora.ui.components.AgoraDropdownMenu
+import com.newoether.agora.ui.components.AgoraDropdownMenuItem
 
 /**
  * Tasks feature root: a saved prompt + model you can run on demand or on a schedule.
@@ -69,45 +78,62 @@ import java.util.UUID
  * The open task is tracked by ID (not entity) so live Room updates — countdown, run status — flow
  * into the detail page without restarting the transition.
  */
+internal fun shouldApplyInitialTaskResolution(
+    resolvingTaskId: String,
+    openTaskId: String?,
+): Boolean = openTaskId == resolvingTaskId
+
+internal fun shouldClearMissingTaskDestination(
+    renderedTaskId: String,
+    activeTaskId: String?,
+    resolvingInitialTaskId: String?,
+): Boolean = renderedTaskId == activeTaskId && renderedTaskId != resolvingInitialTaskId
+
 @Composable
-fun TasksScreen(
+internal fun TasksScreen(
     viewModel: ChatViewModel,
+    editorSession: TaskEditorSessionViewModel,
     taskListState: LazyListState,
+    backHandlingEnabled: Boolean,
     initialTaskId: String? = null,
     onInitialTaskHandled: () -> Unit = {},
     onBack: () -> Unit,
-    onOpenConversation: (taskId: String, conversationId: String) -> Unit,
+    onOpenConversation: (conversationId: String) -> Unit,
 ) {
     val tasks by viewModel.tasks.collectAsState()
-    // Seed the navigation target synchronously. In particular, returning from a history
-    // conversation must compose the detail page on the overlay's first visible frame instead of
-    // briefly composing the list and then animating list -> detail from a LaunchedEffect.
-    var openTaskId by remember { mutableStateOf(initialTaskId) }
-    var resolvingInitialTaskId by remember { mutableStateOf(initialTaskId) }
-    var initialTaskSnapshot by remember { mutableStateOf<TaskEntity?>(null) }
-    // A brand-new task only reaches Room once it has a name + prompt, so backing out of an
-    // untouched draft leaves nothing behind. Until then it lives here.
-    var draft by remember { mutableStateOf<TaskEntity?>(null) }
+    // An Activity recreation has no new navigation event, so the in-memory session is the only
+    // source that may reopen an editor. A new process has an empty ViewModel and opens the list.
+    var openTaskId by remember { mutableStateOf(initialTaskId ?: editorSession.activeTaskId) }
+    var resolvingInitialTaskId by remember {
+        mutableStateOf(initialTaskId?.takeUnless { it == editorSession.activeTaskId })
+    }
+    var observedPersistedTaskId by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(initialTaskId) {
         val id = initialTaskId ?: return@LaunchedEffect
+        if (editorSession.activeTaskId == id) {
+            resolvingInitialTaskId = null
+            onInitialTaskHandled()
+            return@LaunchedEffect
+        }
         resolvingInitialTaskId = id
         val initialTask = viewModel.getTask(id)
-        initialTaskSnapshot = initialTask
-        if (initialTask != null) {
-            draft = null
-            openTaskId = initialTask.id
-        } else if (openTaskId == id) {
-            openTaskId = null
+        if (shouldApplyInitialTaskResolution(id, openTaskId)) {
+            if (initialTask != null) {
+                editorSession.open(initialTask, isNew = false)
+            } else {
+                editorSession.clear()
+                openTaskId = null
+            }
         }
         resolvingInitialTaskId = null
         onInitialTaskHandled()
     }
 
-    LaunchedEffect(tasks, initialTaskSnapshot?.id) {
-        val snapshotId = initialTaskSnapshot?.id ?: return@LaunchedEffect
-        if (tasks.any { it.id == snapshotId }) {
-            initialTaskSnapshot = null
+    LaunchedEffect(tasks, openTaskId) {
+        val taskId = openTaskId ?: return@LaunchedEffect
+        if (tasks.any { it.id == taskId }) {
+            observedPersistedTaskId = taskId
         }
     }
 
@@ -120,37 +146,71 @@ fun TasksScreen(
                 viewModel = viewModel,
                 tasks = tasks,
                 listState = taskListState,
+                backHandlingEnabled = backHandlingEnabled,
                 onBack = onBack,
                 onNewTask = {
                     val newTask = TaskEntity(
                         id = UUID.randomUUID().toString(),
                         name = "", prompt = "", cronExpr = "", nextRunAt = 0L
                     )
-                    draft = newTask
+                    editorSession.open(newTask, isNew = true)
+                    observedPersistedTaskId = null
                     openTaskId = newTask.id
                 },
-                onOpenTask = { draft = null; openTaskId = it.id },
+                onOpenTask = { task ->
+                    editorSession.open(task, isNew = false)
+                    observedPersistedTaskId = task.id
+                    openTaskId = task.id
+                },
             )
         } else {
             val task = tasks.firstOrNull { it.id == taskId }
-                ?: initialTaskSnapshot?.takeIf { it.id == taskId }
-                ?: draft?.takeIf { it.id == taskId }
-            if (task == null) {
-                if (resolvingInitialTaskId == taskId) {
-                    // Hold the overlay background until the initial task is resolved. Rendering
-                    // the list here would expose both navigation destinations during return.
-                    Box(modifier = Modifier.fillMaxSize())
-                } else {
-                    // Deleted (or never persisted) while open — fall back to the list instead of
-                    // rendering an empty editor.
-                    LaunchedEffect(taskId) { openTaskId = null }
+                ?: editorSession.activeTaskSnapshot?.takeIf { snapshot ->
+                    snapshot.id == taskId &&
+                        (editorSession.isNew || observedPersistedTaskId != taskId)
                 }
+            if (task == null) {
+                when {
+                    resolvingInitialTaskId == taskId && openTaskId == taskId -> {
+                        // Hold the overlay background until the active initial task is resolved.
+                        // Rendering the list here would expose both destinations during return.
+                        Box(modifier = Modifier.fillMaxSize())
+                    }
+
+                    shouldClearMissingTaskDestination(
+                        renderedTaskId = taskId,
+                        activeTaskId = openTaskId,
+                        resolvingInitialTaskId = resolvingInitialTaskId,
+                    ) -> {
+                        // GuardedAnimatedContent keeps outgoing destinations composed. Recheck
+                        // ownership before changing navigation so a stale slot cannot cancel a
+                        // newer target.
+                        LaunchedEffect(taskId) {
+                            if (
+                                shouldClearMissingTaskDestination(
+                                    renderedTaskId = taskId,
+                                    activeTaskId = openTaskId,
+                                    resolvingInitialTaskId = resolvingInitialTaskId,
+                                )
+                            ) {
+                                editorSession.clear()
+                                openTaskId = null
+                            }
+                        }
+                    }
+                }
+            } else if (taskId == openTaskId && editorSession.activeTaskId != taskId) {
+                Box(modifier = Modifier.fillMaxSize())
             } else {
                 TaskDetailPage(
                     viewModel = viewModel,
                     task = task,
-                    isNew = draft?.id == taskId,
-                    onBack = { openTaskId = null },
+                    editorSession = editorSession,
+                    backHandlingEnabled = backHandlingEnabled,
+                    onBack = {
+                        openTaskId = null
+                        editorSession.clear()
+                    },
                     onOpenConversation = onOpenConversation,
                 )
             }
@@ -165,6 +225,7 @@ private fun TasksListPage(
     viewModel: ChatViewModel,
     tasks: List<TaskEntity>,
     listState: LazyListState,
+    backHandlingEnabled: Boolean,
     onBack: () -> Unit,
     onNewTask: () -> Unit,
     onOpenTask: (TaskEntity) -> Unit,
@@ -172,7 +233,7 @@ private fun TasksListPage(
     val running by viewModel.runningTaskIds.collectAsState()
     var pendingDelete by remember { mutableStateOf<TaskEntity?>(null) }
 
-    BackHandler { onBack() }
+    BackHandler(enabled = backHandlingEnabled) { onBack() }
 
     CollapsingSettingsLazyScaffold(
         title = stringResource(R.string.tasks),
@@ -215,12 +276,15 @@ private fun TasksListPage(
             }
         } else {
             itemsIndexed(tasks, key = { _, task -> task.id }) { index, task ->
-                val executions by viewModel.executionSummariesForTask(task.id)
-                    .collectAsState(initial = emptyList())
+                val executionHistoryFlow = remember(task.id, viewModel) {
+                    viewModel.executionSummariesForTask(task.id)
+                }
+                val executions by executionHistoryFlow.collectAsState(initial = null)
                 TaskCard(
                     task = task,
                     isRunning = task.id in running,
-                    lastRunAt = executions.firstOrNull()?.timestamp?.takeIf { it > 0L },
+                    executionsLoaded = executions != null,
+                    lastRunAt = executions?.firstOrNull()?.timestamp?.takeIf { it > 0L },
                     shape = stackedShape(index, totalRows),
                     onClick = { onOpenTask(task) },
                     onRun = { viewModel.runTaskNow(task) },
@@ -266,6 +330,7 @@ private fun TasksListPage(
 private fun TaskCard(
     task: TaskEntity,
     isRunning: Boolean,
+    executionsLoaded: Boolean,
     lastRunAt: Long?,
     shape: RoundedCornerShape,
     onClick: () -> Unit,
@@ -297,6 +362,13 @@ private fun TaskCard(
             modifier = Modifier.fillMaxWidth().padding(start = 18.dp, end = 6.dp, top = 14.dp, bottom = 14.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            Icon(
+                imageVector = Icons.Default.Repeat,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(24.dp),
+            )
+            Spacer(Modifier.width(16.dp))
             Column(modifier = Modifier.weight(1f)) {
                 Text(
                     text = task.name.ifBlank { stringResource(R.string.task_name_hint) },
@@ -338,18 +410,26 @@ private fun TaskCard(
                     overflow = TextOverflow.Ellipsis,
                 )
                 Spacer(Modifier.height(3.dp))
-                Text(
-                    text = when {
-                        isRunning -> stringResource(R.string.task_running)
-                        lastRunAt != null -> stringResource(R.string.task_last_run_at, formatDateTime(lastRunAt))
-                        else -> stringResource(R.string.task_never_run)
-                    },
-                    style = MaterialTheme.typography.labelMedium,
-                    color = if (isRunning) MaterialTheme.colorScheme.primary
-                    else MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
+                val lastRunText = when {
+                    isRunning -> stringResource(R.string.task_running)
+                    !executionsLoaded -> stringResource(R.string.loading_label)
+                    lastRunAt != null -> stringResource(R.string.task_last_run_at, formatDateTime(lastRunAt))
+                    else -> stringResource(R.string.task_never_run)
+                }
+                Crossfade(
+                    targetState = lastRunText to isRunning,
+                    animationSpec = tween(200),
+                    label = "taskLastRun",
+                ) { (text, running) ->
+                    Text(
+                        text = text,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = if (running) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
             }
             Spacer(Modifier.width(8.dp))
             if (isRunning) {
@@ -368,18 +448,17 @@ private fun TaskCard(
                     IconButton(onClick = { menuOpen = true }) {
                         Icon(Icons.Default.MoreVert, contentDescription = null)
                     }
-                    DropdownMenu(
+                    AgoraDropdownMenu(
                         expanded = menuOpen,
                         onDismissRequest = { menuOpen = false },
                         containerColor = MaterialTheme.colorScheme.surfaceContainer,
-                        shape = RoundedCornerShape(12.dp),
                     ) {
-                        DropdownMenuItem(
+                        AgoraDropdownMenuItem(
                             text = { Text(stringResource(R.string.task_run_now)) },
                             leadingIcon = { Icon(Icons.Default.PlayArrow, contentDescription = null) },
                             onClick = { menuOpen = false; onRun() },
                         )
-                        DropdownMenuItem(
+                        AgoraDropdownMenuItem(
                             text = { Text(stringResource(R.string.task_delete), color = MaterialTheme.colorScheme.error) },
                             leadingIcon = { Icon(Icons.Default.Delete, contentDescription = null, tint = MaterialTheme.colorScheme.error) },
                             onClick = { menuOpen = false; onDelete() },

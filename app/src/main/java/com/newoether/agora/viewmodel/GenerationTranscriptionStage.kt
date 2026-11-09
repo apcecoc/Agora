@@ -6,6 +6,8 @@ import kotlinx.coroutines.Job
 
 internal data class GenerationTranscriptionStageRequest(
     val conversationId: String,
+    val runId: String,
+    val pass: Int,
     val parentId: String?,
     val context: GenerationContext,
     val generationJob: Job?,
@@ -38,7 +40,7 @@ internal class GenerationTranscriptionStage(
             onSnapshot: suspend (snapshot: ChatMessage, forceCheckpoint: Boolean) -> Unit,
         ): GenerationTranscriptionStageOutcome {
             val context = request.context
-            if (!context.imageTranscriptionEnabled || context.transcriptionModelId.isEmpty()) {
+            if (!context.imageTranscriptionEnabled) {
                 return GenerationTranscriptionStageOutcome(performed = false)
             }
             val targets = manager.collectTargets(
@@ -46,10 +48,16 @@ internal class GenerationTranscriptionStage(
                 request.parentId,
             )
             if (targets.isEmpty()) return GenerationTranscriptionStageOutcome(performed = false)
+            if (context.transcriptionModelId.isBlank()) return GenerationTranscriptionStageOutcome(
+                performed = false,
+                error = "Image transcription is enabled but no transcription model is configured.",
+            )
 
             val (segments, error) = manager.transcribe(
                 targets,
                 request.conversationId,
+                request.runId,
+                request.pass,
                 context.transcriptionProviderName,
                 context.transcriptionModelId,
                 context.transcriptionApiKey,
@@ -58,6 +66,8 @@ internal class GenerationTranscriptionStage(
                 request.generationJob,
                 request.modelMessageId,
                 request.startTime,
+                context.transcriptionAnthropicCacheEnabled,
+                context.transcriptionAnthropicCacheTtl,
             ) { snapshot ->
                 latestSnapshot = snapshot
                 onSnapshot(snapshot, false)

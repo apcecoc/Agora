@@ -1,10 +1,13 @@
 package com.newoether.agora.data
 
+import androidx.datastore.core.DataMigration
+import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.core.stringSetPreferencesKey
+import com.newoether.agora.model.ToolCallDisplayModes
 
 internal val SELECTED_MODEL = stringPreferencesKey("selected_model")
 internal val AVAILABLE_MODELS_JSON = stringPreferencesKey("available_models_json")
@@ -17,6 +20,7 @@ internal val ACTIVE_API_KEY_IDS_JSON = stringPreferencesKey("active_api_key_ids_
 internal val SYSTEM_PROMPTS_JSON = stringPreferencesKey("system_prompts_json")
 internal val ACTIVE_SYSTEM_PROMPT_ID = stringPreferencesKey("active_system_prompt_id")
 internal val MODEL_ALIASES_JSON = stringPreferencesKey("model_aliases_json")
+internal val MODEL_PROVIDER_NAMES_JSON = stringPreferencesKey("model_provider_names_json")
 internal val CONTEXT_TOKEN_BUDGET = stringPreferencesKey("context_token_budget")
 /** Legacy logical-message window, retained only as a migration source. */
 internal val MAX_CONTEXT_WINDOW = stringPreferencesKey("max_context_window")
@@ -25,16 +29,21 @@ internal val CONTEXT_COMPACT_ENABLED = booleanPreferencesKey("context_compact_en
 internal val CONTEXT_COMPACT_MODEL = stringPreferencesKey("context_compact_model")
 internal val CONTEXT_COMPACT_PROMPT = stringPreferencesKey("context_compact_prompt")
 internal val CONTEXT_COMPACT_RETAIN_COUNT = intPreferencesKey("context_compact_retain_count")
+internal val CONTEXT_COMPACT_PRESERVE_SYSTEM_PROMPT =
+    booleanPreferencesKey("context_compact_preserve_system_prompt")
 internal val CONTEXT_COMPACT_THRESHOLD_PERCENT = intPreferencesKey("context_compact_threshold_percent")
 internal val CODE_EXECUTION_ENABLED = booleanPreferencesKey("code_execution_enabled")
 internal val GOOGLE_SEARCH_ENABLED = booleanPreferencesKey("google_search_enabled")
 internal val THINKING_ENABLED = booleanPreferencesKey("thinking_enabled")
 internal val THINKING_LEVEL = stringPreferencesKey("thinking_level")
 internal val THINKING_BUDGET_ENABLED = booleanPreferencesKey("thinking_budget_enabled")
+
 internal val THINKING_BUDGET_TOKENS = intPreferencesKey("thinking_budget_tokens")
 internal val OPENAI_SERVICE_TIER_ENABLED = booleanPreferencesKey("openai_service_tier_enabled")
 internal val OPENAI_SERVICE_TIER = stringPreferencesKey("openai_service_tier")
 internal val OPENAI_RESPONSES_API_ENABLED = booleanPreferencesKey("openai_responses_api_enabled")
+internal val ANTHROPIC_CACHE_ENABLED = booleanPreferencesKey("anthropic_cache_enabled")
+internal val ANTHROPIC_CACHE_TTL = stringPreferencesKey("anthropic_cache_ttl")
 internal val PROVIDER_BASE_URLS = stringPreferencesKey("provider_base_urls")
 internal val CUSTOM_ENDPOINT_RESOLUTIONS_JSON = stringPreferencesKey("custom_endpoint_resolutions_json")
 internal val TITLE_GENERATION_ENABLED = booleanPreferencesKey("title_generation_enabled")
@@ -72,13 +81,19 @@ internal val SEARCH_CONTEXT_WINDOW = intPreferencesKey("search_context_window")
 internal val SEARCH_MATCH_LIMIT = intPreferencesKey("search_match_limit")
 internal val RAG_THRESHOLD = stringPreferencesKey("rag_threshold")
 internal val AUTO_CACHE_ENABLED = booleanPreferencesKey("auto_cache_enabled")
+internal val SHOW_UNCACHED_NOTIFICATION = booleanPreferencesKey("show_uncached_notification")
 internal val AUTO_UPDATE_CHECK = booleanPreferencesKey("auto_update_check")
 internal val LAST_UPDATE_CHECK_TIME = longPreferencesKey("last_update_check_time")
 internal val LOCAL_CHAT_MODELS_JSON = stringPreferencesKey("local_chat_models_json")
+internal val LOCAL_MODEL_IDLE_RETENTION_MINUTES =
+    intPreferencesKey("local_model_idle_retention_minutes")
+internal val LOCAL_LOW_CONTEXT_MODE_ENABLED =
+    booleanPreferencesKey("local_low_context_mode_enabled")
 internal val CUSTOM_PROVIDERS_JSON = stringPreferencesKey("custom_providers_json")
 internal val SHELL_ENABLED = booleanPreferencesKey("shell_enabled")
 internal val AUTOMATION_TOOLS_ENABLED = booleanPreferencesKey("automation_tools_enabled")
 internal val EXACT_EXECUTION_ENABLED = booleanPreferencesKey("exact_execution_enabled")
+internal val AUTOMATION_WAKE_LOCK_ENABLED = booleanPreferencesKey("automation_wake_lock_enabled")
 internal val PROXY_ENABLED = booleanPreferencesKey("proxy_enabled")
 internal val PROXY_TYPE = stringPreferencesKey("proxy_type")
 internal val PROXY_HOST = stringPreferencesKey("proxy_host")
@@ -87,18 +102,34 @@ internal val PROXY_USERNAME = stringPreferencesKey("proxy_username")
 internal val PROXY_PASSWORD = stringPreferencesKey("proxy_password")
 internal val PROXY_BYPASS = stringPreferencesKey("proxy_bypass")
 internal val SHELL_CONFIRM_ENABLED = booleanPreferencesKey("shell_confirm_enabled")
+internal val ASK_USER_ENABLED = booleanPreferencesKey("ask_user_enabled")
+internal val ASK_USER_TIMEOUT_MINUTES = intPreferencesKey("ask_user_timeout_minutes")
+internal val TODO_ENABLED = booleanPreferencesKey("todo_enabled")
+internal val SUBAGENT_TOOLS_ENABLED = booleanPreferencesKey("subagent_tools_enabled")
+internal val SUBAGENT_DELETE_ENABLED = booleanPreferencesKey("subagent_delete_enabled")
+internal val SUBAGENT_MAX_TOTAL = intPreferencesKey("subagent_max_total")
+internal val SUBAGENT_MAX_CONCURRENT = intPreferencesKey("subagent_max_concurrent")
+internal val SUBAGENT_CAPSULE_DISPLAY_MODE = stringPreferencesKey("subagent_capsule_display_mode")
+internal val SUBAGENT_ENABLED_MODELS = stringSetPreferencesKey("subagent_enabled_models")
+internal val SUBAGENT_RECOMMENDED_MODEL = stringPreferencesKey("subagent_recommended_model")
 internal val SHELL_DEVICES_JSON = stringPreferencesKey("shell_devices_json")
 internal val MCP_SERVERS_JSON = stringPreferencesKey("mcp_servers_json")
 internal val SANDBOX_ENABLED = booleanPreferencesKey("sandbox_enabled")
 internal val SANDBOX_SHARED_STORAGE_ENABLED =
     booleanPreferencesKey("sandbox_shared_storage_enabled")
+internal const val DEFAULT_COLOR_SCHEME = "FOREST"
+internal const val DEFAULT_SCHEME_STYLE = "TONAL_SPOT"
+internal const val DEFAULT_DYNAMIC_COLOR = false
+
 internal val THEME_MODE = stringPreferencesKey("theme_mode")
+internal val AMOLED_ENABLED = booleanPreferencesKey("amoled_enabled")
 internal val COLOR_SCHEME = stringPreferencesKey("color_scheme")
 internal val DYNAMIC_COLOR = booleanPreferencesKey("dynamic_color")
 internal val BLUR_EFFECTS_ENABLED = booleanPreferencesKey("blur_effects_enabled")
 internal val REDUCE_MOTION = booleanPreferencesKey("reduce_motion")
 internal val STICK_TO_BOTTOM = booleanPreferencesKey("stick_to_bottom")
 internal val PARSE_INLINE_DOLLAR_MATH = booleanPreferencesKey("parse_inline_dollar_math")
+internal val AUTO_WRAP_CODE_BLOCKS = booleanPreferencesKey("auto_wrap_code_blocks")
 internal val HAPTICS_ENABLED = booleanPreferencesKey("haptics_enabled")
 internal val DETAILED_TOKEN_USAGE = booleanPreferencesKey("detailed_token_usage")
 internal val TOOL_CALL_DISPLAY_MODE = stringPreferencesKey("tool_call_display_mode")
@@ -110,11 +141,13 @@ internal val CUSTOM_FONT_PATH = stringPreferencesKey("custom_font_path")
 internal val CUSTOM_FONT_NAME = stringPreferencesKey("custom_font_name")
 internal val FIRST_LAUNCH_TIME = longPreferencesKey("first_launch_time")
 internal val ONBOARDING_COMPLETED = booleanPreferencesKey("onboarding_completed")
+internal val DISPLAYED_SUBMISSION_MESSAGES = stringSetPreferencesKey("displayed_submission_messages")
 internal val RATING_PROMPT_SUBMITTED = booleanPreferencesKey("rating_prompt_submitted")
 internal val RATING_PROMPT_DISMISSED = booleanPreferencesKey("rating_prompt_dismissed")
 internal val SHOW_DOCUMENTATION_FAB = booleanPreferencesKey("show_documentation_fab")
-/** Device-local release feature gate. Intentionally excluded from portable settings archives. */
+/** Device-local Developer feature gates. Intentionally excluded from portable settings archives. */
 internal val DEVELOPER_OPTIONS_ENABLED = booleanPreferencesKey("developer_options_enabled")
+internal val DEBUG_MODEL_ENABLED = booleanPreferencesKey("debug_model_enabled")
 internal val TOTAL_MESSAGES_SENT = intPreferencesKey("total_messages_sent")
 internal val DEFAULT_TEMPERATURE = stringPreferencesKey("default_temperature")
 internal val DEFAULT_MAX_TOKENS = intPreferencesKey("default_max_tokens")
@@ -131,3 +164,20 @@ internal val AUTO_DELETE_ENABLED = booleanPreferencesKey("auto_delete_enabled")
 internal val AUTO_DELETE_PERIOD_HOURS = intPreferencesKey("auto_delete_period_hours")
 internal val LAST_BACKUP_TIMESTAMP = longPreferencesKey("last_backup_timestamp")
 internal val LAST_MODELS_FETCH_FINGERPRINT = stringPreferencesKey("last_models_fetch_fingerprint")
+
+/** Persist the retired display value before any Settings flow is published. */
+internal val toolCallDisplayModeMigration = object : DataMigration<Preferences> {
+    override suspend fun shouldMigrate(currentData: Preferences): Boolean =
+        currentData[TOOL_CALL_DISPLAY_MODE] == "compact"
+
+    override suspend fun migrate(currentData: Preferences): Preferences =
+        if (shouldMigrate(currentData)) {
+            currentData.toMutablePreferences().apply {
+                this[TOOL_CALL_DISPLAY_MODE] = ToolCallDisplayModes.GROUPED_TIMELINE
+            }
+        } else {
+            currentData
+        }
+
+    override suspend fun cleanUp() = Unit
+}

@@ -1,6 +1,8 @@
 package com.newoether.agora.viewmodel
 
+import com.newoether.agora.api.util.tokens.FixedContextComposition
 import com.newoether.agora.data.local.MessageEntity
+import com.newoether.agora.data.ConversationSettings
 import com.newoether.agora.data.repository.ConversationRepository
 import com.newoether.agora.model.MessageSegment
 import com.newoether.agora.model.MessageStatus
@@ -10,8 +12,14 @@ import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.encodeToString
@@ -38,14 +46,19 @@ class ConversationContextProjectorTest {
                 "context-preview-conversation",
                 "provider:model",
                 "prompt-selected-for-new-chat",
+                NEW_CHAT_SETTINGS,
             )
         } returns snapshot
         every { generationManager.fixedContextTokenCost(snapshot.config, snapshot.context) } returns 221
+        every { generationManager.includesAssistantReasoning(any(), any()) } returns false
+        stubFixedComposition(generationManager)
         val projector = ConversationContextProjector(
             conversations = conversations,
             requestBuilder = requestBuilder,
             generationManager = { generationManager },
+            generationErrorFormatter = { it },
             newChatSystemPromptId = { "prompt-selected-for-new-chat" },
+            newChatConversationSettings = { NEW_CHAT_SETTINGS },
         )
 
         val projection = projector.project(null, null, "provider:model", 4_096)
@@ -57,9 +70,9 @@ class ConversationContextProjectorTest {
                 "context-preview-conversation",
                 "provider:model",
                 "prompt-selected-for-new-chat",
+                NEW_CHAT_SETTINGS,
             )
         }
-        coVerify(exactly = 0) { conversations.getMessagesForConversationSnapshot(any()) }
         coVerify(exactly = 0) { conversations.restoreBranchSelections(any()) }
     }
 
@@ -119,10 +132,13 @@ class ConversationContextProjectorTest {
             requestBuilder.captureContextProjectionSnapshot("conversation", "provider:model", null)
         } returns snapshot
         every { generationManager.fixedContextTokenCost(snapshot.config, snapshot.context) } returns 137
+        every { generationManager.includesAssistantReasoning(any(), any()) } returns false
+        stubFixedComposition(generationManager)
         val projector = ConversationContextProjector(
             conversations = conversations,
             requestBuilder = requestBuilder,
             generationManager = { generationManager },
+            generationErrorFormatter = { it },
             contextLoader = contextLoader,
         )
 
@@ -161,10 +177,13 @@ class ConversationContextProjectorTest {
         every {
             generationManager.fixedContextTokenCost(snapshot.config, snapshot.context)
         } returns 0
+        every { generationManager.includesAssistantReasoning(any(), any()) } returns false
+        stubFixedComposition(generationManager)
         val projector = ConversationContextProjector(
             conversations = conversations,
             requestBuilder = requestBuilder,
             generationManager = { generationManager },
+            generationErrorFormatter = { it },
             contextLoader = contextLoader,
         )
 
@@ -197,10 +216,13 @@ class ConversationContextProjectorTest {
         every {
             generationManager.fixedContextTokenCost(snapshot.config, snapshot.context)
         } returns 0
+        every { generationManager.includesAssistantReasoning(any(), any()) } returns false
+        stubFixedComposition(generationManager)
         val projector = ConversationContextProjector(
             conversations = conversations,
             requestBuilder = requestBuilder,
             generationManager = { generationManager },
+            generationErrorFormatter = { it },
             contextLoader = contextLoader,
         )
 
@@ -237,10 +259,13 @@ class ConversationContextProjectorTest {
             requestBuilder.captureContextProjectionSnapshot("conversation", "provider:model", null)
         } returns snapshot
         every { generationManager.fixedContextTokenCost(snapshot.config, snapshot.context) } returns 0
+        every { generationManager.includesAssistantReasoning(any(), any()) } returns false
+        stubFixedComposition(generationManager)
         val projector = ConversationContextProjector(
             conversations = conversations,
             requestBuilder = requestBuilder,
             generationManager = { generationManager },
+            generationErrorFormatter = { it },
             contextLoader = contextLoader,
         )
         val firstSelection = """{"root":"branch-first"}"""
@@ -293,10 +318,13 @@ class ConversationContextProjectorTest {
             requestBuilder.captureContextProjectionSnapshot("conversation", "provider:model", null)
         } returns snapshot
         every { generationManager.fixedContextTokenCost(snapshot.config, snapshot.context) } returns 0
+        every { generationManager.includesAssistantReasoning(any(), any()) } returns false
+        stubFixedComposition(generationManager)
         val projector = ConversationContextProjector(
             conversations = conversations,
             requestBuilder = requestBuilder,
             generationManager = { generationManager },
+            generationErrorFormatter = { it },
             contextLoader = contextLoader,
         )
 
@@ -366,10 +394,13 @@ class ConversationContextProjectorTest {
             requestBuilder.captureContextProjectionSnapshot(any(), "provider:model", null)
         } returns snapshot
         every { generationManager.fixedContextTokenCost(snapshot.config, snapshot.context) } returns 0
+        every { generationManager.includesAssistantReasoning(any(), any()) } returns false
+        stubFixedComposition(generationManager)
         val projector = ConversationContextProjector(
             conversations = conversations,
             requestBuilder = requestBuilder,
             generationManager = { generationManager },
+            generationErrorFormatter = { it },
             contextLoader = contextLoader,
         )
 
@@ -433,9 +464,17 @@ class ConversationContextProjectorTest {
         )
         val firstLoad = CompletableDeferred<DurableSelectedContext>()
         val secondLoad = CompletableDeferred<DurableSelectedContext>()
+        val firstStarted = CompletableDeferred<Unit>()
+        val secondStarted = CompletableDeferred<Unit>()
         var loadIndex = 0
         coEvery { contextLoader.load(any()) } coAnswers {
-            if (loadIndex++ == 0) firstLoad.await() else secondLoad.await()
+            if (loadIndex++ == 0) {
+                firstStarted.complete(Unit)
+                firstLoad.await()
+            } else {
+                secondStarted.complete(Unit)
+                secondLoad.await()
+            }
         }
         val admission = testGenerationAdmissionSnapshot(conversationId = "conversation")
         val snapshot = GenerationContextProjectionSnapshot(admission.config, admission.context)
@@ -443,10 +482,13 @@ class ConversationContextProjectorTest {
             requestBuilder.captureContextProjectionSnapshot("conversation", "provider:model", null)
         } returns snapshot
         every { generationManager.fixedContextTokenCost(snapshot.config, snapshot.context) } returns 0
+        every { generationManager.includesAssistantReasoning(any(), any()) } returns false
+        stubFixedComposition(generationManager)
         val projector = ConversationContextProjector(
             conversations = conversations,
             requestBuilder = requestBuilder,
             generationManager = { generationManager },
+            generationErrorFormatter = { it },
             contextLoader = contextLoader,
         )
         val firstSelection = """{"root":"branch-first"}"""
@@ -455,11 +497,12 @@ class ConversationContextProjectorTest {
         val firstJob = launch {
             projector.project("conversation", firstSelection, "provider:model", 4_096)
         }
-        runCurrent()
+        // project switches to Dispatchers.Default, which runCurrent does not drain.
+        firstStarted.await()
         val secondJob = launch {
             projector.project("conversation", secondSelection, "provider:model", 4_096)
         }
-        runCurrent()
+        secondStarted.await()
         secondLoad.complete(secondContext)
         secondJob.join()
 
@@ -497,10 +540,13 @@ class ConversationContextProjectorTest {
             requestBuilder.captureContextProjectionSnapshot("conversation", "provider:model", null)
         } returns snapshot
         every { generationManager.fixedContextTokenCost(snapshot.config, snapshot.context) } returns 0
+        every { generationManager.includesAssistantReasoning(any(), any()) } returns false
+        stubFixedComposition(generationManager)
         val projector = ConversationContextProjector(
             conversations = conversations,
             requestBuilder = requestBuilder,
             generationManager = { generationManager },
+            generationErrorFormatter = { it },
             contextLoader = contextLoader,
         )
 
@@ -514,6 +560,129 @@ class ConversationContextProjectorTest {
         assertNull(projection.usage)
         assertNull(projection.retainedMessageIds)
         assertEquals(projection, projector.projection.value)
+    }
+
+    /**
+     * The fixed-cost breakdown only feeds the context indicator's composition bar; these tests
+     * assert totals and retained messages, so a zero split keeps them focused.
+     */
+    @Test
+    fun newerRequestCancelsTheOlderAndNeverOverlapsItsHistoryLoad() = runTest {
+        val conversations = mockk<ConversationRepository>()
+        val requestBuilder = mockk<GenerationRequestBuilder>()
+        val generationManager = mockk<GenerationManager>()
+        val contextLoader = mockk<DurableSelectedContextLoader>()
+        val first = entity("branch-first", null, Participant.USER, "first", 0)
+        val second = entity("branch-second", null, Participant.USER, "second", 1)
+        val firstStarted = CompletableDeferred<Unit>()
+        val releaseFirst = CompletableDeferred<Unit>()
+        val loads = AtomicInteger(0)
+        var firstReleasedWhenSecondStarted: Boolean? = null
+        coEvery { contextLoader.load(any()) } coAnswers {
+            if (loads.getAndIncrement() == 0) {
+                firstStarted.complete(Unit)
+                // Models history work that cancellation cannot interrupt midway.
+                withContext(NonCancellable) { releaseFirst.await() }
+                DurableSelectedContext(
+                    messages = projectProviderMessages(listOf(first), false),
+                    entities = listOf(first),
+                )
+            } else {
+                firstReleasedWhenSecondStarted = releaseFirst.isCompleted
+                DurableSelectedContext(
+                    messages = projectProviderMessages(listOf(second), false),
+                    entities = listOf(second),
+                )
+            }
+        }
+        val admission = testGenerationAdmissionSnapshot(conversationId = "conversation")
+        val snapshot = GenerationContextProjectionSnapshot(admission.config, admission.context)
+        coEvery {
+            requestBuilder.captureContextProjectionSnapshot("conversation", "provider:model", null)
+        } returns snapshot
+        every { generationManager.fixedContextTokenCost(snapshot.config, snapshot.context) } returns 0
+        every { generationManager.includesAssistantReasoning(any(), any()) } returns false
+        stubFixedComposition(generationManager)
+        val projector = ConversationContextProjector(
+            conversations = conversations,
+            requestBuilder = requestBuilder,
+            generationManager = { generationManager },
+            generationErrorFormatter = { it },
+            contextLoader = contextLoader,
+        )
+        val firstSelection = """{"root":"branch-first"}"""
+        val secondSelection = """{"root":"branch-second"}"""
+
+        projector.request(this, "conversation", firstSelection, "provider:model", 4_096)
+        firstStarted.await()
+        projector.request(this, "conversation", secondSelection, "provider:model", 4_096)
+        // Give an unserialized second request real time to reach its load; a correct
+        // implementation passes regardless of this wait.
+        runCurrent()
+        Thread.sleep(200)
+        releaseFirst.complete(Unit)
+        val settled = projector.projection.first { it.completed }
+
+        assertEquals(true, firstReleasedWhenSecondStarted)
+        assertEquals(2, loads.get())
+        assertEquals(secondSelection, settled.selectedBranchesJson)
+        assertEquals(setOf(second.id), settled.retainedMessageIds.orEmpty())
+    }
+    @Test
+    fun invalidationRequestsFreshProjectionEvenWhenTheGraphAndSelectionAreUnchanged() = runTest {
+        val contextLoader = mockk<DurableSelectedContextLoader>()
+        val row = entity("retained", null, Participant.USER, "same payload", 0)
+        val context = DurableSelectedContext(
+            messages = projectProviderMessages(listOf(row), false),
+            entities = listOf(row),
+        )
+        val started = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val loads = AtomicInteger()
+        coEvery { contextLoader.load(any()) } coAnswers {
+            if (loads.getAndIncrement() == 0) {
+                started.complete(Unit)
+                withContext(NonCancellable) { release.await() }
+            }
+            context
+        }
+        val projector = ConversationContextProjector(
+            conversations = mockk(),
+            requestBuilder = mockk(),
+            generationManager = { mockk() },
+            generationErrorFormatter = { it },
+            contextLoader = contextLoader,
+        )
+        // Matches ChatApp's revision-keyed Effect while all other request inputs stay equal.
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            projector.invalidationRevision.collect {
+                projector.request(this@runTest, "conversation", "{}", "", 4_096)
+            }
+        }
+        started.await()
+        projector.invalidate("conversation")
+        runCurrent()
+        release.complete(Unit)
+        val refreshed = projector.projection.first { it.completed && !it.loading }
+
+        assertEquals(1L, projector.invalidationRevision.value)
+        assertEquals(2, loads.get())
+        assertFalse(refreshed.failed)
+        assertEquals("{}", refreshed.selectedBranchesJson)
+        assertEquals(setOf(row.id), refreshed.retainedMessageIds)
+
+        // The same race can also invalidate a projection that Room already completed.
+        projector.invalidate("conversation")
+        runCurrent()
+        val refreshedAgain = projector.projection.first { it.completed && !it.loading }
+        assertEquals(2L, projector.invalidationRevision.value)
+        assertEquals(3, loads.get())
+        assertEquals(refreshed, refreshedAgain)
+    }
+
+    private fun stubFixedComposition(generationManager: GenerationManager) {
+        every { generationManager.fixedContextComposition(any(), any()) } returns
+            FixedContextComposition(systemPromptTokens = 0, toolTokens = 0)
     }
 
     private fun entity(
@@ -534,4 +703,8 @@ class ConversationContextProjectorTest {
         runId = "run",
         runSequence = sequence,
     )
+
+    private companion object {
+        val NEW_CHAT_SETTINGS = ConversationSettings(temperature = 0.25f)
+    }
 }

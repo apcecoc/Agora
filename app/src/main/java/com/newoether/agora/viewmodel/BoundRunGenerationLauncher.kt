@@ -1,6 +1,5 @@
 package com.newoether.agora.viewmodel
 
-import com.newoether.agora.api.HttpClient
 import com.newoether.agora.data.local.MessageEntity
 import com.newoether.agora.data.repository.ConversationRepository
 import com.newoether.agora.diagnostics.DeveloperDiagnostics
@@ -21,7 +20,8 @@ internal data class BoundRunGenerationRequest(
     val persistId: Long,
     val runId: String,
     val pass: Int,
-    val callerTag: String,
+    val requestKind: String,
+    val continuesAfterSuccess: Boolean = false,
     val transformFinalText: (String, MessageStatus) -> String = { text, _ -> text },
 ) {
     init {
@@ -52,6 +52,7 @@ internal class BoundRunGenerationLauncher(
     ) -> Boolean,
     private val terminalSettlement: GenerationTerminalSettlementController,
     private val toUiMessage: (MessageEntity) -> ChatMessage,
+    private val isConversationVisible: ((String) -> Boolean)? = null,
     private val onAutomaticCompactContinuation: (
         request: AutomaticCompactContinuationRequest,
         state: ConversationGenerationState,
@@ -62,9 +63,9 @@ internal class BoundRunGenerationLauncher(
         request: BoundRunGenerationRequest,
         state: ConversationGenerationState,
     ) {
-        val requestTrace = HttpClient.RequestTrace(
+        val requestTrace = DeveloperDiagnostics.newRequestTrace(
             requestId = request.modelMessageId,
-            origin = request.callerTag,
+            origin = request.requestKind,
             diagnosticContext = DeveloperDiagnostics.newRequestContext(
                 requestId = request.modelMessageId,
                 conversationId = request.conversationId,
@@ -72,7 +73,7 @@ internal class BoundRunGenerationLauncher(
                 pass = request.pass,
                 provider = request.snapshot.config.providerName,
                 model = request.snapshot.selectedModelId,
-                requestKind = request.callerTag,
+                requestKind = request.requestKind,
             ),
         )
         requestTrace.mark(
@@ -82,12 +83,17 @@ internal class BoundRunGenerationLauncher(
         try {
             requestTrace.mark("request_config_ready")
             val generationManager = generationManagerProvider()
-            val fixedTokenCost = generationManager.fixedContextTokenCost(
+            val fixedTokenCost = generationManager.resolvedFixedContextTokenCost(
                 request.snapshot.config,
                 request.snapshot.context,
             )
             val automaticCompactConfig = request.snapshot.automaticCompact.copy(
                 fixedTokenCost = fixedTokenCost,
+                mainModelId = request.snapshot.config.modelId,
+                includeAssistantReasoning = generationManager.includesAssistantReasoning(
+                    request.snapshot.config,
+                    request.snapshot.context,
+                ),
             )
             val result = generationManager.generate(
                 conversationId = request.conversationId,
@@ -102,7 +108,11 @@ internal class BoundRunGenerationLauncher(
                 providerInstances = request.snapshot.providerInstances,
                 generationJob = currentCoroutineContext()[Job],
                 callbacks = state.callbacksFor(request.uiToken, request.persistId).copy(
+                    isConversationVisible = isConversationVisible?.let { visible ->
+                        { visible(request.conversationId) }
+                    },
                     transformFinalText = request.transformFinalText,
+                    hasPendingContinuation = request.continuesAfterSuccess,
                     onToolRoundPersisted = {
                         if (
                             automaticCompactNeeded(
@@ -135,7 +145,7 @@ internal class BoundRunGenerationLauncher(
         } catch (e: Exception) {
             DebugLog.e(
                 "AgoraVM",
-                "Generation failed in ${request.callerTag} " +
+                "Generation failed in ${request.requestKind} " +
                     "errorType=${e.javaClass.simpleName}",
             )
             // A pre-stream failure would otherwise strand the SENDING placeholder and overlay.

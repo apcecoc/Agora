@@ -20,6 +20,7 @@ import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -34,8 +35,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.ProgressBarRangeInfo
+import androidx.compose.ui.semantics.progressBarRangeInfo
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.newoether.agora.R
@@ -59,26 +64,43 @@ fun ThinkingControlPanel(
     onBudgetTokensChange: (Int) -> Unit,
     modifier: Modifier = Modifier,
     showHeader: Boolean = true,
-    providerName: String? = null,
-    animateSections: Boolean = false
+    showEnabledToggle: Boolean = true,
+    animateSections: Boolean = false,
+    availableEfforts: List<String>? = null,
+    controlsEnabled: Boolean = true,
+    allowDisable: Boolean = true,
+    showBudgetControls: Boolean = true,
+    budgetControlsEnabled: Boolean = true,
+    settingsRevision: Long = 0,
+    knownSelection: Boolean = true,
 ) {
-    val normalizedEffort = ThinkingLevels.normalize(level)
-    val providerRange = ThinkingLevels.effortRangeForProvider(providerName)
+    val normalizedEffort = if (availableEfforts == null) ThinkingLevels.normalize(level) else level
+    // A caller that knows the selected model passes that model's accepted efforts. Without one
+    // (the global default page) every documented level is offered; no provider-name range exists.
+    val providerRange = availableEfforts?.indices?.takeUnless { it.isEmpty() }
+        ?: ThinkingLevels.effortValues.indices
     val maxIndex = providerRange.last
-    val effortGate = remember(providerRange.first, providerRange.last) {
+    fun effortAt(index: Int) = availableEfforts?.getOrNull(index) ?: if (availableEfforts == null) {
+        ThinkingLevels.effortForIndex(index)
+    } else ""
+    val effortGate = remember(providerRange.first, providerRange.last, availableEfforts, settingsRevision) {
         PersistedSliderFeedbackGate(
             initialPersisted = normalizedEffort,
             toDisplay = { persisted ->
-                ThinkingLevels.indexForEffort(persisted).coerceIn(providerRange).toFloat()
+                (availableEfforts?.indexOf(persisted) ?: ThinkingLevels.indexForEffort(persisted))
+                    .coerceIn(providerRange).toFloat()
             },
         )
     }
-    LaunchedEffect(normalizedEffort, providerRange.first, providerRange.last) {
+    LaunchedEffect(normalizedEffort, effortGate) {
         effortGate.reconcile(normalizedEffort)
     }
+    var choosingEffort by remember(knownSelection, normalizedEffort, availableEfforts, settingsRevision) { mutableStateOf(false) }
+    val showSelection = knownSelection || choosingEffort
     val sliderPosition = effortGate.displayed
     var showAdvanced by rememberSaveable { mutableStateOf(budgetEnabled) }
-    val sliderEnabled = enabled && !budgetEnabled
+    val budgetEditable = enabled && controlsEnabled && budgetControlsEnabled
+    val sliderEnabled = (enabled || !showEnabledToggle) && !budgetEnabled && controlsEnabled && availableEfforts?.isEmpty() != true
 
     LaunchedEffect(budgetEnabled) {
         if (budgetEnabled) showAdvanced = true
@@ -99,19 +121,21 @@ fun ThinkingControlPanel(
                 Spacer(modifier = Modifier.width(16.dp))
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = stringResource(R.string.gen_thinking_enabled),
+                        text = stringResource(if (showEnabledToggle) R.string.gen_thinking_enabled else R.string.thinking),
                         style = MaterialTheme.typography.bodyLarge.copy(fontWeight = FontWeight.Medium),
                         color = MaterialTheme.colorScheme.onSurface
                     )
                     Text(
-                        text = thinkingControlShortLabel(enabled, normalizedEffort, budgetEnabled, budgetTokens),
+                        text = thinkingControlShortLabel(enabled, normalizedEffort, budgetEnabled, budgetTokens, normalizeLevel = availableEfforts == null),
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(top = 2.dp)
                     )
                 }
-                Spacer(modifier = Modifier.width(16.dp))
-                Switch(checked = enabled, onCheckedChange = onEnabledChange)
+                if (showEnabledToggle) {
+                    Spacer(modifier = Modifier.width(16.dp))
+                    Switch(checked = enabled, onCheckedChange = onEnabledChange, enabled = controlsEnabled && (allowDisable || !enabled))
+                }
             }
             Spacer(modifier = Modifier.height(32.dp))
         }
@@ -136,7 +160,7 @@ fun ThinkingControlPanel(
                         modifier = Modifier.weight(1f)
                     )
                     Text(
-                        text = effortLabel(ThinkingLevels.effortForIndex(sliderPosition.roundToInt())),
+                        text = if (showSelection) effortLabel(effortAt(sliderPosition.roundToInt())) else "",
                         style = MaterialTheme.typography.labelLarge,
                         color = MaterialTheme.colorScheme.primary,
                         fontWeight = FontWeight.Bold
@@ -150,28 +174,41 @@ fun ThinkingControlPanel(
                 )
                 Slider(
                     value = sliderPosition,
-                    onValueChange = { if (sliderEnabled) effortGate.updateFromGesture(it) },
+                    onValueChange = {
+                        if (sliderEnabled) {
+                            choosingEffort = true
+                            effortGate.updateFromGesture(it.coerceIn(providerRange.first.toFloat(), maxIndex.toFloat()))
+                        }
+                    },
                     onValueChangeFinished = {
                         if (sliderEnabled) {
-                            val idx = sliderPosition.roundToInt().coerceIn(providerRange)
-                            val effort = ThinkingLevels.effortForIndex(idx)
+                            val idx = effortGate.displayed.roundToInt().coerceIn(providerRange)
+                            val effort = effortAt(idx)
                             if (effort == normalizedEffort) {
                                 effortGate.settleWithoutWrite(normalizedEffort, idx.toFloat())
                             } else {
                                 effortGate.expectPersisted(effort, idx.toFloat())
                             }
-                            onEnabledChange(true)
-                            onLevelChange(effort)
+                            if (availableEfforts == null) onEnabledChange(true)
+                            if (effort != normalizedEffort || !knownSelection) onLevelChange(effort)
                         }
                     },
-                    valueRange = 0f..maxIndex.toFloat(),
+                    valueRange = 0f..maxIndex.coerceAtLeast(1).toFloat(),
                     steps = if (maxIndex > 0) maxIndex - 1 else 0,
-                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                    enabled = sliderEnabled
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp).semantics {
+                        if (!showSelection) progressBarRangeInfo = ProgressBarRangeInfo.Indeterminate
+                    },
+                    colors = if (showSelection) SliderDefaults.colors() else SliderDefaults.colors(
+                        thumbColor = Color.Transparent, disabledThumbColor = Color.Transparent,
+                        activeTrackColor = MaterialTheme.colorScheme.secondaryContainer,
+                        activeTickColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                    ),
+                    enabled = sliderEnabled && (maxIndex > 0 || !knownSelection)
                 )
             }
         }
 
+        if (!showBudgetControls) return@Column
         Spacer(modifier = Modifier.height(8.dp))
         val chevronRotation by animateFloatAsState(
             targetValue = if (showAdvanced) 180f else 0f,
@@ -196,7 +233,7 @@ fun ThinkingControlPanel(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .alpha(if (enabled) 1f else 0.38f)
+                    .alpha(if (budgetEditable) 1f else 0.38f)
             ) {
                 Spacer(modifier = Modifier.height(8.dp))
                 Row(
@@ -226,7 +263,7 @@ fun ThinkingControlPanel(
                     Spacer(modifier = Modifier.width(16.dp))
                     Switch(
                         checked = budgetEnabled,
-                        onCheckedChange = if (enabled) { { checked ->
+                        onCheckedChange = if (budgetEditable) { { checked ->
                             if (checked) {
                                 onEnabledChange(true)
                                 if (budgetTokens < 1) {
@@ -235,7 +272,7 @@ fun ThinkingControlPanel(
                             }
                             onBudgetEnabledChange(checked)
                         } } else { { } },
-                        enabled = enabled
+                        enabled = budgetEditable
                     )
                 }
 
@@ -244,7 +281,7 @@ fun ThinkingControlPanel(
                         Spacer(modifier = Modifier.height(BudgetToggleToSliderSpacing))
                         val budgetPresets = ThinkingLevels.budgetPresets
                         val currentBudget = budgetTokens.coerceAtLeast(1)
-                        val budgetGate = remember(budgetPresets) {
+                        val budgetGate = remember(budgetPresets, settingsRevision) {
                             PersistedSliderFeedbackGate(
                                 initialPersisted = currentBudget,
                                 toDisplay = { persisted ->
@@ -286,11 +323,11 @@ fun ThinkingControlPanel(
                                 Slider(
                                     value = budgetSliderPos,
                                     onValueChange = {
-                                        if (enabled) budgetGate.updateFromGesture(it)
+                                        if (budgetEditable) budgetGate.updateFromGesture(it)
                                     },
                                     onValueChangeFinished = {
-                                        if (enabled) {
-                                            val idx = budgetSliderPos.roundToInt().coerceIn(0, budgetPresets.lastIndex)
+                                        if (budgetEditable) {
+                                            val idx = budgetGate.displayed.roundToInt().coerceIn(0, budgetPresets.lastIndex)
                                             val tokens = budgetPresets[idx]
                                             if (tokens == currentBudget) {
                                                 budgetGate.settleWithoutWrite(
@@ -300,14 +337,13 @@ fun ThinkingControlPanel(
                                             } else {
                                                 budgetGate.expectPersisted(tokens, idx.toFloat())
                                             }
-                                            onEnabledChange(true)
-                                            onBudgetTokensChange(tokens)
+                                            if (tokens != currentBudget) onBudgetTokensChange(tokens)
                                         }
                                     },
                                     valueRange = 0f..(budgetPresets.size - 1).toFloat(),
                                     steps = budgetPresets.size - 2,
                                     modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                                    enabled = enabled
+                                    enabled = budgetEditable
                                 )
                             }
                         }
@@ -360,21 +396,23 @@ fun thinkingControlShortLabel(
     enabled: Boolean,
     level: String,
     budgetEnabled: Boolean = false,
-    budgetTokens: Int = ThinkingLevels.DefaultBudgetTokens
+    budgetTokens: Int = ThinkingLevels.DefaultBudgetTokens,
+    normalizeLevel: Boolean = true,
 ): String {
     if (!enabled) return stringResource(R.string.thinking_control_off)
-    val effortText = effortLabel(ThinkingLevels.normalize(level))
+    val effortText = effortLabel(if (normalizeLevel) ThinkingLevels.normalize(level) else level)
     if (!budgetEnabled) return effortText
     return stringResource(R.string.thinking_budget_tokens, budgetTokens.coerceAtLeast(1))
 }
 
 @Composable
-private fun effortLabel(effort: String): String = when (effort) {
+internal fun effortLabel(effort: String): String = when (effort) {
     "minimal" -> stringResource(R.string.gen_thinking_level_minimal)
     "low" -> stringResource(R.string.gen_thinking_level_low)
     "medium" -> stringResource(R.string.gen_thinking_level_medium)
     "high" -> stringResource(R.string.gen_thinking_level_high)
     "xhigh" -> stringResource(R.string.gen_thinking_level_xhigh)
     "max" -> stringResource(R.string.gen_thinking_level_max)
+    "ultra" -> "Ultra"
     else -> effort
 }

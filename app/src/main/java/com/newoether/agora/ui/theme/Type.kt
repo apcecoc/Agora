@@ -1,10 +1,15 @@
 package com.newoether.agora.ui.theme
 
 import androidx.compose.material3.Typography
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.text.ExperimentalTextApi
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.font.FontVariation
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 import com.newoether.agora.R
@@ -16,12 +21,21 @@ val MonoFamily = FontFamily(
     Font(R.font.jetbrains_mono_bolditalic, FontWeight.Bold, FontStyle.Italic),
 )
 
+@OptIn(ExperimentalTextApi::class)
+private fun miOutfitFont(weight: FontWeight) = Font(
+    resId = R.font.mioutfit_variable,
+    weight = weight,
+    variationSettings = FontVariation.Settings(
+        FontVariation.weight(weight.weight),
+    ),
+)
+
 val OutfitFamily = FontFamily(
-    Font(R.font.mioutfit_extralight, FontWeight.ExtraLight),
-    Font(R.font.mioutfit_light, FontWeight.Light),
-    Font(R.font.mioutfit_regular, FontWeight.Normal),
-    Font(R.font.mioutfit_medium, FontWeight.Medium),
-    Font(R.font.mioutfit_bold, FontWeight.Bold),
+    miOutfitFont(FontWeight.ExtraLight),
+    miOutfitFont(FontWeight.Light),
+    miOutfitFont(FontWeight.Normal),
+    miOutfitFont(FontWeight.Medium),
+    miOutfitFont(FontWeight.Bold),
 )
 
 // Geometric (modular) type scale: every distinct size is a term of a geometric
@@ -157,6 +171,16 @@ val Typography = Typography(
 /** Mutable font family for ChatType styles. Set from Theme.kt when font preference changes. */
 internal var chatFontFamily: FontFamily = OutfitFamily
 
+/** Windows narrower than this (a large system display size on a typical phone) use the compact
+ *  tier: AgoraTheme scales every sp by [COMPACT_FONT_SCALE] (16 sp body -> 15 sp) and a few composer
+ *  insets tighten. Pixel-class phones at the default display size are ~411 dp and stay regular. */
+internal const val CHAT_COMPACT_WIDTH_DP = 400
+internal const val COMPACT_FONT_SCALE = 15f / 16f
+
+/** Snapshot state so readers recompose when the window width crosses the threshold. Set from
+ *  AgoraTheme before its content composes. */
+internal var chatCompactWidth by mutableStateOf(false)
+
 object ChatType {
 
     // Title tier
@@ -175,9 +199,9 @@ object ChatType {
     // Input tier
     val input get() = TextStyle(fontFamily = chatFontFamily, fontWeight = FontWeight.Normal, fontSize = 16.sp, lineHeight = 23.sp, letterSpacing = 0.5.sp)
 
-    // Body tier
-    val body get() = TextStyle(fontFamily = chatFontFamily, fontWeight = FontWeight.Normal, fontSize = 16.sp, lineHeight = 24.sp)
-    val userBody get() = TextStyle(fontFamily = chatFontFamily, fontWeight = FontWeight.Normal, fontSize = 15.sp, lineHeight = 24.2.sp)
+    // Body tier. The compact tier also tightens the line height ratio by 1 sp on top of the sp scale.
+    val body get() = TextStyle(fontFamily = chatFontFamily, fontWeight = FontWeight.Normal, fontSize = 16.sp, lineHeight = if (chatCompactWidth) 23.sp else 24.sp)
+    val userBody get() = TextStyle(fontFamily = chatFontFamily, fontWeight = FontWeight.Normal, fontSize = 15.sp, lineHeight = if (chatCompactWidth) 23.2.sp else 24.2.sp)
     val thoughtBody get() = TextStyle(fontFamily = chatFontFamily, fontWeight = FontWeight.Normal, fontSize = 13.sp, lineHeight = 19.sp)
     val thoughtTitle get() = TextStyle(fontFamily = chatFontFamily, fontWeight = FontWeight.Medium, fontSize = 13.sp, lineHeight = 19.sp)
     val errorBody get() = TextStyle(fontFamily = chatFontFamily, fontWeight = FontWeight.Medium, fontSize = 13.sp, lineHeight = 18.sp)

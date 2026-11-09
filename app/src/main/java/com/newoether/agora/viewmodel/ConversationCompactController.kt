@@ -15,6 +15,7 @@ import java.util.UUID
 internal data class StandardCompactLaunch(
     val messageId: String,
     val job: Job,
+    val uiToken: Long,
 )
 
 /**
@@ -51,14 +52,22 @@ internal class ConversationCompactController(
             snapshot = snapshot,
             state = state,
             awaitCompletion = false,
+            touchConversationOnAdmission = false,
         ).second
     }
 
+    /**
+     * [alreadyHoldsConversationLock] must be true when the caller already owns this conversation's
+     * execution lease (headless Task/Loop runs). The coordinator is non-reentrant, so acquiring it
+     * again would suspend the Compact launch forever after it has claimed the generation slot.
+     */
     suspend fun startAutomaticStandard(
         conversationId: String,
         contextLimit: Int,
         config: AutomaticCompactConfig,
         state: ConversationGenerationState,
+        alreadyHoldsConversationLock: Boolean = false,
+        continuesAfterSuccess: Boolean = false,
     ): StandardCompactLaunch? {
         if (!operation.automaticNeeded(conversationId, contextLimit, config)) return null
         val snapshot = automaticSnapshot(conversationId, config)
@@ -68,6 +77,9 @@ internal class ConversationCompactController(
             snapshot = snapshot,
             state = state,
             awaitCompletion = false,
+            touchConversationOnAdmission = false,
+            alreadyHoldsConversationLock = alreadyHoldsConversationLock,
+            continuesAfterSuccess = continuesAfterSuccess,
         ).first
     }
 
@@ -101,6 +113,7 @@ internal class ConversationCompactController(
             snapshot = snapshot,
             state = state,
             awaitCompletion = true,
+            touchConversationOnAdmission = true,
         ).second
     }
 
@@ -110,6 +123,9 @@ internal class ConversationCompactController(
         snapshot: GenerationAdmissionSnapshot,
         state: ConversationGenerationState,
         awaitCompletion: Boolean,
+        touchConversationOnAdmission: Boolean,
+        alreadyHoldsConversationLock: Boolean = false,
+        continuesAfterSuccess: Boolean = false,
     ): Pair<StandardCompactLaunch?, CompactResult> {
         val topology = conversations.getProviderContextTopologySnapshot(conversationId)
             ?: return null to CompactResult.NotNeeded
@@ -157,8 +173,12 @@ internal class ConversationCompactController(
                 snapshot = generationSnapshot,
                 modelMessageId = messageId,
                 replacementMessageId = target?.id,
-                callerTag = if (target == null) "compact" else "recompact",
+                requestKind = "compact",
+                conversationModelId = null,
+                touchConversationOnAdmission = touchConversationOnAdmission,
+                alreadyHoldsConversationLock = alreadyHoldsConversationLock,
                 queueDrainRequiresSuccess = true,
+                continuesAfterSuccess = continuesAfterSuccess,
                 transformFinalText = transform,
             ),
             state,
@@ -169,7 +189,7 @@ internal class ConversationCompactController(
             return null to CompactResult.Failed(CompactFailureReason.GENERATION_NOT_STARTED)
         }
         onCompactStarted(conversationId, messageId)
-        val compactLaunch = StandardCompactLaunch(messageId, launched.job)
+        val compactLaunch = StandardCompactLaunch(messageId, launched.job, launched.uiToken)
         if (!awaitCompletion) return compactLaunch to CompactResult.Created(messageId)
 
         try {
@@ -219,14 +239,34 @@ internal class ConversationCompactController(
         request: CompactRequest,
     ): GenerationAdmissionSnapshot = copy(
         config = config.copy(
-            effectiveSystemPrompt = request.prompt,
-            initialUserPrompt = BuiltInPrompts.CONTEXT_COMPACT_USER,
+            // Preserved mode keeps the system prompt captured for the compact request (the
+            // conversation's ordinary one) and moves the Compact Prompt to the head of the
+            // user message; legacy mode replaces the system prompt with the Compact Prompt.
+            effectiveSystemPrompt = if (request.preserveSystemPrompt) {
+                config.effectiveSystemPrompt
+            } else {
+                request.prompt
+            },
+            initialUserPrompt = if (request.preserveSystemPrompt) {
+                request.prompt + "\n\n" + BuiltInPrompts.CONTEXT_COMPACT_USER
+            } else {
+                BuiltInPrompts.CONTEXT_COMPACT_USER
+            },
+            userPrepend = null,
+            userPostpend = null,
+            assistantPrepend = null,
+            assistantPostpend = null,
+            promptTemplate = null,
+            requestResolver = null,
             codeExecutionEnabled = false,
             googleSearchEnabled = false,
             openAiWebSearchEnabled = false,
             thinkingEnabled = false,
         ),
         context = context.copy(
+            phoneEnabled = false,
+            todoEnabled = false,
+            subagentToolsEnabled = false,
             accessSavedMemories = false,
             accessActiveMemory = false,
             skillReadAccess = false,
@@ -234,6 +274,7 @@ internal class ConversationCompactController(
             accessPastConversations = false,
             webSearchEnabled = false,
             imageGenEnabled = false,
+            askUserEnabled = false,
             automationToolsEnabled = false,
             shellEnabled = false,
             sandboxEnabled = false,
@@ -257,10 +298,11 @@ internal class ConversationCompactController(
             retainLogicalMessages,
         ).retained
         return { generatedText, status ->
-            if (status == MessageStatus.SUCCESS && generatedText.isNotBlank()) {
-                buildPersistedCompactText(generatedText, retained)
+            val normalizedText = normalizeContextCompactOutput(generatedText)
+            if (status == MessageStatus.SUCCESS && normalizedText.isNotBlank()) {
+                buildPersistedCompactText(normalizedText, retained)
             } else {
-                generatedText
+                normalizedText
             }
         }
     }

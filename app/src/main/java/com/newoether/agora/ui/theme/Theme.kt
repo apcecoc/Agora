@@ -7,9 +7,13 @@ import androidx.compose.material3.Typography
 import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
@@ -75,9 +79,10 @@ private fun typographyWithFont(family: FontFamily): Typography {
 @Composable
 fun AgoraTheme(
     themeMode: ThemeMode = ThemeMode.FOLLOW_DEVICE,
-    colorSchemePreset: ColorSchemePreset = ColorSchemePreset.MIDNIGHT,
+    colorSchemePreset: ColorSchemePreset = ColorSchemePreset.FOREST,
     schemeStyle: SchemeStyle = SchemeStyle.TONAL_SPOT,
-    dynamicColor: Boolean = true,
+    dynamicColor: Boolean = false,
+    amoledEnabled: Boolean = false,
     fontPreference: String = "app_default",
     customFontPath: String = "",
     content: @Composable () -> Unit
@@ -89,7 +94,7 @@ fun AgoraTheme(
         ThemeMode.FOLLOW_DEVICE -> systemDark
     }
 
-    val colorScheme = when {
+    val baseColorScheme = when {
         dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
             val context = LocalContext.current
             if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
@@ -99,13 +104,27 @@ fun AgoraTheme(
         }
     }
 
+    val colorScheme = remember(baseColorScheme, darkTheme, amoledEnabled) {
+        baseColorScheme.withAmoledBackground(darkTheme, amoledEnabled)
+    }
+
     val fontFamily = effectiveFontFamily(fontPreference, customFontPath)
     chatFontFamily = fontFamily
+    val baseDensity = LocalDensity.current
+    val windowWidthDp = with(baseDensity) { LocalWindowInfo.current.containerSize.width.toDp().value }
+    // Zero before the first layout pass; keep the regular tier until a real width is known.
+    val compact = windowWidthDp > 0f && windowWidthDp < CHAT_COMPACT_WIDTH_DP
+    chatCompactWidth = compact
+    // Compact windows shrink every sp one step on top of the user's own font scale; dp is untouched.
+    val contentDensity = remember(baseDensity, compact) {
+        if (compact) Density(baseDensity.density, baseDensity.fontScale * COMPACT_FONT_SCALE) else baseDensity
+    }
     val typography = remember(fontFamily) { typographyWithFont(fontFamily) }
 
     MaterialTheme(
         colorScheme = colorScheme,
         typography = typography,
-        content = content
-    )
+    ) {
+        CompositionLocalProvider(LocalDensity provides contentDensity, content = content)
+    }
 }

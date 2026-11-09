@@ -6,6 +6,7 @@ import com.newoether.agora.data.local.RunEntity
 import com.newoether.agora.data.MessageAttachmentCloneSession
 import com.newoether.agora.data.repository.ConversationRepository
 import com.newoether.agora.data.repository.SettingsRepository
+import com.newoether.agora.data.repository.remapToolRoundReferences
 import com.newoether.agora.model.AttachmentMeta
 import com.newoether.agora.model.MessageSegment
 import com.newoether.agora.model.Participant
@@ -56,11 +57,11 @@ class ConversationForkShareService(
     ): ForkResult {
         val source = conversations.getConversation(conversationId)
             ?: return ForkResult.Failure("Conversation not found")
-        val sourceMessages = conversations.getMessagesForConversationSnapshot(conversationId)
+        val sourceTopology = conversations.getMessageTopologySnapshot(conversationId)
         val allRuns = conversations.getRunsForConversationSnapshot(conversationId)
         val selectedChildren = conversations.restoreBranchSelections(conversationId)
-        val selection = resolveConversationBranchPath(
-            messages = sourceMessages,
+        val selection = resolveConversationBranchTopology(
+            messages = sourceTopology,
             runs = allRuns,
             selectedChildren = selectedChildren,
             throughMessageId = throughMessageId,
@@ -79,10 +80,16 @@ class ConversationForkShareService(
             return ForkResult.Failure("Wait for generation to finish before forking")
         }
 
-        val selectedMessages = selection.structuralMessages
+        val selectedTopology = selection.structuralMessages
             .filter { it.conversationId == conversationId }
-        if (selectedMessages.isEmpty()) return ForkResult.Failure("Conversation has no messages")
-        val selectedMessageIds = selectedMessages.mapTo(mutableSetOf()) { it.id }
+        if (selectedTopology.isEmpty()) return ForkResult.Failure("Conversation has no messages")
+        val selectedMessageIds = selectedTopology.mapTo(mutableSetOf()) { it.id }
+        val selectedPayloads = conversations.getMessagesByIds(selectedMessageIds.toList())
+            .associateBy { it.id }
+        val selectedMessages = selectedTopology.map { topology ->
+            selectedPayloads[topology.id]
+                ?: return ForkResult.Failure("Message not found: ${topology.id}")
+        }
         val selectedRunIds = selection.runIds.toSet()
         if (selectedRuns.any { it.parentRunId != null && it.parentRunId !in selectedRunIds }) {
             return ForkResult.Failure("Selected Run ancestry is incomplete")
@@ -122,6 +129,7 @@ class ConversationForkShareService(
                     conversationId = newConversationId,
                     parentId = message.parentId?.let { checkNotNull(messageIds[it]) },
                     runId = checkNotNull(runIds[message.runId]),
+                    toolCallJson = remapToolRoundReferences(message.toolCallJson, messageIds),
                             ),
                             ownerKey = checkNotNull(messageIds[message.id]),
                         )
@@ -161,6 +169,7 @@ class ConversationForkShareService(
         val forkConversation = ChatEntity(
             id = newConversationId,
             title = source.title,
+            todoJson = source.todoJson,
             selectedBranchesJson = explicitMessageSelections.encodeSelections(),
             systemPromptId = source.systemPromptId,
             modelId = source.modelId,
@@ -263,9 +272,9 @@ class ConversationForkShareService(
 
     private suspend fun shareSnapshot(conversationId: String): ShareSnapshot? {
         val conversation = conversations.getConversation(conversationId) ?: return null
-        val messages = conversations.getMessagesForConversationSnapshot(conversationId)
+        val messages = conversations.getMessageTopologySnapshot(conversationId)
         val runs = conversations.getRunsForConversationSnapshot(conversationId)
-        val branch = resolveConversationBranchPath(
+        val branch = resolveConversationBranchTopology(
             messages = messages,
             runs = runs,
             selectedChildren = conversations.restoreBranchSelections(conversationId),
@@ -277,7 +286,7 @@ class ConversationForkShareService(
         )
     }
 
-    private fun renderShare(
+    private suspend fun renderShare(
         snapshot: ShareSnapshot,
         selectedMessageIds: Set<String>,
     ): ShareResult {
@@ -292,10 +301,17 @@ class ConversationForkShareService(
         if (completeRunIds.any { snapshot.runsById[it]?.status?.isTerminal != true }) {
             return ShareResult.Failure("Wait for generation to finish before sharing")
         }
-        val selected = snapshot.branch.structuralMessages
+        val selectedTopology = snapshot.branch.structuralMessages
             .filter { message ->
                 message.id in selectedMessageIds || message.runId in completeRunIds
             }
+        val selectedIds = selectedTopology.map { it.id }
+        val payloadsById = conversations.getMessagesByIds(selectedIds).associateBy { it.id }
+        if (payloadsById.size != selectedIds.toSet().size) {
+            return ShareResult.Failure("A selected message no longer exists")
+        }
+        val selected = selectedTopology
+            .map { topology -> checkNotNull(payloadsById[topology.id]) }
             .sortedWith(
                 compareBy<MessageEntity> {
                     snapshot.branch.runIds.indexOf(it.runId).let { index ->
@@ -314,7 +330,7 @@ class ConversationForkShareService(
     private data class ShareSnapshot(
         val title: String,
         val runsById: Map<String, RunEntity>,
-        val branch: ConversationBranchPath,
+        val branch: ConversationBranchTopology,
     )
 }
 
@@ -402,10 +418,16 @@ private fun attachmentSummary(message: MessageEntity): String? {
 internal fun remapForkMessageId(
     sourceMessageId: String,
     generatedId: String = UUID.randomUUID().toString(),
-): String = when {
-    sourceMessageId.startsWith(Constants.TOOL_MSG_PREFIX) ->
-        "${Constants.TOOL_MSG_PREFIX}$generatedId"
-    sourceMessageId.startsWith(Constants.RESULT_MSG_PREFIX) ->
-        "${Constants.RESULT_MSG_PREFIX}$generatedId"
-    else -> generatedId
+): String {
+    // Row kinds are encoded in the id prefix (tool calls, tool results, the compact summary that
+    // marks the context boundary). A fork must keep the kind, or e.g. the forked conversation
+    // loses its compact boundary and every context load reads the whole history.
+    val prefix = FORK_PRESERVED_MESSAGE_ID_PREFIXES.firstOrNull(sourceMessageId::startsWith).orEmpty()
+    return "$prefix$generatedId"
 }
+
+private val FORK_PRESERVED_MESSAGE_ID_PREFIXES = listOf(
+    Constants.TOOL_MSG_PREFIX,
+    Constants.RESULT_MSG_PREFIX,
+    Constants.COMPACT_MSG_PREFIX,
+)

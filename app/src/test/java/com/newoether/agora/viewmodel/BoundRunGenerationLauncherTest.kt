@@ -5,6 +5,7 @@ import com.newoether.agora.data.repository.ConversationRepository
 import com.newoether.agora.model.ChatMessage
 import com.newoether.agora.model.MessageStatus
 import com.newoether.agora.model.Participant
+import com.newoether.agora.util.CloudDebugLog
 import com.newoether.agora.util.DebugLog
 import io.mockk.Runs
 import io.mockk.coEvery
@@ -20,7 +21,9 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
+import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
 
@@ -56,7 +59,7 @@ class BoundRunGenerationLauncherTest {
             fixture.launcher.launch(fixture.request, fixture.state)
             callbacks.captured.onToolRoundPersisted()
         } finally {
-            unmockkObject(DebugLog)
+            unmockkObject(DebugLog, CloudDebugLog)
         }
 
         assertSame(currentCoroutineContext()[Job], generationJob)
@@ -64,11 +67,41 @@ class BoundRunGenerationLauncherTest {
             fixture.compactController.automaticNeeded(
                 conversationId = "conversation",
                 contextLimit = 4096,
-                config = fixture.snapshot.automaticCompact,
+                // The threshold measures the main request, so it carries the main model id.
+                config = fixture.snapshot.automaticCompact.copy(
+                    mainModelId = fixture.config.modelId,
+                ),
             )
         }
         fixture.state.dispose()
         Unit
+    }
+
+    @Test
+    fun explicitContinuationIsForwardedToGenerationWithoutQueuedGuidance() = runBlocking {
+        for (continuesAfterSuccess in listOf(false, true)) {
+            val fixture = Fixture()
+            val callbacks = slot<GenerationCallbacks>()
+            coEvery {
+                fixture.manager.generate(
+                    any(), any(), any(), any(), any(), any(), any(),
+                    any(), any(), any(), any(), capture(callbacks), any(), any(),
+                )
+            } returns GenerationExecutionResult()
+            mockDebugLog()
+            try {
+                fixture.launcher.launch(
+                    fixture.request.copy(continuesAfterSuccess = continuesAfterSuccess),
+                    fixture.state,
+                )
+                assertEquals(continuesAfterSuccess, callbacks.captured.hasPendingContinuation)
+                assertFalse(callbacks.captured.hasQueuedSends())
+                assertTrue(fixture.continuationRequests.isEmpty())
+            } finally {
+                fixture.state.dispose()
+                unmockkObject(DebugLog, CloudDebugLog)
+            }
+        }
     }
 
     @Test
@@ -96,7 +129,7 @@ class BoundRunGenerationLauncherTest {
         try {
             fixture.launcher.launch(fixture.request, fixture.state)
         } finally {
-            unmockkObject(DebugLog)
+            unmockkObject(DebugLog, CloudDebugLog)
         }
 
         val continuation = fixture.continuationRequests.single()
@@ -141,13 +174,14 @@ class BoundRunGenerationLauncherTest {
                 state = fixture.state,
                 failedMessage = capture(failedMessage),
                 effectId = "request-finalize-run-3",
+                notificationText = any(),
             )
         } returns true
         mockDebugLog()
         try {
             fixture.launcher.launch(fixture.request, fixture.state)
         } finally {
-            unmockkObject(DebugLog)
+            unmockkObject(DebugLog, CloudDebugLog)
         }
 
         assertEquals(MessageStatus.ERROR, failedMessage.captured.status)
@@ -193,7 +227,7 @@ class BoundRunGenerationLauncherTest {
                 Unit
             }
         } finally {
-            unmockkObject(DebugLog)
+            unmockkObject(DebugLog, CloudDebugLog)
         }
 
         coVerify(exactly = 0) {
@@ -212,7 +246,7 @@ class BoundRunGenerationLauncherTest {
         val terminalSettlement = mockk<GenerationTerminalSettlementController>()
         val continuationRequests = mutableListOf<AutomaticCompactContinuationRequest>()
         val continuationStates = mutableListOf<ConversationGenerationState>()
-        val state = ConversationGenerationState("conversation")
+        val state = ConversationGenerationState("conversation", reclaimQueuedAttachments = {})
         val uiToken = requireNotNull(state.acquireForSend())
         val snapshot = testGenerationAdmissionSnapshot(
             conversationId = "conversation",
@@ -229,13 +263,14 @@ class BoundRunGenerationLauncherTest {
             persistId = 7L,
             runId = "run",
             pass = 3,
-            callerTag = "test",
+            requestKind = "test",
         )
         val launcher: BoundRunGenerationLauncher
 
         init {
             state.bindRun(uiToken, "run", pass = 3)
-            every { manager.fixedContextTokenCost(any(), any()) } returns 0
+            coEvery { manager.resolvedFixedContextTokenCost(any(), any()) } returns 0
+            every { manager.includesAssistantReasoning(any(), any()) } returns false
             coEvery {
                 compactController.automaticNeeded(any(), any(), any())
             } returns false
@@ -277,9 +312,10 @@ class BoundRunGenerationLauncherTest {
         )
 
         fun mockDebugLog() {
-            mockkObject(DebugLog)
+            mockkObject(DebugLog, CloudDebugLog)
             every { DebugLog.d(any(), any()) } just Runs
             every { DebugLog.e(any(), any()) } just Runs
+            every { CloudDebugLog.d(any(), any()) } just Runs
         }
     }
 }

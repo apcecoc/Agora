@@ -1,11 +1,13 @@
 package com.newoether.agora.data
 
 import androidx.datastore.preferences.core.Preferences
+import com.newoether.agora.model.OpenAiServiceTiers
 import com.newoether.agora.util.Constants
 import com.newoether.agora.util.DebugLog
 import com.newoether.agora.util.SecretCrypto
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.util.UUID
 
@@ -15,26 +17,6 @@ data class ApiKeyEntry(
     val name: String,
     val key: String,
     val provider: String = Constants.PROVIDER_GOOGLE
-)
-
-@Serializable
-data class ShellDeviceConfig(
-    val id: String = UUID.randomUUID().toString(),
-    val name: String,
-    val description: String = "",
-    val type: String = "conch",          // "conch" | "ssh"
-    // Conch fields (type=conch)
-    val serverUrl: String = "",
-    val apiKey: String = "",
-    val conchPublicKey: String = "",
-    // SSH fields (type=ssh)
-    val sshHost: String = "",
-    val sshPort: Int = 22,
-    val sshUser: String = "root",
-    val sshPassword: String = "",
-    // Pinned SSH host key (base64 of the server public-key blob). Blank = not yet
-    // pinned (trust-on-first-use); once set, connections must match or are rejected.
-    val sshHostKey: String = ""
 )
 
 @Serializable
@@ -64,13 +46,30 @@ data class SystemPromptEntry(
     val title: String,
     val content: String = "",
     val systemItems: List<PromptTemplateItem> = emptyList(),
+    val userItems: List<PromptTemplateItem> = emptyList(),
+    val assistantItems: List<PromptTemplateItem> = emptyList(),
+    // Legacy fields retained only so prompts saved before structured message templates deserialize.
     val userPrependItems: List<PromptTemplateItem> = emptyList(),
-    val userPostpendItems: List<PromptTemplateItem> = emptyList()
+    val userPostpendItems: List<PromptTemplateItem> = emptyList(),
+    /** Completed built-in migration revision; absent legacy JSON starts at zero. Never prompt text. */
+    val builtInMigrationVersion: Int = 0,
 ) {
     val resolvedSystemItems: List<PromptTemplateItem>
         get() = if (systemItems.isNotEmpty()) systemItems
         else if (content.isNotBlank()) listOf(PromptTemplateItem(type = PromptItemType.CUSTOM, value = content))
         else emptyList()
+
+    val resolvedUserItems: List<PromptTemplateItem>
+        get() = PredefinedVariables.normalizeMessageTemplate(
+            if (userItems.isNotEmpty()) {
+                userItems
+            } else {
+                userPrependItems + PredefinedVariables.promptItem() + userPostpendItems
+            },
+        )
+
+    val resolvedAssistantItems: List<PromptTemplateItem>
+        get() = PredefinedVariables.normalizeMessageTemplate(assistantItems)
 }
 
 internal val WEB_SEARCH_PROVIDERS = setOf(
@@ -94,9 +93,22 @@ internal fun decodeConversationSettings(
     preferences: Preferences,
     json: Json,
 ): Map<String, ConversationSettings> = try {
-    json.decodeFromString(preferences[CONVERSATION_SETTINGS_JSON] ?: "{}")
+    json.decodeFromString<Map<String, ConversationSettings>>(
+        preferences[CONVERSATION_SETTINGS_JSON] ?: "{}",
+    ).mapValues { (_, settings) -> settings.normalizedServiceTier() }
 } catch (_: Exception) {
     emptyMap()
+}
+
+internal fun ConversationSettings.normalizedServiceTier(): ConversationSettings =
+    if (openAiServiceTier == null) this
+    else copy(openAiServiceTier = OpenAiServiceTiers.normalize(openAiServiceTier))
+
+internal fun encryptShellDevices(devices: List<ShellDeviceConfig>, json: Json): String {
+    val stored = SecretCrypto.encrypt(json.encodeToString(devices))
+    check(devices.none { it.sshPrivateKey.isNotEmpty() || it.sshKeyPassphrase.isNotEmpty() } ||
+        SecretCrypto.isEncrypted(stored)) { "Could not encrypt SSH private-key credentials" }
+    return stored
 }
 
 internal fun decodeEncryptedShellDevices(preferences: Preferences, json: Json): List<ShellDeviceConfig> {
@@ -123,7 +135,8 @@ data class ConversationSettings(
     val openAiServiceTierEnabled: Boolean? = null,
     val openAiServiceTier: String? = null,
     val webSearchEnabled: Boolean? = null,
-    val shellEnabled: Boolean? = null
+    val shellEnabled: Boolean? = null,
+    val lowContextModeEnabled: Boolean? = null,
 ) {
     fun isAllNull() = contextWindow == null && temperature == null && maxTokens == null && topP == null
         && frequencyPenalty == null && presencePenalty == null
@@ -132,4 +145,5 @@ data class ConversationSettings(
         && thinkingLevel == null && thinkingBudgetEnabled == null && thinkingBudgetTokens == null
         && openAiServiceTierEnabled == null && openAiServiceTier == null
         && webSearchEnabled == null && shellEnabled == null
+        && lowContextModeEnabled == null
 }

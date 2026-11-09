@@ -1,6 +1,5 @@
 package com.newoether.agora.ui.settings.datacontrol
 
-import android.content.Intent
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -8,17 +7,12 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -29,14 +23,14 @@ import kotlinx.coroutines.withContext
 import com.newoether.agora.R
 import com.newoether.agora.ui.settings.CollapsingSettingsScaffold
 import com.newoether.agora.ui.settings.DocumentationFab
+import com.newoether.agora.ui.settings.PillTabSwitcher
 import com.newoether.agora.ui.settings.SettingsGroup
 import com.newoether.agora.ui.settings.SettingsGroupColumn
 import com.newoether.agora.ui.settings.SettingsItem
 import com.newoether.agora.data.DataExporter
 import com.newoether.agora.data.DataImporter
-import com.newoether.agora.data.NativeBackupFormat
 import com.newoether.agora.viewmodel.ChatViewModel
-import com.newoether.agora.ui.settings.ImportStrategy
+import com.newoether.agora.ui.components.optionClickable
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -49,6 +43,7 @@ fun SettingsDataControlPage(viewModel: ChatViewModel, onBack: () -> Unit) {
     val promptCount by viewModel.dataControl.systemPromptCount.collectAsState()
     val exportProgress by viewModel.importExport.exportProgress.collectAsState()
     val importProgress by viewModel.importExport.importProgress.collectAsState()
+    val importPreviewLoading by viewModel.importExport.importPreviewLoading.collectAsState()
     val importManifest by viewModel.importExport.importManifest.collectAsState()
     val importPreview by viewModel.importExport.importPreview.collectAsState()
 
@@ -68,11 +63,20 @@ fun SettingsDataControlPage(viewModel: ChatViewModel, onBack: () -> Unit) {
     var claudeFileUri by remember { mutableStateOf<Uri?>(null) }
     var claudeFileName by remember { mutableStateOf<String?>(null) }
     var showClaudeSuccessDialog by remember { mutableStateOf(false) }
+    var claudeImportStrategy by remember {
+        mutableStateOf(DataImporter.ImportStrategy.MERGE)
+    }
+    var claudeSelectedIds by remember { mutableStateOf<Set<String>>(emptySet()) }
 
     var showGptImportDialog by remember { mutableStateOf(false) }
     var gptFileUri by remember { mutableStateOf<Uri?>(null) }
     var gptFileName by remember { mutableStateOf<String?>(null) }
     var showGptSuccessDialog by remember { mutableStateOf(false) }
+    var gptImportStrategy by remember {
+        mutableStateOf(DataImporter.ImportStrategy.MERGE)
+    }
+    var gptSelectedIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var pendingExternalReplace by remember { mutableStateOf<Pair<Boolean, Set<String>>?>(null) }
 
     // Auto Backup
     val autoBackupEnabled by viewModel.settings.autoBackupEnabled.collectAsState()
@@ -144,15 +148,21 @@ fun SettingsDataControlPage(viewModel: ChatViewModel, onBack: () -> Unit) {
     }
 
     // Show import preview dialog when preview is loaded
-    LaunchedEffect(importPreview) {
-        if (importPreview != null) {
+    LaunchedEffect(importPreview, importPreviewLoading) {
+        if (importPreview != null && !importPreviewLoading) {
             showImportPreviewDialog = true
         }
     }
 
     val isClaudeImporting = claudeImportProgress != null
     val isGptImporting = gptImportProgress != null
-    val isProgressVisible = isExporting || isImporting || isClaudeImporting || isGptImporting
+    val isNativeProgressVisible = importPreviewLoading || isExporting || isImporting
+    val nativeProgressTitle = when {
+        importPreviewLoading -> R.string.loading_label
+        isExporting -> R.string.exporting_label
+        else -> R.string.importing_label
+    }
+    val isThirdPartyImporting = isClaudeImporting || isGptImporting
 
     val showDocFab by viewModel.settings.showDocumentationFab.collectAsState()
     Box(modifier = Modifier.fillMaxSize()) {
@@ -218,7 +228,10 @@ fun SettingsDataControlPage(viewModel: ChatViewModel, onBack: () -> Unit) {
 
                 // Show Claude import dialog when preview is loaded
                 LaunchedEffect(claudeImportPreview) {
-                    if (claudeImportPreview != null) {
+                    claudeImportPreview?.let { preview ->
+                        claudeSelectedIds = preview.conversations.mapTo(mutableSetOf()) { it.uuid }
+                        claudeImportStrategy = DataImporter.ImportStrategy.MERGE
+                        pendingExternalReplace = null
                         showClaudeImportDialog = true
                     }
                 }
@@ -232,7 +245,10 @@ fun SettingsDataControlPage(viewModel: ChatViewModel, onBack: () -> Unit) {
 
                 // Show GPT import dialog when preview is loaded
                 LaunchedEffect(gptImportPreview) {
-                    if (gptImportPreview != null) {
+                    gptImportPreview?.let { preview ->
+                        gptSelectedIds = preview.conversations.mapTo(mutableSetOf()) { it.uuid }
+                        gptImportStrategy = DataImporter.ImportStrategy.MERGE
+                        pendingExternalReplace = null
                         showGptImportDialog = true
                     }
                 }
@@ -247,14 +263,17 @@ fun SettingsDataControlPage(viewModel: ChatViewModel, onBack: () -> Unit) {
                 if (showDocFab) { Spacer(modifier = Modifier.height(80.dp)) }
         }
 
-        // Progress dialog
-        if (isProgressVisible) {
-            val progress = claudeImportProgress ?: gptImportProgress ?: exportProgress ?: importProgress ?: 0f
-            val label = if (isClaudeImporting) stringResource(R.string.claude_import_progress)
-                        else if (isGptImporting) stringResource(R.string.gpt_import_progress)
-                        else if (isExporting) stringResource(R.string.exporting_label)
-                        else stringResource(R.string.importing_label)
+        if (isNativeProgressVisible) {
+            NativeDataProgressDialog(title = stringResource(nativeProgressTitle))
+        }
 
+        if (isThirdPartyImporting) {
+            val progress = claudeImportProgress ?: gptImportProgress ?: 0f
+            val label = if (isClaudeImporting) {
+                stringResource(R.string.claude_import_progress)
+            } else {
+                stringResource(R.string.gpt_import_progress)
+            }
             AlertDialog(
                 containerColor = MaterialTheme.colorScheme.surfaceContainer,
                 onDismissRequest = { },
@@ -264,17 +283,17 @@ fun SettingsDataControlPage(viewModel: ChatViewModel, onBack: () -> Unit) {
                         Spacer(Modifier.height(8.dp))
                         LinearProgressIndicator(
                             progress = { progress },
-                            modifier = Modifier.fillMaxWidth()
+                            modifier = Modifier.fillMaxWidth(),
                         )
                         Spacer(Modifier.height(8.dp))
                         Text(
                             "${(progress * 100).toInt()}%",
                             style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
                 },
-                confirmButton = { }
+                confirmButton = { },
             )
         }
     }
@@ -330,22 +349,45 @@ fun SettingsDataControlPage(viewModel: ChatViewModel, onBack: () -> Unit) {
     // Claude import preview dialog
     if (showClaudeImportDialog && claudeImportPreview != null) {
         val preview = claudeImportPreview!!
-        var dialogSelectedIds by remember { mutableStateOf(preview.conversations.map { it.uuid }.toSet()) }
         val allIds = preview.conversations.map { it.uuid }.toSet()
-        val allSelected = dialogSelectedIds.size == allIds.size
-        val selectedConvCount = preview.conversations.count { it.uuid in dialogSelectedIds }
-        val selectedMsgCount = preview.conversations.filter { it.uuid in dialogSelectedIds }.sumOf { it.messageCount }
+        val allSelected = claudeSelectedIds.size == allIds.size
+        val selectedConvCount = preview.conversations.count { it.uuid in claudeSelectedIds }
+        val selectedMsgCount = preview.conversations
+            .filter { it.uuid in claudeSelectedIds }
+            .sumOf { it.messageCount }
 
         AlertDialog(
             containerColor = MaterialTheme.colorScheme.surfaceContainer,
             onDismissRequest = {
                 showClaudeImportDialog = false
+                pendingExternalReplace = null
                 viewModel.importExport.clearClaudeImportState()
             },
             title = { Text(stringResource(R.string.claude_import_title), fontWeight = FontWeight.Bold) },
             text = {
                 Column {
-                    // Fixed header
+                    Text(
+                        stringResource(R.string.claude_import_strategy),
+                        style = MaterialTheme.typography.labelLarge,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    PillTabSwitcher(
+                        tabs = listOf(
+                            stringResource(R.string.import_strategy_merge),
+                            stringResource(R.string.import_strategy_replace),
+                        ),
+                        selectedIndex = if (
+                            claudeImportStrategy == DataImporter.ImportStrategy.MERGE
+                        ) 0 else 1,
+                        onSelect = { index ->
+                            claudeImportStrategy = if (index == 0) {
+                                DataImporter.ImportStrategy.MERGE
+                            } else {
+                                DataImporter.ImportStrategy.REPLACE
+                            }
+                        },
+                    )
+                    Spacer(Modifier.height(16.dp))
                     Text(
                         "$selectedConvCount ${stringResource(R.string.claude_import_conversations)}, $selectedMsgCount ${stringResource(R.string.claude_import_messages)}",
                         style = MaterialTheme.typography.bodySmall,
@@ -354,7 +396,7 @@ fun SettingsDataControlPage(viewModel: ChatViewModel, onBack: () -> Unit) {
                     Spacer(Modifier.height(4.dp))
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         TextButton(onClick = {
-                            dialogSelectedIds = if (allSelected) emptySet() else allIds
+                            claudeSelectedIds = if (allSelected) emptySet() else allIds
                         }) {
                             Text(
                                 if (allSelected) stringResource(R.string.deselect_all) else stringResource(R.string.select_all),
@@ -363,25 +405,30 @@ fun SettingsDataControlPage(viewModel: ChatViewModel, onBack: () -> Unit) {
                         }
                     }
                     HorizontalDivider()
-                    // Scrollable list
                     LazyColumn(modifier = Modifier.heightIn(max = 280.dp)) {
                         items(preview.conversations.size) { index ->
                             val conv = preview.conversations[index]
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .clickable {
-                                        dialogSelectedIds = if (conv.uuid in dialogSelectedIds)
-                                            dialogSelectedIds - conv.uuid else dialogSelectedIds + conv.uuid
+                                    .optionClickable {
+                                        claudeSelectedIds = if (conv.uuid in claudeSelectedIds) {
+                                            claudeSelectedIds - conv.uuid
+                                        } else {
+                                            claudeSelectedIds + conv.uuid
+                                        }
                                     }
                                     .padding(vertical = 2.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Checkbox(
-                                    checked = conv.uuid in dialogSelectedIds,
-                                    onCheckedChange = {
-                                        dialogSelectedIds = if (it)
-                                            dialogSelectedIds + conv.uuid else dialogSelectedIds - conv.uuid
+                                    checked = conv.uuid in claudeSelectedIds,
+                                    onCheckedChange = { checked ->
+                                        claudeSelectedIds = if (checked) {
+                                            claudeSelectedIds + conv.uuid
+                                        } else {
+                                            claudeSelectedIds - conv.uuid
+                                        }
                                     }
                                 )
                                 Spacer(Modifier.width(4.dp))
@@ -405,16 +452,24 @@ fun SettingsDataControlPage(viewModel: ChatViewModel, onBack: () -> Unit) {
             confirmButton = {
                 TextButton(
                     onClick = {
-                        val finalIds = dialogSelectedIds
+                        val finalIds = claudeSelectedIds
                         showClaudeImportDialog = false
-                        viewModel.importExport.clearClaudeImportState()
-                        claudeFileUri?.let {
-                            scope.launch {
-                                viewModel.importExport.importClaudeChat(it, ImportStrategy.MERGE, finalIds)
+                        if (claudeImportStrategy == DataImporter.ImportStrategy.REPLACE) {
+                            pendingExternalReplace = true to finalIds
+                        } else {
+                            viewModel.importExport.clearClaudeImportState()
+                            claudeFileUri?.let { uri ->
+                                scope.launch {
+                                    viewModel.importExport.importClaudeChat(
+                                        uri,
+                                        claudeImportStrategy,
+                                        finalIds,
+                                    )
+                                }
                             }
                         }
                     },
-                    enabled = dialogSelectedIds.isNotEmpty()
+                    enabled = claudeSelectedIds.isNotEmpty()
                 ) {
                     Text(stringResource(R.string.claude_import_import))
                 }
@@ -422,11 +477,72 @@ fun SettingsDataControlPage(viewModel: ChatViewModel, onBack: () -> Unit) {
             dismissButton = {
                 TextButton(onClick = {
                     showClaudeImportDialog = false
+                    pendingExternalReplace = null
                     viewModel.importExport.clearClaudeImportState()
                 }) {
                     Text(stringResource(R.string.cancel))
                 }
             }
+        )
+    }
+
+    pendingExternalReplace?.let { (isClaude, selectedIds) ->
+        AlertDialog(
+            containerColor = MaterialTheme.colorScheme.surfaceContainer,
+            onDismissRequest = {
+                pendingExternalReplace = null
+                if (isClaude) showClaudeImportDialog = true else showGptImportDialog = true
+            },
+            title = {
+                Text(
+                    stringResource(R.string.external_import_replace_confirm_title),
+                    fontWeight = FontWeight.Bold,
+                )
+            },
+            text = { Text(stringResource(R.string.external_import_replace_confirm_message)) },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        pendingExternalReplace = null
+                        if (isClaude) {
+                            viewModel.importExport.clearClaudeImportState()
+                            claudeFileUri?.let { uri ->
+                                scope.launch {
+                                    viewModel.importExport.importClaudeChat(
+                                        uri,
+                                        DataImporter.ImportStrategy.REPLACE,
+                                        selectedIds,
+                                    )
+                                }
+                            }
+                        } else {
+                            viewModel.importExport.clearGptImportState()
+                            gptFileUri?.let { uri ->
+                                scope.launch {
+                                    viewModel.importExport.importGptChat(
+                                        uri,
+                                        DataImporter.ImportStrategy.REPLACE,
+                                        selectedIds,
+                                    )
+                                }
+                            }
+                        }
+                    },
+                    colors = ButtonDefaults.textButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error,
+                    ),
+                ) {
+                    Text(stringResource(R.string.external_import_replace_confirm_button))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    pendingExternalReplace = null
+                    if (isClaude) showClaudeImportDialog = true else showGptImportDialog = true
+                }) {
+                    Text(stringResource(R.string.cancel))
+                }
+            },
         )
     }
 
@@ -467,21 +583,45 @@ fun SettingsDataControlPage(viewModel: ChatViewModel, onBack: () -> Unit) {
     // GPT import preview dialog
     if (showGptImportDialog && gptImportPreview != null) {
         val preview = gptImportPreview!!
-        var dialogSelectedIds by remember { mutableStateOf(preview.conversations.map { it.uuid }.toSet()) }
         val allIds = preview.conversations.map { it.uuid }.toSet()
-        val allSelected = dialogSelectedIds.size == allIds.size
-        val selectedConvCount = preview.conversations.count { it.uuid in dialogSelectedIds }
-        val selectedMsgCount = preview.conversations.filter { it.uuid in dialogSelectedIds }.sumOf { it.messageCount }
+        val allSelected = gptSelectedIds.size == allIds.size
+        val selectedConvCount = preview.conversations.count { it.uuid in gptSelectedIds }
+        val selectedMsgCount = preview.conversations
+            .filter { it.uuid in gptSelectedIds }
+            .sumOf { it.messageCount }
 
         AlertDialog(
             containerColor = MaterialTheme.colorScheme.surfaceContainer,
             onDismissRequest = {
                 showGptImportDialog = false
+                pendingExternalReplace = null
                 viewModel.importExport.clearGptImportState()
             },
             title = { Text(stringResource(R.string.gpt_import_title), fontWeight = FontWeight.Bold) },
             text = {
                 Column {
+                    Text(
+                        stringResource(R.string.claude_import_strategy),
+                        style = MaterialTheme.typography.labelLarge,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    PillTabSwitcher(
+                        tabs = listOf(
+                            stringResource(R.string.import_strategy_merge),
+                            stringResource(R.string.import_strategy_replace),
+                        ),
+                        selectedIndex = if (
+                            gptImportStrategy == DataImporter.ImportStrategy.MERGE
+                        ) 0 else 1,
+                        onSelect = { index ->
+                            gptImportStrategy = if (index == 0) {
+                                DataImporter.ImportStrategy.MERGE
+                            } else {
+                                DataImporter.ImportStrategy.REPLACE
+                            }
+                        },
+                    )
+                    Spacer(Modifier.height(16.dp))
                     Text(
                         "$selectedConvCount ${stringResource(R.string.gpt_import_conversations)}, $selectedMsgCount ${stringResource(R.string.gpt_import_messages)}",
                         style = MaterialTheme.typography.bodySmall,
@@ -490,7 +630,7 @@ fun SettingsDataControlPage(viewModel: ChatViewModel, onBack: () -> Unit) {
                     Spacer(Modifier.height(4.dp))
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         TextButton(onClick = {
-                            dialogSelectedIds = if (allSelected) emptySet() else allIds
+                            gptSelectedIds = if (allSelected) emptySet() else allIds
                         }) {
                             Text(
                                 if (allSelected) stringResource(R.string.deselect_all) else stringResource(R.string.select_all),
@@ -505,18 +645,24 @@ fun SettingsDataControlPage(viewModel: ChatViewModel, onBack: () -> Unit) {
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .clickable {
-                                        dialogSelectedIds = if (conv.uuid in dialogSelectedIds)
-                                            dialogSelectedIds - conv.uuid else dialogSelectedIds + conv.uuid
+                                    .optionClickable {
+                                        gptSelectedIds = if (conv.uuid in gptSelectedIds) {
+                                            gptSelectedIds - conv.uuid
+                                        } else {
+                                            gptSelectedIds + conv.uuid
+                                        }
                                     }
                                     .padding(vertical = 2.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Checkbox(
-                                    checked = conv.uuid in dialogSelectedIds,
-                                    onCheckedChange = {
-                                        dialogSelectedIds = if (it)
-                                            dialogSelectedIds + conv.uuid else dialogSelectedIds - conv.uuid
+                                    checked = conv.uuid in gptSelectedIds,
+                                    onCheckedChange = { checked ->
+                                        gptSelectedIds = if (checked) {
+                                            gptSelectedIds + conv.uuid
+                                        } else {
+                                            gptSelectedIds - conv.uuid
+                                        }
                                     }
                                 )
                                 Spacer(Modifier.width(4.dp))
@@ -540,16 +686,24 @@ fun SettingsDataControlPage(viewModel: ChatViewModel, onBack: () -> Unit) {
             confirmButton = {
                 TextButton(
                     onClick = {
-                        val finalIds = dialogSelectedIds
+                        val finalIds = gptSelectedIds
                         showGptImportDialog = false
-                        viewModel.importExport.clearGptImportState()
-                        gptFileUri?.let {
-                            scope.launch {
-                                viewModel.importExport.importGptChat(it, ImportStrategy.MERGE, finalIds)
+                        if (gptImportStrategy == DataImporter.ImportStrategy.REPLACE) {
+                            pendingExternalReplace = false to finalIds
+                        } else {
+                            viewModel.importExport.clearGptImportState()
+                            gptFileUri?.let { uri ->
+                                scope.launch {
+                                    viewModel.importExport.importGptChat(
+                                        uri,
+                                        gptImportStrategy,
+                                        finalIds,
+                                    )
+                                }
                             }
                         }
                     },
-                    enabled = dialogSelectedIds.isNotEmpty()
+                    enabled = gptSelectedIds.isNotEmpty()
                 ) {
                     Text(stringResource(R.string.gpt_import_import))
                 }
@@ -557,6 +711,7 @@ fun SettingsDataControlPage(viewModel: ChatViewModel, onBack: () -> Unit) {
             dismissButton = {
                 TextButton(onClick = {
                     showGptImportDialog = false
+                    pendingExternalReplace = null
                     viewModel.importExport.clearGptImportState()
                 }) {
                     Text(stringResource(R.string.cancel))
@@ -599,219 +754,3 @@ fun SettingsDataControlPage(viewModel: ChatViewModel, onBack: () -> Unit) {
         )
     }
 }
-
-@Composable
-private fun ExportDataDialog(
-    conversationCount: Int,
-    memoryCount: Int,
-    promptCount: Int,
-    onDismiss: () -> Unit,
-    onExport: (categories: Set<DataExporter.ExportCategory>, includeApiKeys: Boolean) -> Unit
-) {
-    var exportConversations by remember { mutableStateOf(true) }
-    var exportMemories by remember { mutableStateOf(true) }
-    var exportPrompts by remember { mutableStateOf(true) }
-    var exportSettings by remember { mutableStateOf(true) }
-    var exportApiKeys by remember { mutableStateOf(false) }
-
-    val anyChecked = exportConversations || exportMemories || exportPrompts || exportSettings || exportApiKeys
-
-    AlertDialog(
-        containerColor = MaterialTheme.colorScheme.surfaceContainer,
-        onDismissRequest = onDismiss,
-        title = { Text(stringResource(R.string.data_export_title), fontWeight = FontWeight.Bold) },
-        text = {
-            Column {
-                CheckRow(exportConversations, { exportConversations = it },
-                    "${stringResource(R.string.export_category_conversations)} ($conversationCount)")
-                CheckRow(exportMemories, { exportMemories = it },
-                    "${stringResource(R.string.export_category_memories)} ($memoryCount)")
-                CheckRow(exportPrompts, { exportPrompts = it },
-                    "${stringResource(R.string.export_category_system_prompts)} ($promptCount)")
-                CheckRow(exportSettings, { exportSettings = it },
-                    stringResource(R.string.export_category_settings))
-                CheckRow(exportApiKeys, { exportApiKeys = it },
-                    stringResource(R.string.export_category_api_keys))
-                if (exportApiKeys) {
-                    Spacer(Modifier.height(4.dp))
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.Warning, null, modifier = Modifier.size(16.dp),
-                            tint = MaterialTheme.colorScheme.error)
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            stringResource(R.string.export_api_keys_warning),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.error
-                        )
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = {
-                    val cats = mutableSetOf<DataExporter.ExportCategory>()
-                    if (exportConversations) cats.add(DataExporter.ExportCategory.CONVERSATIONS)
-                    if (exportMemories) cats.add(DataExporter.ExportCategory.MEMORIES)
-                    if (exportPrompts) cats.add(DataExporter.ExportCategory.SYSTEM_PROMPTS)
-                    if (exportSettings) cats.add(DataExporter.ExportCategory.SETTINGS)
-                    if (exportApiKeys) cats.add(DataExporter.ExportCategory.API_KEYS)
-                    onExport(cats, exportApiKeys)
-                }, enabled = anyChecked) {
-                Text(stringResource(R.string.export_button))
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text(stringResource(R.string.cancel)) }
-        }
-    )
-}
-
-@Composable
-internal fun CheckRow(checked: Boolean, onToggle: (Boolean) -> Unit, label: String) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable { onToggle(!checked) }
-            .padding(vertical = 6.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Checkbox(checked = checked, onCheckedChange = onToggle)
-        Spacer(Modifier.width(8.dp))
-        Text(label, style = MaterialTheme.typography.bodyMedium)
-    }
-}
-
-@Composable
-private fun ImportPreviewDialog(
-    manifest: DataImporter.ImportManifest,
-    preview: DataImporter.ImportPreview,
-    onDismiss: () -> Unit,
-    onImport: (Map<DataExporter.ExportCategory, DataImporter.ImportStrategy>) -> Unit
-) {
-    var convStrategy by remember { mutableStateOf(DataImporter.ImportStrategy.MERGE) }
-    var memStrategy by remember { mutableStateOf(DataImporter.ImportStrategy.MERGE) }
-    var promptStrategy by remember { mutableStateOf(DataImporter.ImportStrategy.MERGE) }
-    var settingsStrategy by remember { mutableStateOf(DataImporter.ImportStrategy.MERGE) }
-    var keysStrategy by remember { mutableStateOf(DataImporter.ImportStrategy.SKIP) }
-
-    AlertDialog(
-        containerColor = MaterialTheme.colorScheme.surfaceContainer,
-        onDismissRequest = onDismiss,
-        title = { Text(stringResource(R.string.import_preview_title), fontWeight = FontWeight.Bold) },
-        text = {
-            Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
-                Text(
-                    stringResource(R.string.import_from, manifest.exportedAt.take(19).replace("T", " "), manifest.appVersion),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                if (!preview.isSupportedVersion) {
-                    Spacer(Modifier.height(12.dp))
-                    Text(
-                        stringResource(
-                            R.string.import_unsupported_backup_version,
-                            manifest.version,
-                            NativeBackupFormat.CURRENT_VERSION,
-                        ),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error,
-                    )
-                }
-                Spacer(Modifier.height(24.dp))
-
-                if (preview.hasConversationGraph) {
-                    StrategyRow(
-                        stringResource(
-                            R.string.import_conversation_graph_counts,
-                            preview.conversationCount,
-                            preview.taskCount,
-                            preview.loopCount,
-                        ),
-                        convStrategy, { convStrategy = it })
-                    Spacer(Modifier.height(8.dp))
-                }
-                if (preview.memoryCount > 0) {
-                    StrategyRow(
-                        "${stringResource(R.string.export_category_memories)} (${preview.memoryCount})",
-                        memStrategy, { memStrategy = it })
-                    Spacer(Modifier.height(8.dp))
-                }
-                if (preview.systemPromptCount > 0) {
-                    StrategyRow(
-                        "${stringResource(R.string.export_category_system_prompts)} (${preview.systemPromptCount})",
-                        promptStrategy, { promptStrategy = it })
-                    Spacer(Modifier.height(8.dp))
-                }
-                if (preview.settingsPresent) {
-                    StrategyRow(
-                        stringResource(R.string.export_category_settings),
-                        settingsStrategy, { settingsStrategy = it })
-                    Spacer(Modifier.height(8.dp))
-                }
-                if (preview.apiKeysPresent) {
-                    StrategyRow(
-                        stringResource(R.string.export_category_api_keys),
-                        keysStrategy, { keysStrategy = it })
-                    Spacer(Modifier.height(8.dp))
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.Warning, null, modifier = Modifier.size(16.dp),
-                            tint = MaterialTheme.colorScheme.error)
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            stringResource(R.string.import_api_keys_warning),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.error
-                        )
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(
-                onClick = {
-                val decisions = mutableMapOf<DataExporter.ExportCategory, DataImporter.ImportStrategy>()
-                if (preview.hasConversationGraph) {
-                    decisions[DataExporter.ExportCategory.CONVERSATIONS] = convStrategy
-                }
-                if (preview.memoryCount > 0) decisions[DataExporter.ExportCategory.MEMORIES] = memStrategy
-                if (preview.systemPromptCount > 0) decisions[DataExporter.ExportCategory.SYSTEM_PROMPTS] = promptStrategy
-                if (preview.settingsPresent) decisions[DataExporter.ExportCategory.SETTINGS] = settingsStrategy
-                if (preview.apiKeysPresent) decisions[DataExporter.ExportCategory.API_KEYS] = keysStrategy
-                onImport(decisions)
-                },
-                enabled = preview.isSupportedVersion,
-            ) { Text(stringResource(R.string.import_button)) }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text(stringResource(R.string.cancel)) }
-        }
-    )
-}
-
-@Composable
-private fun StrategyRow(
-    label: String,
-    strategy: DataImporter.ImportStrategy,
-    onSelect: (DataImporter.ImportStrategy) -> Unit
-) {
-    Column {
-        Text(label, style = MaterialTheme.typography.bodyMedium)
-        Spacer(Modifier.height(4.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            StrategyChip(stringResource(R.string.import_strategy_merge), strategy == DataImporter.ImportStrategy.MERGE) { onSelect(DataImporter.ImportStrategy.MERGE) }
-            StrategyChip(stringResource(R.string.import_strategy_replace), strategy == DataImporter.ImportStrategy.REPLACE) { onSelect(DataImporter.ImportStrategy.REPLACE) }
-            StrategyChip(stringResource(R.string.import_strategy_skip), strategy == DataImporter.ImportStrategy.SKIP) { onSelect(DataImporter.ImportStrategy.SKIP) }
-        }
-    }
-}
-
-@Composable
-private fun StrategyChip(label: String, selected: Boolean, onClick: () -> Unit) {
-    FilterChip(
-        selected = selected,
-        onClick = onClick,
-        label = { Text(label, style = MaterialTheme.typography.labelSmall) },
-        shape = RoundedCornerShape(50)
-    )
-}
-

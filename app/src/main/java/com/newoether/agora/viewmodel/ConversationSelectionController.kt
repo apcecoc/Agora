@@ -1,6 +1,8 @@
 package com.newoether.agora.viewmodel
 
+import com.newoether.agora.api.DebugProvider
 import com.newoether.agora.data.repository.ConversationRepository
+import com.newoether.agora.data.repository.SettingsRepository
 import com.newoether.agora.model.ChatMessage
 import com.newoether.agora.util.Constants
 import com.newoether.agora.util.DebugLog
@@ -12,10 +14,45 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.withLock
+
+internal fun validChatModels(
+    enabledModels: Set<String>,
+    developerOptionsEnabled: Boolean,
+    debugModelEnabled: Boolean,
+): Set<String> {
+    val ordinaryModels = enabledModels - DebugProvider.MODEL_ID
+    return if (developerOptionsEnabled && debugModelEnabled) {
+        ordinaryModels + DebugProvider.MODEL_ID
+    } else {
+        ordinaryModels
+    }
+}
+
+internal fun SettingsRepository.validChatModels(
+    scope: CoroutineScope,
+): StateFlow<Set<String>?> = flow {
+    awaitInitialLoad()
+    combine(
+        enabledModels,
+        developerOptionsEnabled,
+        debugModelEnabled,
+        ::validChatModels,
+    ).collect { emit(it) }
+}.stateIn(scope, SharingStarted.Eagerly, null)
+
+internal fun resolveValidModel(
+    referencedModel: String?,
+    defaultModel: String,
+    validModels: Set<String>,
+): String = referencedModel
+    ?.takeIf(validModels::contains)
+    ?: defaultModel.takeIf(validModels::contains).orEmpty()
 
 /**
  * Owns the open-conversation projection and its mutually superseding transition Job.
@@ -29,11 +66,11 @@ internal class ConversationSelectionController(
     private val conversations: ConversationRepository,
     private val registry: ConversationStateRegistry,
     defaultModel: StateFlow<String>,
+    validModels: StateFlow<Set<String>?>,
     private val scrollRequests: ScrollRequestCoordinator,
     private val renderStore: () -> ConversationRenderStore,
     private val clearConversationGraph: () -> Unit,
-    private val clearPendingSystemPrompt: () -> Unit,
-    private val clearPendingConversationSettings: () -> Unit,
+    private val workspaces: ConversationWorkspaceStore,
     private val abortRegeneration: () -> Unit,
     private val onTreeMutationCommitted: (String) -> Unit = {},
     private val fadeDelay: suspend () -> Unit = { delay(SWITCH_OVERLAY_FADE_MS) },
@@ -43,17 +80,90 @@ internal class ConversationSelectionController(
 
     private val _currentConversationId = MutableStateFlow<String?>(null)
     val currentConversationId: StateFlow<String?> = _currentConversationId.asStateFlow()
-
-    private val _activeModelOverride = MutableStateFlow<String?>(null)
-    val currentActiveModel: StateFlow<String> = combine(
-        _activeModelOverride,
-        defaultModel,
-    ) { active, fallback ->
-        active ?: fallback
-    }.stateIn(scope, SharingStarted.Eagerly, Constants.EXAMPLE_MODEL_ID)
+    private val _selectedConversationGenerationSnapshot =
+        MutableStateFlow(ConversationGenerationSnapshot())
+    val selectedConversationGenerationSnapshot: StateFlow<ConversationGenerationSnapshot> =
+        _selectedConversationGenerationSnapshot.asStateFlow()
+    private var selectedRuntimeCollectorJob: Job? = null
+    private var selectedRuntimeBindingGeneration = 0L
 
     private val _isNewChatMode = MutableStateFlow(true)
     val isNewChatMode: StateFlow<Boolean> = _isNewChatMode.asStateFlow()
+    private val _activeModelOverride = MutableStateFlow<String?>(null)
+    private val newChatModelId: StateFlow<String?> = workspaces.newChatModelId
+    val currentActiveModel: StateFlow<String> = combine(
+        _activeModelOverride,
+        newChatModelId,
+        _isNewChatMode,
+        defaultModel,
+        validModels,
+    ) { active, newChatModel, isNewChat, fallback, valid ->
+        if (valid == null) {
+            ""
+        } else {
+            val referencedModel = if (isNewChat) active ?: newChatModel else active
+            resolveValidModel(referencedModel, fallback, valid)
+        }
+    }.stateIn(scope, SharingStarted.Eagerly, "")
+
+    init {
+        scope.launch {
+            combine(
+                _activeModelOverride,
+                newChatModelId,
+                _isNewChatMode,
+                defaultModel,
+                validModels,
+            ) { active, stored, isNewChat, fallback, valid ->
+                if (isNewChat && active == null && valid != null) {
+                    reconcileNewChatModel(stored, fallback, valid)
+                }
+            }.collect { }
+        }
+        scope.launch {
+            combine(
+                _activeModelOverride,
+                _currentConversationId,
+                _isNewChatMode,
+                defaultModel,
+                validModels,
+            ) { active, conversationId, isNewChat, fallback, valid ->
+                if (!isNewChat && conversationId != null && valid != null) {
+                    reconcileConversationModel(conversationId, active, fallback, valid)
+                }
+            }.collect { }
+        }
+    }
+
+    private fun reconcileNewChatModel(
+        referencedModel: String?,
+        defaultModel: String,
+        validModels: Set<String>,
+    ) {
+        if (referencedModel == null || referencedModel in validModels) return
+        if (!_isNewChatMode.value || _activeModelOverride.value != null) return
+        if (newChatModelId.value != referencedModel) return
+        workspaces.setModel(
+            NEW_CHAT_WORKSPACE_ID,
+            resolveValidModel(referencedModel, defaultModel, validModels)
+                .takeIf(String::isNotBlank),
+        )
+    }
+
+    private fun reconcileConversationModel(
+        conversationId: String,
+        referencedModel: String?,
+        defaultModel: String,
+        validModels: Set<String>,
+    ) {
+        if (referencedModel == null || referencedModel in validModels) return
+        if (_isNewChatMode.value || _currentConversationId.value != conversationId) return
+        if (_activeModelOverride.value != referencedModel) return
+        val resolvedModel = resolveValidModel(referencedModel, defaultModel, validModels)
+            .takeIf(String::isNotBlank)
+        _activeModelOverride.value = resolvedModel
+        workspaces.setModel(conversationId, resolvedModel)
+    }
 
     private val _newChatEntryId = MutableStateFlow(1L)
     val newChatEntryId: StateFlow<Long> = _newChatEntryId.asStateFlow()
@@ -65,11 +175,55 @@ internal class ConversationSelectionController(
     val isSwitching: StateFlow<Boolean> = switching.isSwitching
     val switchingScrollRequest: StateFlow<SwitchingScrollRequest?> = switching.request
 
-    /** Publish a first Send only after its conversation/Run/message graph is durable. */
-    fun publishAcceptedConversation(conversationId: String) {
-        require(conversationId.isNotBlank())
+    private fun publishSelectedConversation(conversationId: String?) {
+        selectedRuntimeBindingGeneration += 1L
+        val bindingGeneration = selectedRuntimeBindingGeneration
+        selectedRuntimeCollectorJob?.cancel()
+        if (conversationId == null) {
+            _selectedConversationGenerationSnapshot.value = ConversationGenerationSnapshot()
+            _currentConversationId.value = null
+            selectedRuntimeCollectorJob = null
+            return
+        }
+        val runtimeSnapshot = registry.getOrCreate(conversationId).generationSnapshot
+        _selectedConversationGenerationSnapshot.value = runtimeSnapshot.value
         _currentConversationId.value = conversationId
+        selectedRuntimeCollectorJob = scope.launch {
+            runtimeSnapshot.collect { snapshot ->
+                if (
+                    _currentConversationId.value == conversationId &&
+                    selectedRuntimeBindingGeneration == bindingGeneration
+                ) {
+                    _selectedConversationGenerationSnapshot.value = snapshot
+                }
+            }
+        }
+    }
+
+    /** Publish a first Send only after its conversation/Run/message graph is durable. */
+    fun publishAcceptedConversation(conversationId: String, modelId: String) {
+        require(conversationId.isNotBlank())
+        require(modelId.isNotBlank())
+        _activeModelOverride.value = modelId
+        publishSelectedConversation(conversationId)
         _isNewChatMode.value = false
+    }
+
+    fun publishAcceptedConversationIfOriginStillOpen(
+        conversationId: String,
+        modelId: String,
+        originNewChatEntryId: Long,
+    ): Boolean {
+        if (
+            !_isNewChatMode.value ||
+            _currentConversationId.value != null ||
+            _newChatEntryId.value != originNewChatEntryId ||
+            switching.isSwitching.value
+        ) {
+            return false
+        }
+        publishAcceptedConversation(conversationId, modelId)
+        return true
     }
 
     fun replaceActiveModelReference(oldModelId: String, newModelId: String?) {
@@ -80,48 +234,108 @@ internal class ConversationSelectionController(
 
     fun setActiveModel(model: String) {
         _activeModelOverride.value = model
-        _currentConversationId.value?.let { conversationId ->
-            scope.launch {
-                conversations.getConversation(conversationId)?.let { current ->
-                    conversations.upsertConversation(current.copy(modelId = model))
-                }
-            }
+        val conversationId = _currentConversationId.value
+        if (_isNewChatMode.value || conversationId == null) {
+            workspaces.setModel(NEW_CHAT_WORKSPACE_ID, model)
+        } else {
+            workspaces.setModel(conversationId, model)
         }
     }
 
-    fun createNewChat() {
+    fun createNewChat() = createNewChat(force = false)
+
+    /** Cancels any stale selection and republishes New Chat even when it is already projected. */
+    fun restoreNewChatDestination(onFailure: (() -> Unit)? = null) =
+        createNewChat(force = true, onFailure = onFailure)
+
+    private fun createNewChat(force: Boolean, onFailure: (() -> Unit)? = null) {
         // Drawer and top-bar actions are the same no-op while already on New Chat.
-        if (_isNewChatMode.value) return
+        if (!force && _isNewChatMode.value) return
         abortRegeneration()
         val previousJob = switchingJob
-        val request = switching.beginNewChat()
+        val request = switching.beginNewChat(onFailure)
         previousJob?.cancel()
-        clearPendingSystemPrompt()
         _newChatEntryId.value += 1L
         _isNewChatMode.value = true
         _isTransitioningToNewChat.value = true
         scrollRequests.clear()
         switchingJob = scope.launch {
+            var completed = false
             try {
                 fadeDelay()
                 if (!switching.isCurrent(request.id)) return@launch
-                _currentConversationId.value = null
+                publishSelectedConversation(null)
                 _activeModelOverride.value = null
-                clearPendingConversationSettings()
                 clearConversationGraph()
+                completed = true
             } finally {
-                if (switching.complete(request.id)) {
+                if (switching.complete(request.id, successful = completed)) {
                     _isTransitioningToNewChat.value = false
                 }
             }
         }
     }
 
+    fun settleDeletedSelectedConversation(conversationId: String, parentConversationId: String? = null) {
+        require(conversationId.isNotBlank())
+        if (_isNewChatMode.value) return
+        val pendingRequest = switching.request.value
+        if (
+            pendingRequest?.kind == SwitchingRequestKind.CONVERSATION &&
+            pendingRequest.conversationId != conversationId
+        ) {
+            return
+        }
+        if (
+            pendingRequest?.kind != SwitchingRequestKind.CONVERSATION &&
+            _currentConversationId.value?.let { it != conversationId } == true
+        ) {
+            return
+        }
+        if (parentConversationId == null) {
+            createNewChat()
+        } else {
+            selectConversation(
+                conversationId = parentConversationId,
+                hapticOnCompletion = false,
+                force = true,
+                onFailure = {
+                    // Superseding navigation owns the active request and must not be replaced.
+                    if (!switching.isSwitching.value) createNewChat()
+                },
+            )
+        }
+    }
+
     fun selectConversation(
         conversationId: String,
         hapticOnCompletion: Boolean = true,
+    ) = selectConversation(
+        conversationId = conversationId,
+        hapticOnCompletion = hapticOnCompletion,
+        force = false,
+    )
+
+    /** Supersedes stale history loads even when the origin is still the published destination. */
+    fun restoreConversationDestination(
+        conversationId: String,
+        onFailure: (() -> Unit)? = null,
+    ) =
+        selectConversation(
+            conversationId = conversationId,
+            hapticOnCompletion = false,
+            force = true,
+            onFailure = onFailure,
+        )
+
+    private fun selectConversation(
+        conversationId: String,
+        hapticOnCompletion: Boolean,
+        force: Boolean,
+        onFailure: (() -> Unit)? = null,
     ) {
         if (
+            !force &&
             _currentConversationId.value == conversationId &&
             !_isNewChatMode.value
         ) {
@@ -129,7 +343,7 @@ internal class ConversationSelectionController(
         }
         abortRegeneration()
         val previousJob = switchingJob
-        val request = switching.beginConversation(conversationId, hapticOnCompletion)
+        val request = switching.beginConversation(conversationId, hapticOnCompletion, onFailure)
         previousJob?.cancel()
         _isTransitioningToNewChat.value = false
         scrollRequests.clear()
@@ -144,7 +358,7 @@ internal class ConversationSelectionController(
                     return@launch
                 }
                 _isNewChatMode.value = false
-                _currentConversationId.value = conversationId
+                publishSelectedConversation(conversationId)
                 _activeModelOverride.value = conversation.modelId
                 switching.markConversationReady(request.id)
             } catch (error: CancellationException) {
@@ -232,11 +446,34 @@ internal class ConversationSelectionController(
 
     /** Begins the same UI transition for edit/delete services without exposing the coordinator. */
     suspend fun beginTreeMutation(scrollToTarget: Boolean = true): Long? {
-        val request = _currentConversationId.value?.let { conversationId ->
-            switching.beginTreeMutation(conversationId, scrollToTarget)
+        val conversationId = _currentConversationId.value ?: return null
+        return beginTreeMutation(conversationId, scrollToTarget)
+    }
+
+    /**
+     * Starts a mutation overlay only while [conversationId] is still the published destination.
+     * This prevents a delayed delete coroutine from covering a newer, rapidly selected chat.
+     */
+    suspend fun beginTreeMutation(
+        conversationId: String,
+        scrollToTarget: Boolean = true,
+    ): Long? {
+        if (_currentConversationId.value != conversationId || _isNewChatMode.value) return null
+        val pendingRequest = switching.request.value
+        if (
+            pendingRequest?.kind == SwitchingRequestKind.CONVERSATION &&
+            pendingRequest.conversationId != conversationId
+        ) {
+            return null
         }
-        fadeDelay()
-        return request?.id
+        val request = switching.beginTreeMutation(conversationId, scrollToTarget)
+        try {
+            fadeDelay()
+            return request.id
+        } catch (error: Exception) {
+            switching.complete(request.id, successful = false)
+            throw error
+        }
     }
 
     fun markTreeMutationReady(requestId: Long?, targetMessageId: String?) {
@@ -262,7 +499,7 @@ internal class ConversationSelectionController(
     fun failSwitchingScroll(requestId: Long, reason: String) {
         if (!switching.isCurrent(requestId)) return
         DebugLog.e("ConversationSelection", "Switching scroll did not settle: $reason")
-        switching.complete(requestId)
+        switching.complete(requestId, successful = false)
     }
 
     fun failConversationLoad(conversationId: String) {

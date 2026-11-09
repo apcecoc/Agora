@@ -3,34 +3,8 @@ package com.newoether.agora.ui.components
 import android.graphics.Bitmap
 import android.graphics.Canvas
 
-import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.tween
-import androidx.compose.foundation.layout.size
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.geometry.isUnspecified
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.ImageBitmap
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.graphics.drawscope.DrawScope
-import androidx.compose.ui.graphics.painter.ColorPainter
-import androidx.compose.ui.graphics.painter.Painter
-import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.unit.Density
-import androidx.compose.ui.unit.IntSize
-import com.mikepenz.markdown.model.ImageData
-import com.mikepenz.markdown.model.ImageTransformer
-import com.mikepenz.markdown.model.ImageWidth
-import com.mikepenz.markdown.model.PlaceholderConfig
-import androidx.compose.ui.text.PlaceholderVerticalAlign
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
@@ -38,14 +12,26 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import org.scilab.forge.jlatexmath.DefaultTeXFont
+import org.scilab.forge.jlatexmath.TeXConstants
 import ru.noties.jlatexmath.JLatexMathDrawable
+import com.newoether.agora.util.DebugLog
 import kotlin.io.encoding.Base64
 import kotlin.math.roundToInt
 
+// The log tag for this file's own diagnostics.
+private const val TAG = "LatexRenderer"
+
+/**
+ * One parsed piece of message text. A LaTeX span also keeps [source]: its exact original slice,
+ * delimiters included, plus any whitespace removed next to an inline formula, so copying the
+ * rendered formula reproduces the original text.
+ */
 data class LatexSpan(
     val isLatex: Boolean,
     val content: String,
     val display: Boolean = false,
+    val source: String = content,
 )
 
 // ── Patterns ──────────────────────────────────────────────────────────
@@ -85,9 +71,10 @@ private const val LATEX_URL_INLINE = "inline/"
 private const val LATEX_URL_DISPLAY = "display/"
 private val LATEX_BASE64 = Base64.UrlSafe
 
-private data class LatexImageRequest(
+internal data class LatexImageRequest(
     val latex: String,
     val display: Boolean,
+    val source: String,
 )
 
 private data class ProtectedRange(
@@ -200,31 +187,13 @@ fun String.escapeDollarForMarkdown(): String = buildString {
         }
         val protected = protectedRanges.getOrNull(protectedIndex)
         if (protected != null && i >= protected.start) {
-            append(src.substring(i, protected.endExclusive))
+            append(src, i, protected.endExclusive)
             i = protected.endExclusive
             protectedIndex++
             continue
         }
 
         val ch = src[i]
-        val remaining = src.substring(i)
-
-        // ``` fenced code block — pass through
-        if (remaining.startsWith("```")) {
-            val end = remaining.indexOf("```", 3)
-            if (end >= 0) {
-                append(remaining.substring(0, end + 3))
-                i += end + 3; continue
-            }
-        }
-        // ` inline code — pass through
-        if (ch == '`') {
-            val end = remaining.indexOf('`', 1)
-            if (end >= 0) {
-                append(remaining.substring(0, end + 1))
-                i += end + 1; continue
-            }
-        }
         // Bare $ → \$ (but not already-escaped \$)
         if (ch == '$' && (i == 0 || src[i - 1] != '\\')) {
             append('\\')
@@ -251,44 +220,21 @@ fun parseLatexSpans(
         }
         val protected = protectedRanges.getOrNull(protectedIndex)
         if (protected != null && i >= protected.start) {
-            buf.append(text.substring(i, protected.endExclusive))
+            buf.append(text, i, protected.endExclusive)
             i = protected.endExclusive
             protectedIndex++
             continue
         }
 
-        val remaining = text.substring(i)
-
-        // ``` fenced code block — skip until closing ```
-        if (remaining.startsWith("```")) {
-            val end = remaining.indexOf("```", 3)
-            if (end >= 0) {
-                if (buf.isNotEmpty()) { spans.add(LatexSpan(false, buf.toString())); buf.clear() }
-                spans.add(LatexSpan(false, remaining.substring(0, end + 3)))
-                i += end + 3
-                continue
-            }
-        }
-
-        // ` inline code — skip until closing `
-        if (remaining[0] == '`' && !remaining.startsWith("```")) {
-            val end = remaining.indexOf('`', 1)
-            if (end >= 0) {
-                buf.append(remaining.substring(0, end + 1))
-                i += end + 1
-                continue
-            }
-        }
-
         // $$ display math
-        if (remaining.startsWith("$$")) {
-            val end = remaining.indexOf("$$", 2)
+        if (text.startsWith("$$", i)) {
+            val end = text.indexOf("$$", startIndex = i + 2)
             if (end >= 0) {
-                val latex = remaining.substring(2, end).trim()
+                val latex = text.substring(i + 2, end).trim()
                 if (latex.isNotBlank() && nonAsciiInsideBraces(latex)) {
                     if (buf.isNotEmpty()) { spans.add(LatexSpan(false, buf.toString())); buf.clear() }
-                    spans.add(LatexSpan(true, latex, true))
-                    i += end + 2
+                    spans.add(LatexSpan(true, latex, true, text.substring(i, end + 2)))
+                    i = end + 2
                     continue
                 } else if (latex.isNotBlank()) {
                     // Invalid display candidate. Keep recovery local so a stray
@@ -304,14 +250,14 @@ fun parseLatexSpans(
         }
 
         // \[ display math
-        if (remaining.startsWith("\\[")) {
-            val end = remaining.indexOf("\\]", 2)
+        if (text.startsWith("\\[", i)) {
+            val end = text.indexOf("\\]", startIndex = i + 2)
             if (end >= 0) {
-                val latex = remaining.substring(2, end).trim()
+                val latex = text.substring(i + 2, end).trim()
                 if (latex.isNotBlank() && nonAsciiInsideBraces(latex)) {
                     if (buf.isNotEmpty()) { spans.add(LatexSpan(false, buf.toString())); buf.clear() }
-                    spans.add(LatexSpan(true, latex, true))
-                    i += end + 2
+                    spans.add(LatexSpan(true, latex, true, text.substring(i, end + 2)))
+                    i = end + 2
                     continue
                 } else if (latex.isNotBlank()) {
                     buf.append("\\[")
@@ -325,14 +271,14 @@ fun parseLatexSpans(
         }
 
         // \( inline math
-        if (remaining.startsWith("\\(")) {
-            val end = remaining.indexOf("\\)", 2)
+        if (text.startsWith("\\(", i)) {
+            val end = text.indexOf("\\)", startIndex = i + 2)
             if (end >= 0) {
-                val latex = remaining.substring(2, end).trim()
+                val latex = text.substring(i + 2, end).trim()
                 if (latex.isNotBlank() && nonAsciiInsideBraces(latex)) {
                     if (buf.isNotEmpty()) { spans.add(LatexSpan(false, buf.toString())); buf.clear() }
-                    spans.add(LatexSpan(true, latex, false))
-                    i += end + 2
+                    spans.add(LatexSpan(true, latex, false, text.substring(i, end + 2)))
+                    i = end + 2
                     continue
                 } else if (latex.isNotBlank()) {
                     buf.append("\\(")
@@ -346,21 +292,23 @@ fun parseLatexSpans(
         }
 
         // $ inline math — skip if preceded by \ (escaped)
-        if (parseInlineDollarMath && remaining[0] == '$' && !remaining.startsWith("$$")) {
+        if (parseInlineDollarMath && text[i] == '$' && !text.startsWith("$$", i)) {
             val prevChar = if (i > 0) text[i - 1] else ' '
             if (prevChar != '\\') {
                 // Find real closing $ on the same line (skip escaped \$)
-                val lineEnd = remaining.indexOf('\n').let { if (it < 0) remaining.length else it }
-                var end = remaining.indexOf('$', 1)
-                while (end in 1..<lineEnd && remaining[end - 1] == '\\') {
-                    end = remaining.indexOf('$', end + 1)
+                val newline = text.indexOf('\n', startIndex = i + 1)
+                val lineEnd = if (newline < 0) text.length else newline
+                var end = text.indexOf('$', startIndex = i + 1)
+                while (end in (i + 1)..<lineEnd && text[end - 1] == '\\') {
+                    end = text.indexOf('$', startIndex = end + 1)
                 }
-                if (end in 1..<lineEnd) {
-                    val latex = remaining.substring(1, end).trim()
+                if (end in (i + 1)..<lineEnd) {
+                    val latex = text.substring(i + 1, end).trim()
                     if (latex.isNotEmpty() && isLikelyLatex(latex)) {
                         if (buf.isNotEmpty()) { spans.add(LatexSpan(false, buf.toString())); buf.clear() }
-                        spans.add(LatexSpan(true, latex, false))
-                        i += end + 1; continue
+                        spans.add(LatexSpan(true, latex, false, text.substring(i, end + 1)))
+                        i = end + 1
+                        continue
                     }
                     // Content looks like prose → only treat the opening $ as literal.
                     // Don't consume the closing $ — it may belong to a valid LaTeX pair later.
@@ -377,13 +325,13 @@ fun parseLatexSpans(
         }
 
         // Escaped \$ → literal $
-        if (remaining.startsWith("\\$")) {
+        if (text.startsWith("\\$", i)) {
             buf.append('$')
             i += 2
             continue
         }
 
-        buf.append(remaining[0])
+        buf.append(text[i])
         i++
     }
     if (buf.isNotEmpty()) spans.add(LatexSpan(false, buf.toString()))
@@ -396,18 +344,29 @@ fun parseLatexSpans(
         }
     }
 
-    // Trim whitespace around inline LaTeX spans
+    // Trim whitespace around inline LaTeX spans. The removed whitespace moves into the formula's
+    // source so a copy of the rendered text still equals the original.
     for (idx in spans.indices) {
         val span = spans[idx]
         if (span.isLatex && !span.display) {
+            var source = span.source
             if (idx > 0) {
                 val prev = spans[idx - 1]
-                if (!prev.isLatex) spans[idx - 1] = prev.copy(content = prev.content.trimEnd())
+                if (!prev.isLatex) {
+                    val trimmed = prev.content.trimEnd()
+                    source = prev.content.substring(trimmed.length) + source
+                    spans[idx - 1] = prev.copy(content = trimmed)
+                }
             }
             if (idx + 1 < spans.size) {
                 val next = spans[idx + 1]
-                if (!next.isLatex) spans[idx + 1] = next.copy(content = next.content.trimStart())
+                if (!next.isLatex) {
+                    val trimmed = next.content.trimStart()
+                    source += next.content.substring(0, next.content.length - trimmed.length)
+                    spans[idx + 1] = next.copy(content = trimmed)
+                }
             }
+            spans[idx] = span.copy(source = source)
         }
     }
 
@@ -433,13 +392,46 @@ fun renderLatexToBitmap(
         val ih = drawable.intrinsicHeight
         val w = maxOf(iw.takeIf { it > 0 } ?: fallbackW, minW)
         val h = ih.takeIf { it > 0 } ?: fallbackH
-        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bmp)
+        // Placeholders are centered on the text, so pad above or below until the TeX math axis
+        // (where fraction bars and the minus sign sit) is the bitmap's vertical center.
+        val padding = if (ih > 0) mathAxisCenteringPadding(drawable, textSize, h) else AxisPadding(0, 0)
+        val bmp = Bitmap.createBitmap(w, h + padding.top + padding.bottom, Bitmap.Config.ARGB_8888)
+        val canvas = FilledTextCanvas(bmp)
+        canvas.translate(0f, padding.top.toFloat())
         drawable.setBounds(0, 0, w, h)
         drawable.draw(canvas)
         bmp
     } catch (e: Exception) {
+        // A swallowed exception here is what turns a formula back into its own source text, so the
+        // failure has to reach the log or it is invisible: the caller only ever sees a null and
+        // silently paints the raw LaTeX. Only the exception type and stack are logged, never the
+        // formula itself.
+        DebugLog.w(TAG, "latex render failed size=$textSize", e)
         null
+    }
+}
+
+internal data class AxisPadding(val top: Int, val bottom: Int)
+
+/**
+ * The transparent rows to add so the math axis lands on the vertical center of a formula of
+ * [height] pixels. The axis is the formula font's axis height above the icon's baseline.
+ */
+private fun mathAxisCenteringPadding(drawable: JLatexMathDrawable, textSize: Float, height: Int): AxisPadding {
+    val icon = drawable.icon()
+    val baselineY = icon.baseLine * height
+    val axisHeight = DefaultTeXFont(textSize).getAxisHeight(TeXConstants.STYLE_DISPLAY) * textSize
+    return axisCenteringPadding(axisY = baselineY - axisHeight, height = height)
+}
+
+/** Rows above and below that move [axisY] (pixels from the top) to the center of the result. */
+internal fun axisCenteringPadding(axisY: Float, height: Int): AxisPadding {
+    val above = axisY.coerceIn(0f, height.toFloat())
+    val below = height - above
+    return if (above < below) {
+        AxisPadding(top = (below - above).roundToInt(), bottom = 0)
+    } else {
+        AxisPadding(top = 0, bottom = (above - below).roundToInt())
     }
 }
 
@@ -450,10 +442,12 @@ fun canRenderLatex(latex: String): Boolean {
     } catch (_: Exception) { false }
 }
 
-private fun encodeLatexUrl(latex: String, display: Boolean = false): String {
+// latex://<mode>/<base64 latex>/<base64 source>. URL-safe Base64 never contains '/'.
+private fun encodeLatexUrl(latex: String, display: Boolean, source: String): String {
     val mode = if (display) LATEX_URL_DISPLAY else LATEX_URL_INLINE
     val encoded = LATEX_BASE64.encode(latex.toByteArray(Charsets.UTF_8))
-    return "$mode$encoded"
+    val encodedSource = LATEX_BASE64.encode(source.toByteArray(Charsets.UTF_8))
+    return "$mode$encoded/$encodedSource"
 }
 
 private fun decodeLatexUrl(encoded: String): String {
@@ -468,19 +462,40 @@ private fun decodeLatexLink(link: String): LatexImageRequest? {
         payload.startsWith(LATEX_URL_INLINE) -> false to payload.removePrefix(LATEX_URL_INLINE)
         else -> false to payload
     }
+    val parts = encoded.split('/')
+    if (parts.size != 2) return null
     return try {
-        LatexImageRequest(decodeLatexUrl(encoded), display)
+        LatexImageRequest(decodeLatexUrl(parts[0]), display, decodeLatexUrl(parts[1]))
     } catch (_: Exception) {
         null
     }
 }
 
-fun inlineLatexToMarkdown(latexContent: String): String {
-    return latexToMarkdown(latexContent, display = false)
+internal fun isDisplayLatexLink(link: String?): Boolean {
+    return link?.let(::decodeLatexLink)?.display == true
 }
 
-fun latexToMarkdown(latexContent: String, display: Boolean): String {
-    val image = "![latex]($LATEX_URL_PREFIX${encodeLatexUrl(latexContent, display)})"
+/** The original text a rendered formula stands for, or null when [link] is not a LaTeX link. */
+internal fun latexSourceForLink(link: String): String? = decodeLatexLink(link)?.source
+
+/**
+ * The formula an image stands for, from its latex:// URL or from its source text. The markdown
+ * renderer hands an inline image's alternate text, not its URL, to the image transformer, and a
+ * formula's alternate text is its source (so copying it reproduces the original). The source
+ * holds exactly one formula, so parsing it gives the same request its URL encodes.
+ */
+internal fun latexImageRequest(linkOrSource: String): LatexImageRequest? =
+    decodeLatexLink(linkOrSource) ?: latexRequestForSource(restoreFormulaLineBreaks(linkOrSource))
+
+private fun latexRequestForSource(source: String): LatexImageRequest? {
+    val spans = parseLatexSpans(source, parseInlineDollarMath = true)
+    val formula = spans.singleOrNull { it.isLatex } ?: return null
+    if (spans.any { !it.isLatex && it.content.isNotBlank() }) return null
+    return LatexImageRequest(formula.content, formula.display, source)
+}
+
+fun latexToMarkdown(latexContent: String, display: Boolean, source: String): String {
+    val image = "![latex]($LATEX_URL_PREFIX${encodeLatexUrl(latexContent, display, source)})"
     return if (display) "\n\n$image\n\n" else image
 }
 
@@ -500,13 +515,13 @@ private fun renderTextToBitmap(text: String, textSize: Float, color: Int): Bitma
     return bmp
 }
 
-private data class LatexRenderKey(
+internal data class LatexRenderKey(
     val latex: String,
     val textSize: Float,
     val color: Int,
 )
 
-private object LatexBitmapCache {
+internal object LatexBitmapCache {
     private const val MAX_ENTRIES = 128
 
     private val lock = Any()
@@ -517,10 +532,15 @@ private object LatexBitmapCache {
             return size > MAX_ENTRIES
         }
     }
+    // Rendered sizes as snapshot state, so layout decisions that depend on a formula's size
+    // recompose when its bitmap finishes. Sizes outlive evicted bitmaps; a re-render is identical.
+    private val renderedSizes = mutableStateMapOf<LatexRenderKey, Size>()
 
     fun get(key: LatexRenderKey): Bitmap? = synchronized(lock) {
         bitmaps[key]
     }
+
+    fun observedSize(key: LatexRenderKey): Size? = renderedSizes[key]
 
     fun renderAsync(key: LatexRenderKey): Deferred<Bitmap> = synchronized(lock) {
         bitmaps[key]?.let { return CompletableDeferred(it) }
@@ -531,6 +551,7 @@ private object LatexBitmapCache {
         renderScope.launch {
             try {
                 val rendered = renderBitmap(key)
+                renderedSizes[key] = Size(rendered.width.toFloat(), rendered.height.toFloat())
                 synchronized(lock) {
                     bitmaps[key] = rendered
                     if (inFlight[key] === deferred) {
@@ -577,7 +598,7 @@ private object LatexBitmapCache {
     }
 }
 
-private fun estimateLatexPlaceholderSize(latex: String, textSize: Float, display: Boolean): Size {
+internal fun estimateLatexPlaceholderSize(latex: String, textSize: Float, display: Boolean): Size {
     val charCount = latex.length.coerceAtLeast(1)
     val minWidth = textSize * if (display) 4f else 1.4f
     val maxWidth = textSize * if (display) 18f else 8f
@@ -585,107 +606,4 @@ private fun estimateLatexPlaceholderSize(latex: String, textSize: Float, display
         .coerceIn(minWidth, maxWidth)
     val height = textSize * if (display) 1.45f else 1.05f
     return Size(width, height)
-}
-
-// ── Image transformer ──────────────────────────────────────────────────
-
-class LatexImageTransformer(
-    private val textSize: Float = 40f,
-    private val color: Int = 0xFF000000.toInt(),
-) : ImageTransformer {
-    @Composable
-    override fun transform(link: String): ImageData? {
-        val request = decodeLatexLink(link) ?: return null
-        val key = LatexRenderKey(request.latex, textSize, color)
-        var bitmap by remember(key) { mutableStateOf(LatexBitmapCache.get(key)) }
-        val fade = remember(key) { Animatable(if (bitmap != null) 1f else 0f) }
-        LaunchedEffect(key) {
-            val cached = LatexBitmapCache.get(key)
-            if (cached != null) {
-                bitmap = cached
-                fade.snapTo(1f)
-                return@LaunchedEffect
-            }
-
-            bitmap = null
-            fade.snapTo(0f)
-            val rendered = try {
-                LatexBitmapCache.awaitRendered(key)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Throwable) {
-                null
-            }
-            if (rendered != null) {
-                bitmap = rendered
-                fade.snapTo(0f)
-                fade.animateTo(1f, tween(durationMillis = 180))
-            }
-        }
-        val bmp: Bitmap? = bitmap
-        val density = LocalDensity.current
-        val placeholderModifier = if (bmp == null) {
-            val estimated = estimateLatexPlaceholderSize(request.latex, textSize, request.display)
-            with(density) {
-                Modifier.size(estimated.width.toDp(), estimated.height.toDp())
-            }
-        } else {
-            Modifier
-        }
-        return ImageData(
-            painter = bmp?.let { FadingBitmapPainter(it.asImageBitmap(), fade.value) }
-                ?: ColorPainter(Color.Transparent),
-            contentDescription = request.latex,
-            modifier = placeholderModifier,
-            alignment = Alignment.CenterStart,
-            contentScale = ContentScale.Fit,
-        )
-    }
-
-    override fun placeholderConfig(
-        link: String,
-        density: Density,
-        containerSize: Size,
-        imageWidth: ImageWidth,
-        imageSize: Size,
-        imageSizeChanged: ((link: String, Size) -> Unit)?,
-    ): PlaceholderConfig {
-        val request = decodeLatexLink(link) ?: return super.placeholderConfig(
-            link, density, containerSize, imageWidth, imageSize, imageSizeChanged
-        )
-        val key = LatexRenderKey(request.latex, textSize, color)
-        val resolvedSize = if (imageSize.isUnspecified) {
-            LatexBitmapCache.get(key)?.let { bmp ->
-                Size(bmp.width.toFloat(), bmp.height.toFloat())
-            } ?: estimateLatexPlaceholderSize(request.latex, textSize, request.display)
-        } else {
-            imageSize
-        }
-        val sizeDp = with(density) {
-            Size(
-                width = resolvedSize.width.toDp().value,
-                height = resolvedSize.height.toDp().value,
-            )
-        }
-        return PlaceholderConfig(size = sizeDp, verticalAlign = PlaceholderVerticalAlign.TextCenter)
-    }
-}
-
-private class FadingBitmapPainter(
-    private val image: ImageBitmap,
-    private val alpha: Float,
-) : Painter() {
-    override val intrinsicSize: Size
-        get() = Size(image.width.toFloat(), image.height.toFloat())
-
-    override fun DrawScope.onDraw() {
-        drawImage(
-            image = image,
-            dstSize = IntSize(
-                width = size.width.roundToInt().coerceAtLeast(1),
-                height = size.height.roundToInt().coerceAtLeast(1),
-            ),
-            alpha = alpha.coerceIn(0f, 1f),
-        )
-    }
 }

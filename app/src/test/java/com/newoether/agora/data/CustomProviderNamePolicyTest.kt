@@ -18,6 +18,7 @@ class CustomProviderNamePolicyTest {
             Constants.PROVIDER_GROQ,
             Constants.PROVIDER_OLLAMA,
             Constants.PROVIDER_OPEN_ROUTER,
+            Constants.PROVIDER_OPENCODE_GO,
             Constants.PROVIDER_LOCAL,
         )
 
@@ -47,6 +48,22 @@ class CustomProviderNamePolicyTest {
                 existingNames = listOf("Example"),
             ),
         )
+    }
+
+    @Test
+    fun creationRejectsTrimmedReservedAndNewlyAddedNamesWithoutMutatingTheList() {
+        val names = mutableListOf("Existing")
+        assertFalse(CustomProviderNamePolicy.hasConflict("  Gateway  ", names))
+
+        names += "Gateway"
+        val snapshot = names.toList()
+
+        assertTrue(CustomProviderNamePolicy.hasConflict("  gAtEwAy  ", names))
+        assertTrue(CustomProviderNamePolicy.hasConflict("  openai  ", names))
+        assertTrue(CustomProviderNamePolicy.hasConflict("  LOCAL  ", names))
+        assertTrue(CustomProviderNamePolicy.hasConflict("   ", names))
+        assertFalse(CustomProviderNamePolicy.hasConflict("  Another Gateway  ", names))
+        assertEquals(snapshot, names)
     }
 
     @Test

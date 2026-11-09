@@ -2,6 +2,8 @@ package com.newoether.agora.viewmodel
 
 import com.newoether.agora.data.local.ChatEntity
 import com.newoether.agora.data.repository.ConversationRepository
+import com.newoether.agora.model.AttachmentImportState
+import com.newoether.agora.model.ImageArtifact
 import com.newoether.agora.model.SelectedAttachment
 import com.newoether.agora.util.DebugLog
 import io.mockk.Runs
@@ -12,6 +14,7 @@ import io.mockk.just
 import io.mockk.mockk
 import io.mockk.mockkObject
 import io.mockk.unmockkObject
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -51,9 +54,37 @@ class ComposerDraftControllerTest {
                 Json.encodeToString(listOf(newAttachment)),
             )
         }
-        coVerify(exactly = 1) {
+        coVerify(exactly = 0) {
             repository.deleteUnreferencedDraftAttachmentFiles(listOf(oldAttachment))
         }
+    }
+
+    @Test
+    fun `cache eviction reloads durable state without writing or reclaiming`() = runTest {
+        val repository = mockk<ConversationRepository>()
+        coEvery { repository.getConversation(CONVERSATION_ID) } returnsMany listOf(
+            chat(text = "initial"),
+            chat(text = "external"),
+        )
+        coEvery { repository.updateDraft(any(), any(), any()) } returns Unit
+        coEvery { repository.deleteUnreferencedDraftAttachmentFiles(any()) } returns Unit
+        val controller = ComposerDraftController(repository)
+        val loaded = controller.load(CONVERSATION_ID)
+        val persisted = controller.persist(
+            conversationId = CONVERSATION_ID,
+            expectedRevision = loaded.revision,
+            text = "cached",
+            attachments = emptyList(),
+        )
+
+        controller.evictCached(CONVERSATION_ID)
+        val reloaded = controller.load(CONVERSATION_ID)
+
+        assertEquals(1L, persisted.revision)
+        assertEquals(LoadedComposerDraft("external", emptyList(), 0L), reloaded)
+        coVerify(exactly = 2) { repository.getConversation(CONVERSATION_ID) }
+        coVerify(exactly = 1) { repository.updateDraft(CONVERSATION_ID, "cached", null) }
+        coVerify(exactly = 0) { repository.deleteUnreferencedDraftAttachmentFiles(any()) }
     }
 
     @Test
@@ -152,13 +183,89 @@ class ComposerDraftControllerTest {
                 attachments = listOf(attachment),
             )
 
-            assertEquals(listOf(attachment), cleared)
+            assertEquals(
+                DraftClearResult(
+                    attachments = listOf(attachment),
+                    revision = 1L,
+                    succeeded = true,
+                ),
+                cleared,
+            )
             assertEquals(1L, staleTailFlush.revision)
             assertTrue(staleTailFlush.succeeded)
             assertFalse(staleTailFlush.matchesRequested)
             coVerify(exactly = 1) { repository.updateDraft(CONVERSATION_ID, "", null) }
             coVerify(exactly = 0) { repository.deleteUnreferencedDraftAttachmentFiles(any()) }
         }
+
+    @Test
+    fun `legacy attachments without import state are upgraded instead of silently ready`() =
+        runTest {
+            val repository = mockk<ConversationRepository>()
+            val raw = """[
+                {"localId":"image","uri":"content://legacy/image","type":"image"},
+                {"localId":"video","uri":"content://legacy/video","type":"video","localPath":"/private/video"},
+                {"localId":"pdf","uri":"content://legacy/pdf","type":"pdf","localPath":"/private/pdf"},
+                {"localId":"file","uri":"content://legacy/file","type":"file","localPath":"/private/file"}
+            ]""".trimIndent()
+            coEvery { repository.getConversation(CONVERSATION_ID) } returns ChatEntity(
+                id = CONVERSATION_ID,
+                title = "Conversation",
+                draftText = "legacy",
+                draftAttachments = raw,
+            )
+            coEvery { repository.updateDraft(any(), any(), any()) } returns Unit
+
+            val loaded = ComposerDraftController(repository).load(CONVERSATION_ID)
+
+            assertEquals(1L, loaded.revision)
+            assertEquals(
+                listOf("image", "video", "pdf", "file"),
+                loaded.attachments.map(SelectedAttachment::localId),
+            )
+            assertTrue(
+                loaded.attachments.all {
+                    it.importState == AttachmentImportState.PROCESSING
+                },
+            )
+            coVerify(exactly = 1) {
+                repository.updateDraft(
+                    CONVERSATION_ID,
+                    "legacy",
+                    Json.encodeToString(loaded.attachments),
+                )
+            }
+        }
+
+    @Test
+    fun `accepted clear preserves text persisted after the frozen revision`() = runTest {
+        val repository = mockk<ConversationRepository>()
+        coEvery { repository.getConversation(CONVERSATION_ID) } returns chat(text = "sent")
+        coEvery { repository.updateDraft(any(), any(), any()) } returns Unit
+        val controller = ComposerDraftController(repository)
+        val frozen = controller.load(CONVERSATION_ID)
+        val edited = controller.persist(
+            CONVERSATION_ID,
+            frozen.revision,
+            text = "next draft",
+            attachments = emptyList(),
+        )
+
+        val cleared = controller.clearAccepted(
+            conversationId = CONVERSATION_ID,
+            acceptedRevision = frozen.revision,
+            acceptedText = "sent",
+            acceptedAttachmentIds = emptySet(),
+        )
+
+        assertEquals(1L, edited.revision)
+        assertEquals(2L, cleared.revision)
+        assertEquals("next draft", cleared.remainingText)
+        assertTrue(cleared.remainingAttachments.isEmpty())
+        coVerify(exactly = 1) {
+            repository.updateDraft(CONVERSATION_ID, "next draft", null)
+        }
+    }
 
     @Test
     fun `failed durable write preserves revision and does not reclaim attachments`() = runTest {
@@ -188,6 +295,91 @@ class ComposerDraftControllerTest {
         }
     }
 
+    @Test
+    fun `selected legacy draft hydration keeps omitted and explicit READY imports ready`() = runTest {
+        val path = "/private/restored.png"
+        val legacy = SelectedAttachment(
+            localId = "restored", uri = path, localPath = path, type = "image",
+            imageArtifacts = listOf(ImageArtifact(path, "image/png", 0L, null, null)),
+        )
+        val measured = legacy.copy(
+            mimeType = "image/png", fileSize = 321L, pixelWidth = 17, pixelHeight = 29,
+            imageArtifacts = listOf(ImageArtifact(path, "image/png", 321L, 17, 29)),
+        )
+        for (encodeDefaults in listOf(false, true)) {
+            val repository = mockk<ConversationRepository>()
+            val raw = Json { this.encodeDefaults = encodeDefaults }.encodeToString(listOf(legacy))
+            coEvery { repository.getConversation(CONVERSATION_ID) } returns chat(text = "legacy").copy(
+                draftAttachments = raw,
+            )
+            coEvery { repository.updateDraft(any(), any(), any()) } returns Unit
+            val visited = mutableListOf<SelectedAttachment>()
+            val controller = ComposerDraftController(repository, hydrateAttachment = {
+                visited += it
+                measured
+            })
+            assertTrue(visited.isEmpty())
+
+            val loaded = controller.load(CONVERSATION_ID)
+
+            assertEquals(listOf(legacy), visited)
+            assertEquals(LoadedComposerDraft("legacy", listOf(measured), 1L), loaded)
+            assertTrue(loaded.attachments.single().hasCanonicalReadyArtifact())
+            coVerify(exactly = 1) {
+                repository.updateDraft(CONVERSATION_ID, "legacy", Json.encodeToString(listOf(measured)))
+            }
+        }
+    }
+
+    @Test
+    fun `unavailable restored draft is kept visible without reentering processing`() = runTest {
+        val repository = mockk<ConversationRepository>()
+        val missing = SelectedAttachment(
+            localId = "missing", uri = "", localPath = "", type = "image", unavailable = true,
+        )
+        coEvery { repository.getConversation(CONVERSATION_ID) } returns chat(attachments = listOf(missing))
+
+        val loaded = ComposerDraftController(repository).load(CONVERSATION_ID)
+
+        assertEquals(listOf(missing), loaded.attachments)
+        assertEquals(0L, loaded.revision)
+        assertFalse(loaded.attachments.single().hasCanonicalReadyArtifact())
+        coVerify(exactly = 0) { repository.updateDraft(any(), any(), any()) }
+    }
+
+    @Test
+    fun `selected draft hydration cancellation propagates before any metadata write`() = runTest {
+        val repository = mockk<ConversationRepository>()
+        val pending = attachment("cancelled")
+        coEvery { repository.getConversation(CONVERSATION_ID) } returns chat(attachments = listOf(pending))
+        val cancellation = CancellationException("selection changed")
+        val controller = ComposerDraftController(repository, hydrateAttachment = { throw cancellation })
+
+        val failure = runCatching { controller.load(CONVERSATION_ID) }.exceptionOrNull()
+
+        assertTrue("Expected cancellation, got $failure", failure is CancellationException)
+        assertTrue(generateSequence(failure) { it.cause }.any { it === cancellation })
+        coVerify(exactly = 0) { repository.updateDraft(any(), any(), any()) }
+    }
+
+    @Test
+    fun `selected draft metadata write cancellation does not report a completed load`() = runTest {
+        val repository = mockk<ConversationRepository>()
+        val pending = attachment("cancelled")
+        coEvery { repository.getConversation(CONVERSATION_ID) } returns chat(attachments = listOf(pending))
+        val cancellation = CancellationException("selection changed")
+        coEvery { repository.updateDraft(any(), any(), any()) } throws cancellation
+        val controller = ComposerDraftController(repository, hydrateAttachment = {
+            it.copy(unavailable = true)
+        })
+
+        val failure = runCatching { controller.load(CONVERSATION_ID) }.exceptionOrNull()
+
+        assertTrue("Expected cancellation, got $failure", failure is CancellationException)
+        assertTrue(generateSequence(failure) { it.cause }.any { it === cancellation })
+        coVerify(exactly = 1) { repository.updateDraft(any(), any(), any()) }
+    }
+
     private fun chat(
         text: String = "",
         attachments: List<SelectedAttachment> = emptyList(),
@@ -206,6 +398,7 @@ class ComposerDraftControllerTest {
         type = "file",
         fileName = "$id.txt",
         localPath = "/private/$id.txt",
+        preparedText = "text:$id",
     )
 
     private companion object {

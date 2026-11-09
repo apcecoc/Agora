@@ -1,11 +1,7 @@
 package com.newoether.agora.ui.settings
 
 import androidx.activity.compose.BackHandler
-import androidx.compose.animation.Crossfade
-import androidx.compose.animation.core.tween
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -15,29 +11,19 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Build
-import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.Label
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.SwapHoriz
-import androidx.compose.material.icons.filled.Visibility
-import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.AlertDialog
-import com.newoether.agora.ui.motion.MotionAwareCircularProgressIndicator as CircularProgressIndicator
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -59,11 +45,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import com.newoether.agora.R
@@ -74,6 +58,12 @@ import com.newoether.agora.mcp.McpServerSnapshot
 import com.newoether.agora.util.noOpBringIntoView
 import com.newoether.agora.viewmodel.ChatViewModel
 import java.util.UUID
+import com.newoether.agora.ui.components.AgoraDropdownMenu
+import com.newoether.agora.ui.components.AgoraDropdownMenuItem
+import com.newoether.agora.ui.components.SecretVisibilityToggle
+import com.newoether.agora.ui.components.rememberSecretVisible
+import com.newoether.agora.ui.components.rememberUnsavedChangesBack
+import com.newoether.agora.ui.components.secretVisualTransformation
 
 private data class McpEditorRoute(
     val initial: McpServerConfig,
@@ -84,13 +74,6 @@ private data class McpHeaderDraft(
     val id: String = UUID.randomUUID().toString(),
     val name: String = "",
     val value: String = "",
-    val revealValue: Boolean = false,
-)
-
-private data class McpStatusUiState(
-    val status: McpConnectionStatus,
-    val enabledToolCount: Int,
-    val error: String?,
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -116,27 +99,30 @@ fun SettingsMcpPage(
     GuardedAnimatedContent(
         targetState = editorRoute,
         forward = editorRoute != null,
+        contentKey = { route -> route?.initial?.id },
     ) { route ->
         if (route != null) {
-            val target = route.initial
-            McpServerEditor(
-                initial = target,
-                snapshot = snapshots[target.id],
-                isNew = route.isNew,
-                onBack = { editorRoute = null },
-                onSave = { saved ->
-                    if (route.isNew) {
-                        viewModel.settings.addMcpServer(saved)
-                    } else {
-                        viewModel.settings.updateMcpServer(saved)
-                    }
-                    editorRoute = null
-                },
-                onRefresh = { viewModel.refreshMcpServer(target.id) },
-                showDocFab = showDocFab,
-            )
+            SettingsSecondaryPane {
+                val target = route.initial
+                McpServerEditor(
+                    initial = target,
+                    snapshot = snapshots[target.id],
+                    isNew = route.isNew,
+                    onBack = { editorRoute = null },
+                    onSave = { saved ->
+                        if (route.isNew) {
+                            viewModel.settings.addMcpServer(saved)
+                        } else {
+                            viewModel.settings.updateMcpServer(saved)
+                        }
+                        editorRoute = null
+                    },
+                    onRefresh = { viewModel.refreshMcpServer(target.id) },
+                    showDocFab = showDocFab,
+                )
+            }
         } else {
-            val scrollState = rememberScrollState()
+            val scrollState = rememberSettingsScrollState()
             CollapsingSettingsScaffold(
                 title = stringResource(R.string.mcp_title),
                 onBack = onBack,
@@ -231,16 +217,15 @@ fun SettingsMcpPage(
                                                                 stringResource(R.string.options),
                                                             )
                                                         }
-                                                        DropdownMenu(
+                                                        AgoraDropdownMenu(
                                                             expanded = menuExpanded,
                                                             onDismissRequest = {
                                                                 menuExpanded = false
                                                             },
                                                             containerColor = MaterialTheme.colorScheme.surfaceContainer,
                                                             tonalElevation = 16.dp,
-                                                            shape = RoundedCornerShape(12.dp),
                                                         ) {
-                                                            DropdownMenuItem(
+                                                            AgoraDropdownMenuItem(
                                                                 text = {
                                                                     Text(stringResource(R.string.mcp_refresh))
                                                                 },
@@ -255,7 +240,7 @@ fun SettingsMcpPage(
                                                                     viewModel.refreshMcpServer(server.id)
                                                                 },
                                                             )
-                                                            DropdownMenuItem(
+                                                            AgoraDropdownMenuItem(
                                                                 text = {
                                                                     Text(
                                                                         stringResource(R.string.delete),
@@ -369,7 +354,14 @@ private fun McpServerEditor(
     val parsedHeaders = remember(headerRows) { buildMcpHeaders(headerRows) }
     val validUrl = remember(draft.url) { isValidMcpUrl(draft.url) }
     val canSave = draft.name.isNotBlank() && validUrl
-    val scrollState = rememberScrollState()
+    val hasUnsavedChanges = draft != initial || parsedHeaders != initial.headers
+    val guardedBack = rememberUnsavedChangesBack(
+        hasUnsavedChanges = hasUnsavedChanges,
+        onBack = onBack,
+    )
+    // Registered after the page-level handler, so it takes system back while the editor is shown.
+    BackHandler { guardedBack() }
+    val scrollState = rememberSettingsScrollState()
     fun save() {
         if (!canSave) return
         onSave(
@@ -388,7 +380,7 @@ private fun McpServerEditor(
 
     CollapsingSettingsScaffold(
         title = stringResource(if (isNew) R.string.mcp_add_server else R.string.mcp_edit_server),
-        onBack = onBack,
+        onBack = guardedBack,
         scrollState = scrollState,
         floatingActionButton = { if (showDocFab) DocumentationFab("mcp.md") },
         actions = {
@@ -575,34 +567,6 @@ private fun McpServerEditor(
 }
 
 @Composable
-private fun McpStatusDot(status: McpConnectionStatus) {
-    val description = stringResource(
-        when (status) {
-            McpConnectionStatus.IDLE -> R.string.mcp_status_idle
-            McpConnectionStatus.CONNECTING -> R.string.mcp_status_connecting
-            McpConnectionStatus.CONNECTED -> R.string.mcp_status_connected
-            McpConnectionStatus.ERROR -> R.string.mcp_status_error
-        },
-    )
-    val color = when (status) {
-        McpConnectionStatus.IDLE -> {
-            MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f)
-        }
-        McpConnectionStatus.CONNECTING -> {
-            MaterialTheme.colorScheme.primary.copy(alpha = 0.55f)
-        }
-        McpConnectionStatus.CONNECTED -> MaterialTheme.colorScheme.primary
-        McpConnectionStatus.ERROR -> MaterialTheme.colorScheme.error
-    }
-    Box(
-        modifier = Modifier
-            .size(8.dp)
-            .background(color = color, shape = CircleShape)
-            .semantics { contentDescription = description },
-    )
-}
-
-@Composable
 private fun McpHeaderItem(
     header: McpHeaderDraft,
     onHeaderChange: (McpHeaderDraft) -> Unit,
@@ -622,30 +586,8 @@ private fun McpHeaderItem(
                     label = stringResource(R.string.mcp_header_value),
                     value = header.value,
                     onValueChange = { onHeaderChange(header.copy(value = it)) },
-                    password = !header.revealValue,
+                    password = true,
                     modifier = Modifier.fillMaxWidth(),
-                    trailingContent = {
-                        IconButton(
-                            onClick = {
-                                onHeaderChange(header.copy(revealValue = !header.revealValue))
-                            },
-                        ) {
-                            Icon(
-                                if (header.revealValue) {
-                                    Icons.Default.VisibilityOff
-                                } else {
-                                    Icons.Default.Visibility
-                                },
-                                stringResource(
-                                    if (header.revealValue) {
-                                        R.string.mcp_hide_header_value
-                                    } else {
-                                        R.string.mcp_show_header_value
-                                    },
-                                ),
-                            )
-                        }
-                    },
                 )
             }
         },
@@ -670,18 +612,19 @@ private fun McpHeaderField(
     password: Boolean = false,
     trailingContent: (@Composable () -> Unit)? = null,
 ) {
+    var secretVisible by rememberSecretVisible()
     OutlinedTextField(
         value = value,
         onValueChange = onValueChange,
         modifier = modifier.noOpBringIntoView(),
         label = { Text(label, maxLines = 1) },
         singleLine = true,
-        visualTransformation = if (password) {
-            PasswordVisualTransformation()
+        visualTransformation = if (password) secretVisualTransformation(secretVisible) else VisualTransformation.None,
+        trailingIcon = if (password) {
+            { SecretVisibilityToggle(secretVisible) { secretVisible = !secretVisible } }
         } else {
-            VisualTransformation.None
+            trailingContent
         },
-        trailingIcon = trailingContent,
         shape = RoundedCornerShape(16.dp),
         textStyle = MaterialTheme.typography.bodyMedium.copy(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -690,88 +633,7 @@ private fun McpHeaderField(
 }
 
 @Composable
-private fun McpStatusText(
-    snapshot: McpServerSnapshot?,
-    includeError: Boolean = false,
-) {
-    val state = McpStatusUiState(
-        status = snapshot?.status ?: McpConnectionStatus.IDLE,
-        enabledToolCount = snapshot?.tools?.count { it.enabled } ?: 0,
-        error = snapshot?.error?.takeIf(String::isNotBlank),
-    )
-    Crossfade(
-        targetState = state,
-        animationSpec = tween(durationMillis = 250),
-        label = "mcpStatusText",
-    ) { current ->
-        val color = when (current.status) {
-            McpConnectionStatus.CONNECTED -> MaterialTheme.colorScheme.primary
-            McpConnectionStatus.ERROR -> MaterialTheme.colorScheme.error
-            else -> MaterialTheme.colorScheme.onSurfaceVariant
-        }
-        Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
-            Text(
-                text = when (current.status) {
-                    McpConnectionStatus.IDLE -> stringResource(R.string.mcp_status_idle)
-                    McpConnectionStatus.CONNECTING -> stringResource(R.string.mcp_status_connecting)
-                    McpConnectionStatus.CONNECTED -> stringResource(R.string.mcp_status_connected)
-                    McpConnectionStatus.ERROR -> stringResource(R.string.mcp_status_error)
-                },
-                color = color,
-            )
-            when {
-                current.status == McpConnectionStatus.CONNECTED -> Text(
-                    text = stringResource(
-                        R.string.mcp_tools_enabled,
-                        current.enabledToolCount,
-                    ),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                includeError && current.error != null -> Text(
-                    text = current.error,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.error,
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun McpStatusIcon(status: McpConnectionStatus) {
-    Crossfade(
-        targetState = status,
-        animationSpec = tween(durationMillis = 250),
-        label = "mcpStatusIcon",
-    ) { current ->
-        Box(
-            modifier = Modifier.size(24.dp),
-            contentAlignment = Alignment.Center,
-        ) {
-            when (current) {
-                McpConnectionStatus.IDLE -> Icon(Icons.Default.CloudOff, null)
-                McpConnectionStatus.CONNECTING -> CircularProgressIndicator(
-                    modifier = Modifier.size(22.dp),
-                    strokeWidth = 2.dp,
-                )
-                McpConnectionStatus.CONNECTED -> Icon(
-                    Icons.Default.CheckCircle,
-                    null,
-                    tint = MaterialTheme.colorScheme.primary,
-                )
-                McpConnectionStatus.ERROR -> Icon(
-                    Icons.Default.Error,
-                    null,
-                    tint = MaterialTheme.colorScheme.error,
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun McpLabeledField(
+internal fun McpLabeledField(
     label: String,
     value: String,
     onValueChange: (String) -> Unit,
@@ -781,7 +643,9 @@ private fun McpLabeledField(
     keyboardType: KeyboardType = KeyboardType.Text,
     password: Boolean = false,
     trailingContent: (@Composable () -> Unit)? = null,
+    placeholder: String? = null,
 ) {
+    var secretVisible by rememberSecretVisible()
     Column(modifier) {
         Text(
             label,
@@ -796,13 +660,20 @@ private fun McpLabeledField(
                 singleLine = true,
                 isError = isError,
                 supportingText = supportingText?.let { text -> { Text(text) } },
+                placeholder = placeholder?.let { text -> {
+                    Text(
+                        text,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } },
                 keyboardOptions = KeyboardOptions(keyboardType = keyboardType),
-                visualTransformation = if (password) {
-                    PasswordVisualTransformation()
+                visualTransformation = if (password) secretVisualTransformation(secretVisible) else VisualTransformation.None,
+                trailingIcon = if (password) {
+                    { SecretVisibilityToggle(secretVisible) { secretVisible = !secretVisible } }
                 } else {
-                    VisualTransformation.None
+                    trailingContent
                 },
-                trailingIcon = trailingContent,
                 shape = RoundedCornerShape(16.dp),
                 textStyle = MaterialTheme.typography.bodyMedium.copy(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,

@@ -103,8 +103,15 @@ fun FullScreenMediaViewer(
 ) {
     val url = urls.getOrNull(initialIndex) ?: return
     val haptics = rememberAgoraHaptics(hapticsEnabled)
-    val isPdf = pdfPages.isNotEmpty()
-    val isSingleVideo = if (isPdf) false else rememberIsVideoMedia(url)
+    if (pdfPages.isNotEmpty()) {
+        PdfPager(pdfPages, initialIndex, pdfSelectedPages, onTogglePdfPage, onClose, onNavigate)
+        return
+    }
+    if (urls.size > 1) {
+        MediaPager(urls, initialIndex, onClose, onNavigate, onMessage, haptics = haptics)
+        return
+    }
+    val isSingleVideo = rememberIsVideoMedia(url)
 
     if (isSingleVideo == null) {
         BackHandler(onBack = onClose)
@@ -112,12 +119,15 @@ fun FullScreenMediaViewer(
             modifier = Modifier.fillMaxSize(),
             contentAlignment = Alignment.Center,
         ) {
-            CircularProgressIndicator(color = Color.White)
+            CircularProgressIndicator(
+                color = MaterialTheme.colorScheme.primary,
+                strokeWidth = MEDIA_LOADING_INDICATOR_STROKE_WIDTH,
+            )
         }
         return
     }
 
-    if (isSingleVideo == true && urls.size == 1) {
+    if (isSingleVideo == true) {
         var showOverlay by remember { mutableStateOf(true) }
         var closing by remember { mutableStateOf(false) }
         Box(modifier = Modifier.fillMaxSize()) {
@@ -141,16 +151,6 @@ fun FullScreenMediaViewer(
         return
     }
 
-    if (isPdf) {
-        PdfPager(pdfPages, url, pdfSelectedPages, onTogglePdfPage, onClose, onNavigate)
-        return
-    }
-
-    if (urls.size > 1) {
-        MediaPager(urls, initialIndex, onClose, onNavigate, onMessage, haptics = haptics)
-        return
-    }
-
     // Single image — full zoom/pan experience
     SingleImage(url = url, onClose = onClose, onMessage = onMessage, haptics = haptics)
 }
@@ -160,13 +160,13 @@ fun FullScreenMediaViewer(
 @Composable
 private fun PdfPager(
     pdfPages: List<String>,
-    url: String,
+    initialIndex: Int,
     pdfSelectedPages: Set<Int>? = null,
     onTogglePdfPage: ((Int) -> Unit)? = null,
     onClose: () -> Unit,
     onNavigate: (Int) -> Unit
 ) {
-    val pdfInitialPage = pdfPages.indexOf(url).coerceIn(0, pdfPages.size - 1)
+    val pdfInitialPage = initialIndex.coerceIn(0, pdfPages.size - 1)
     var currentScale by remember { mutableFloatStateOf(1f) }
     var showOverlay by remember { mutableStateOf(true) }
     val pagerState = rememberPagerState(initialPage = pdfInitialPage) { pdfPages.size }
@@ -297,7 +297,10 @@ private fun MediaPager(
                     modifier = Modifier.fillMaxSize(),
                     contentAlignment = Alignment.Center,
                 ) {
-                    CircularProgressIndicator(color = Color.White)
+                    CircularProgressIndicator(
+                        color = MaterialTheme.colorScheme.primary,
+                        strokeWidth = MEDIA_LOADING_INDICATOR_STROKE_WIDTH,
+                    )
                 }
                 true -> {
                     if (page == pagerState.currentPage) {

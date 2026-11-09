@@ -1,13 +1,20 @@
 package com.newoether.agora.ui.chat.message
 
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.ExperimentalAnimationApi
+import androidx.compose.animation.SizeTransform
+import androidx.compose.animation.animateColor
 import androidx.compose.animation.expandIn
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkOut
-import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.togetherWith
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.core.updateTransition
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.filled.Compress
 import androidx.compose.material.icons.filled.Delete
@@ -37,6 +44,7 @@ import com.newoether.agora.R
 import com.newoether.agora.data.forDisplay
 import com.newoether.agora.data.replaceCustomProviderIdsForDisplay
 import com.newoether.agora.model.ChatMessage
+import com.newoether.agora.model.MessageSource
 import com.newoether.agora.model.MessageStatus
 import com.newoether.agora.model.isContextCompact
 import com.newoether.agora.model.Participant
@@ -45,13 +53,28 @@ import com.newoether.agora.model.ToolCallDisplayModes
 import com.newoether.agora.model.ThinkingSegmentDisplayModes
 import com.newoether.agora.ui.chat.ConversationSearchMatch
 import com.newoether.agora.ui.chat.conversationSearchMatchRanges
+import com.newoether.agora.ui.chat.deletionRemovesEntireConversation
 import com.newoether.agora.ui.common.LocalAgoraHaptics
 import com.newoether.agora.ui.components.*
 import com.newoether.agora.ui.motion.LocalAgoraMotionPolicy
 import com.mikepenz.markdown.compose.components.markdownComponents
 import kotlinx.coroutines.flow.StateFlow
+import com.newoether.agora.ui.components.AgoraDropdownMenu
+import com.newoether.agora.ui.components.AgoraDropdownMenuItem
 
 
+
+internal data class PendingMessageDeletion(
+    val targetMessageId: String,
+    val deletesConversation: Boolean,
+    val expectedConversationMessageIds: Set<String>,
+) {
+    constructor(messages: List<ChatMessage>, targetMessageId: String, compactOnly: Boolean) : this(
+        targetMessageId = targetMessageId,
+        deletesConversation = deletionRemovesEntireConversation(messages, targetMessageId, compactOnly),
+        expectedConversationMessageIds = messages.mapTo(linkedSetOf(), ChatMessage::id),
+    )
+}
 
 internal enum class ContextCompactPillPresentation {
     IN_PROGRESS,
@@ -79,13 +102,17 @@ internal fun MessageItem(
     segmentAppearanceRegistry: SegmentAppearanceRegistry,
     modifier: Modifier = Modifier,
     animateEntrance: Boolean = false,
+    outerPadding: PaddingValues = PaddingValues(vertical = 8.dp),
+    includeAssistantOuterSpacing: Boolean = true,
     isStreaming: Boolean = false,
     liveCompactPreview: StateFlow<String>? = null,
     isLoading: Boolean = false,
+    isStopping: Boolean = false,
     compactActionsEnabled: Boolean = true,
     isRegenerationExiting: Boolean = false,
     isEditingAllowed: Boolean = true,
     isEditing: Boolean = false,
+    userBubbleSizeAnimationReady: Boolean = true,
     isSwitching: Boolean = false,
     isInContext: Boolean = false,
     modelAliases: StableModelAliases = StableModelAliases(),
@@ -96,11 +123,13 @@ internal fun MessageItem(
     autoExpandActiveGroup: Boolean = true,
 
     parseInlineDollarMath: Boolean = false,
+    autoWrapCodeBlocks: Boolean = true,
     groupedSegmentAutoExpansionController: GroupedSegmentAutoExpansionController =
         remember { GroupedSegmentAutoExpansionController() },
     onStartEdit: () -> Unit = {},
     onCancelEdit: () -> Unit = {},
     showActions: Boolean = true,
+    readOnlyActions: Boolean = false,
     actionCopyText: String? = message.text,
     showBranchSelector: Boolean = true,
     branchIndex: Int = 0,
@@ -110,15 +139,22 @@ internal fun MessageItem(
     onFork: (String) -> Unit = {},
     onShare: (String) -> Unit = {},
     deleteTargetMessageId: String = message.id,
+    conversationMessages: () -> List<ChatMessage> = { emptyList() },
     onRecompact: (String) -> Unit = {},
-    onDelete: (String) -> Unit = {},
+    onDelete: (String, (Boolean) -> Unit) -> Boolean = { _, _ -> false },
+    onDeleteConversation: (Set<String>, (Boolean) -> Unit) -> Boolean = { _, _ -> false },
     onMediaClick: (List<String>, Int) -> Unit = { _, _ -> },
     onFileContentClick: ((fileName: String, content: String) -> Unit)? = null,
     onPdfPagesClick: ((pages: List<String>, startIndex: Int) -> Unit)? = null,
+    onSegmentDetailRequest: (String, List<Int>, Boolean) -> Unit = { _, _, _ -> },
     onHeightChanged: (Int) -> Unit = {},
     searchQuery: String = "",
     activeSearchMatch: ConversationSearchMatch? = null,
-    onSearchMatchPosition: (key: String, centerYInRoot: Float) -> Unit = { _, _ -> },
+    onSearchMatchPosition: (
+        key: String,
+        measurementEpoch: String?,
+        centerYInRoot: Float,
+    ) -> Unit = { _, _, _ -> },
     selectionMode: Boolean = false,
     selected: Boolean = false,
     onToggleSelection: () -> Unit = {},
@@ -126,19 +162,29 @@ internal fun MessageItem(
     onLayoutMutationSettled: (String) -> Unit = {},
     thoughtExpandedStates: SnapshotStateMap<String, Boolean> = remember { mutableStateMapOf() }
 ) {
-    val displayMessage = remember(message, customProviders) {
-        message.forDisplay(customProviders)
+    val unansweredLabel = stringResource(R.string.message_source_unanswered)
+    val displayMessage = remember(message, customProviders, unansweredLabel) {
+        message.forDisplay(customProviders).withAskUserDisplayText(unansweredLabel)
     }
-    val displayActionCopyText = remember(actionCopyText, customProviders) {
-        actionCopyText?.let { replaceCustomProviderIdsForDisplay(it, customProviders) }
+    val displayActionCopyText = remember(actionCopyText, customProviders, displayMessage) {
+        // An ask_user bubble copies exactly what it shows, including the localized label.
+        if (displayMessage.source?.kind == MessageSource.Kind.ASK_USER) {
+            actionCopyText?.let { displayMessage.text }
+        } else {
+            actionCopyText?.let { replaceCustomProviderIdsForDisplay(it, customProviders) }
+        }
     }
-    var showSegmentDetail by remember { mutableStateOf(false) }
-    var detailUsesExplicitBackHandler by remember { mutableStateOf(false) }
-    var selectedSegmentIndex by remember { mutableIntStateOf(-1) }
-    var selectedSegmentIndices by remember { mutableStateOf<List<Int>>(emptyList()) }
     var showInfoDialog by remember { mutableStateOf(false) }
     var showUserTextSelection by remember(message.id) { mutableStateOf(false) }
-    var showDeleteConfirm by remember { mutableStateOf(false) }
+    var pendingDelete by remember(message.id) { mutableStateOf<PendingMessageDeletion?>(null) }
+    var confirmedDelete by remember(message.id) { mutableStateOf<PendingMessageDeletion?>(null) }
+    val onShowDelete = {
+        pendingDelete = PendingMessageDeletion(
+            messages = conversationMessages(),
+            targetMessageId = deleteTargetMessageId,
+            compactOnly = message.isContextCompact(),
+        )
+    }
     var showCompactDetail by remember(message.id) { mutableStateOf(false) }
     val haptics = LocalAgoraHaptics.current
     val motionPolicy = LocalAgoraMotionPolicy.current
@@ -151,26 +197,54 @@ internal fun MessageItem(
         MessageInfoDialog(
             message = displayMessage,
             modelAliases = modelAliases.map,
+            showProviderName = modelAliases.providerNames[message.modelName] != false,
             customProviders = customProviders,
             onDismiss = { showInfoDialog = false }
         )
     }
 
-    if (showDeleteConfirm) {
-        val onConfirmDelete = {
-            showDeleteConfirm = false
-            haptics.destructiveConfirmed()
-            onDelete(deleteTargetMessageId)
+    LaunchedEffect(confirmedDelete) {
+        val confirmed = confirmedDelete ?: return@LaunchedEffect
+        // Draw the loading action in the blocking confirmation before dispatch.
+        withFrameNanos { }
+        val onResult: (Boolean) -> Unit = { deleted ->
+            pendingDelete = if (deleted) null else confirmed
+            if (deleted) haptics.destructiveConfirmed()
+            confirmedDelete = null
         }
-        if (message.isContextCompact()) {
-            ContextCompactDeleteDialog(
+        val accepted = if (confirmed.deletesConversation) {
+            onDeleteConversation(confirmed.expectedConversationMessageIds, onResult)
+        } else {
+            onDelete(confirmed.targetMessageId, onResult)
+        }
+        if (!accepted) onResult(false)
+    }
+
+    pendingDelete?.let { pending ->
+        val onConfirmDelete = {
+            if (confirmedDelete == null) {
+                confirmedDelete = pending
+            }
+            Unit
+        }
+        if (pending.deletesConversation) {
+            MessageDeleteDialog(
+                deletesConversation = true,
+                pending = confirmedDelete != null,
                 onConfirm = onConfirmDelete,
-                onDismiss = { showDeleteConfirm = false },
+                onDismiss = { if (confirmedDelete == null) pendingDelete = null },
+            )
+        } else if (message.isContextCompact()) {
+            ContextCompactDeleteDialog(
+                pending = confirmedDelete != null,
+                onConfirm = onConfirmDelete,
+                onDismiss = { if (confirmedDelete == null) pendingDelete = null },
             )
         } else {
             MessageDeleteDialog(
+                pending = confirmedDelete != null,
                 onConfirm = onConfirmDelete,
-                onDismiss = { showDeleteConfirm = false },
+                onDismiss = { if (confirmedDelete == null) pendingDelete = null },
             )
         }
     }
@@ -194,7 +268,9 @@ internal fun MessageItem(
     }
 
     val shape = when (message.participant) {
-        Participant.USER -> RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp, bottomStart = 20.dp, bottomEnd = 4.dp)
+        // Three matching large corners (27dp, capped at half the bubble's smaller side) and a 6dp tail;
+        // a single-line bubble reads as a capsule.
+        Participant.USER -> UserBubbleShape()
         Participant.MODEL -> RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp, bottomStart = 4.dp, bottomEnd = 20.dp)
         Participant.ERROR -> RoundedCornerShape(12.dp)
     }
@@ -205,7 +281,8 @@ internal fun MessageItem(
 
     val searchHighlight = searchQuery.takeIf { it.isNotBlank() }?.let { query ->
         val active = activeSearchMatch?.takeIf { it.messageId == message.id }
-        val matchKeys = conversationSearchMatchRanges(displayMessage, query).map { range ->
+        val matchRanges = conversationSearchMatchRanges(displayMessage, query)
+        val matchKeys = matchRanges.map { range ->
             "${message.id}:${range.first}:${range.last + 1}"
         }
         SearchHighlightSpec(
@@ -215,13 +292,17 @@ internal fun MessageItem(
                 ?.let { it.start until it.endExclusive },
             activeKey = active?.key,
             matchKeys = matchKeys,
+            sourceRanges = matchRanges,
             onMatchPosition = onSearchMatchPosition,
         )
     }
     val markdownAssets = rememberChatMarkdownAssets(
         textColor,
-        searchHighlight,
         parseInlineDollarMath,
+        message.markdownImages,
+        onMediaClick,
+        message.preparedMarkdown,
+        autoWrapCodeBlocks,
     )
     val markdownRenderContext = markdownAssets.renderContext
     val thoughtMarkdownRenderContext = markdownAssets.thoughtRenderContext
@@ -230,6 +311,7 @@ internal fun MessageItem(
         animationKey = "message:${message.id}",
         animate = animateEntrance && !isSwitching,
         durationMillis = MESSAGE_ENTER_DURATION_MS,
+        forceOpaque = displayMessage.segments.orEmpty().any { it.type == "tool" },
     )
 
     Row(
@@ -238,7 +320,7 @@ internal fun MessageItem(
             .onSizeChanged {
                 onHeightChanged(it.height)
             }
-            .padding(vertical = 8.dp)
+            .padding(outerPadding)
             .then(entranceModifier),
         verticalAlignment = Alignment.Top,
     ) {
@@ -284,7 +366,7 @@ internal fun MessageItem(
                             actionsEnabled = compactActionsEnabled && !compactInProgress,
                             onClick = { showCompactDetail = true },
                             onRecompact = { onRecompact(message.id) },
-                            onDelete = { showDeleteConfirm = true },
+                            onDelete = onShowDelete,
                         )
                     }
                 } else if (message.participant == Participant.USER) {
@@ -295,9 +377,11 @@ internal fun MessageItem(
                         textColor = textColor,
                         contextAlpha = contextAlpha,
                         isEditing = isEditing,
+                        sizeAnimationReady = userBubbleSizeAnimationReady,
                         isLoading = isLoading,
                         isEditingAllowed = isEditingAllowed,
-                        showActions = showActions,
+                        showActions = showActions || readOnlyActions,
+                        allowMutations = !readOnlyActions,
                         actionCopyText = displayActionCopyText,
                         showBranchSelector = showBranchSelector,
                         branchIndex = branchIndex,
@@ -311,16 +395,18 @@ internal fun MessageItem(
                         onFileContentClick = onFileContentClick,
                         onPdfPagesClick = onPdfPagesClick,
                         onShowInfo = { showInfoDialog = true },
-                        onShowDelete = { showDeleteConfirm = true },
+                        onShowDelete = onShowDelete,
                         searchHighlight = searchHighlight,
                     )
                 } else {
                     AssistantMessageContent(
                         message = displayMessage,
+                        includeOuterSpacing = includeAssistantOuterSpacing,
                         segmentAppearanceRegistry = segmentAppearanceRegistry,
                         contextAlpha = contextAlpha,
                         isStreaming = isStreaming,
                         isLoading = isLoading,
+                        isStopping = isStopping,
                         isRegenerationExiting = isRegenerationExiting,
                         isEditingAllowed = isEditingAllowed,
                         showActions = showActions,
@@ -347,12 +433,9 @@ internal fun MessageItem(
                         onShare = { onShare(message.id) },
                         onMediaClick = onMediaClick,
                         onShowInfo = { showInfoDialog = true },
-                        onShowDelete = { showDeleteConfirm = true },
+                        onShowDelete = onShowDelete,
                         onSegmentSelected = { indices, showListFirst ->
-                            selectedSegmentIndices = indices
-                            selectedSegmentIndex = indices.firstOrNull() ?: -1
-                            detailUsesExplicitBackHandler = showListFirst
-                            showSegmentDetail = true
+                            onSegmentDetailRequest(message.id, indices, showListFirst)
                         },
                         onLayoutMutationStarted = onLayoutMutationStarted,
                         onLayoutMutationSettled = onLayoutMutationSettled,
@@ -423,23 +506,9 @@ internal fun MessageItem(
             onDismiss = { showCompactDetail = false },
         )
     }
-
-    // Segment detail bottom sheet (self-contained draggable sheet + FSM).
-    if (showSegmentDetail && selectedSegmentIndex >= 0) {
-        SegmentDetailSheet(
-            message = displayMessage,
-            selectedSegmentIndex = selectedSegmentIndex,
-            selectedSegmentIndices = selectedSegmentIndices,
-            isStreaming = isStreaming,
-            markdownRenderContext = thoughtMarkdownRenderContext,
-            onMediaClick = onMediaClick,
-            handleBackInternally = detailUsesExplicitBackHandler,
-            showSegmentListFirst = detailUsesExplicitBackHandler,
-            onDismiss = { showSegmentDetail = false }
-        )
-    }
 }
 
+@OptIn(ExperimentalAnimationApi::class)
 @Composable
 internal fun ContextCompactPill(
     presentation: ContextCompactPillPresentation,
@@ -448,40 +517,47 @@ internal fun ContextCompactPill(
     onRecompact: () -> Unit = {},
     onDelete: () -> Unit = {},
 ) {
-    val inProgress = presentation == ContextCompactPillPresentation.IN_PROGRESS
-    val error = presentation == ContextCompactPillPresentation.ERROR
     var actionsExpanded by remember { mutableStateOf(false) }
+    val motionPolicy = LocalAgoraMotionPolicy.current
     val pillShape = RoundedCornerShape(100.dp)
-    val containerColor by animateColorAsState(
-        targetValue = if (error) {
-            MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.4f)
+    val presentationTransition = updateTransition(
+        targetState = presentation,
+        label = "compactPillPresentation",
+    )
+    val containerColor by presentationTransition.animateColor(
+        transitionSpec = { tween(durationMillis = 240) },
+        label = "compactPillContainer",
+    ) { renderedPresentation ->
+        if (renderedPresentation == ContextCompactPillPresentation.ERROR) {
+            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f)
         } else {
             MaterialTheme.colorScheme.secondaryContainer
-        },
-        animationSpec = tween(durationMillis = 240),
-        label = "compactPillContainer",
-    )
-    val contentColor by animateColorAsState(
-        targetValue = if (error) {
-            MaterialTheme.colorScheme.error.copy(alpha = 0.8f)
-        } else {
-            MaterialTheme.colorScheme.onSecondaryContainer
-        },
-        animationSpec = tween(durationMillis = 240),
+        }
+    }
+    val contentColor by presentationTransition.animateColor(
+        transitionSpec = { tween(durationMillis = 240) },
         label = "compactPillContent",
-    )
-    val iconColor by animateColorAsState(
-        targetValue = if (error) {
-            MaterialTheme.colorScheme.error
+    ) { renderedPresentation ->
+        if (renderedPresentation == ContextCompactPillPresentation.ERROR) {
+            MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f)
         } else {
             MaterialTheme.colorScheme.onSecondaryContainer
-        },
-        animationSpec = tween(durationMillis = 240),
+        }
+    }
+    val iconColor by presentationTransition.animateColor(
+        transitionSpec = { tween(durationMillis = 240) },
         label = "compactPillIcon",
-    )
+    ) { renderedPresentation ->
+        if (renderedPresentation == ContextCompactPillPresentation.ERROR) {
+            MaterialTheme.colorScheme.onSurfaceVariant
+        } else {
+            MaterialTheme.colorScheme.onSecondaryContainer
+        }
+    }
     val destructiveActionTint = MaterialTheme.colorScheme.error.copy(
         alpha = if (actionsEnabled) 1f else 0.38f,
     )
+    val presentationCrossfadeSpec = tween<Float>(durationMillis = 240)
     Surface(
         modifier = if (onClick != null) {
             Modifier
@@ -497,44 +573,73 @@ internal fun ContextCompactPill(
         Row(
             modifier = Modifier
                 .heightIn(min = 42.dp)
-                .padding(start = 14.dp, end = 7.dp),
+                .padding(horizontal = 7.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(7.dp),
         ) {
             Box(
-                modifier = Modifier.size(16.dp),
+                modifier = Modifier.size(32.dp),
                 contentAlignment = Alignment.Center,
             ) {
-                if (inProgress) {
-                    com.newoether.agora.ui.motion.MotionAwareCircularProgressIndicator(
-                        modifier = Modifier.fillMaxSize(),
-                        strokeWidth = 2.dp,
-                    )
-                } else {
-                    Icon(
-                        imageVector = when (presentation) {
-                            ContextCompactPillPresentation.ERROR ->
-                                androidx.compose.material.icons.Icons.Default.Error
-                            ContextCompactPillPresentation.STOPPED ->
-                                androidx.compose.material.icons.Icons.Default.StopCircle
-                            else -> androidx.compose.material.icons.Icons.Default.Compress
-                        },
-                        contentDescription = null,
-                        modifier = Modifier.fillMaxSize(),
-                        tint = iconColor,
-                    )
+                presentationTransition.Crossfade(
+                    animationSpec = presentationCrossfadeSpec,
+                ) { renderedPresentation ->
+                    if (renderedPresentation == ContextCompactPillPresentation.IN_PROGRESS) {
+                        com.newoether.agora.ui.motion.MotionAwareCircularProgressIndicator(
+                            modifier = Modifier.size(18.dp),
+                            color = iconColor,
+                            strokeWidth = 2.dp,
+                        )
+                    } else {
+                        Icon(
+                            imageVector = when (renderedPresentation) {
+                                ContextCompactPillPresentation.ERROR ->
+                                    androidx.compose.material.icons.Icons.Default.Error
+                                ContextCompactPillPresentation.STOPPED ->
+                                    androidx.compose.material.icons.Icons.Default.StopCircle
+                                else -> androidx.compose.material.icons.Icons.Default.Compress
+                            },
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp),
+                            tint = iconColor,
+                        )
+                    }
                 }
             }
-            Text(
-                when {
-                    error -> stringResource(R.string.context_compact_error)
-                    presentation == ContextCompactPillPresentation.STOPPED -> stringResource(R.string.context_compact_stopped)
-                    inProgress -> stringResource(com.newoether.agora.R.string.context_compacting)
-                    else -> stringResource(com.newoether.agora.R.string.context_compact)
+            presentationTransition.AnimatedContent(
+                transitionSpec = {
+                    val fade = fadeIn(animationSpec = presentationCrossfadeSpec) togetherWith
+                        fadeOut(animationSpec = presentationCrossfadeSpec)
+                    fade.using(
+                        SizeTransform(
+                            clip = false,
+                            sizeAnimationSpec = { _, _ ->
+                                if (motionPolicy.allowSpatialTransitions) {
+                                    tween(durationMillis = 240)
+                                } else {
+                                    snap()
+                                }
+                            },
+                        )
+                    )
                 },
-                maxLines = 1,
-                style = MaterialTheme.typography.labelLarge,
-            )
+                contentAlignment = Alignment.CenterStart,
+            ) { renderedPresentation ->
+                Text(
+                    when (renderedPresentation) {
+                        ContextCompactPillPresentation.ERROR ->
+                            stringResource(R.string.context_compact_error)
+                        ContextCompactPillPresentation.STOPPED ->
+                            stringResource(R.string.context_compact_stopped)
+                        ContextCompactPillPresentation.IN_PROGRESS ->
+                            stringResource(R.string.context_compacting)
+                        ContextCompactPillPresentation.SUCCESS ->
+                            stringResource(R.string.context_compact)
+                    },
+                    maxLines = 1,
+                    style = MaterialTheme.typography.labelLarge,
+                )
+            }
             Box {
                 IconButton(
                     onClick = { actionsExpanded = true },
@@ -546,14 +651,13 @@ internal fun ContextCompactPill(
                         modifier = Modifier.size(18.dp),
                     )
                 }
-                DropdownMenu(
+                AgoraDropdownMenu(
                     expanded = actionsExpanded,
                     onDismissRequest = { actionsExpanded = false },
-                    shape = RoundedCornerShape(12.dp),
                     containerColor = MaterialTheme.colorScheme.surfaceContainer,
                     tonalElevation = 16.dp,
                 ) {
-                    DropdownMenuItem(
+                    AgoraDropdownMenuItem(
                         text = {
                             Text(
                                 text = stringResource(com.newoether.agora.R.string.recompact),
@@ -571,7 +675,7 @@ internal fun ContextCompactPill(
                             onRecompact()
                         },
                     )
-                    DropdownMenuItem(
+                    AgoraDropdownMenuItem(
                         text = {
                             Text(
                                 text = stringResource(com.newoether.agora.R.string.delete),

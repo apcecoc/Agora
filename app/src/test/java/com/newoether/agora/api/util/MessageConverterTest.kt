@@ -1,109 +1,54 @@
 package com.newoether.agora.api.util
 
-import com.newoether.agora.api.OpenAiContentPart
-import com.newoether.agora.api.OpenAiImageUrl
-import com.newoether.agora.api.OpenAiMessage
+import android.app.Application
 import com.newoether.agora.model.ChatMessage
+import com.newoether.agora.model.MessageSegment
 import com.newoether.agora.model.Participant
-import com.newoether.agora.util.Constants
 import org.junit.Assert.*
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.annotation.Config
+import org.robolectric.annotation.GraphicsMode
 
+@RunWith(ImageWireTestRunner::class)
+@Config(sdk = [35], application = Application::class)
+@GraphicsMode(GraphicsMode.Mode.NATIVE)
 class MessageConverterTest {
-
+    // Provider-only cases relocated to provider/cloud; these cases use the app estimator or image projection.
     @Test
-    fun buildToolCallId_deterministic() {
-        val id1 = buildToolCallId("read_file", """{"path":"/test"}""")
-        val id2 = buildToolCallId("read_file", """{"path":"/test"}""")
-        assertEquals(id1, id2)
-    }
-
-    @Test
-    fun buildToolCallId_prefixApplied() {
-        val id = buildToolCallId("my_tool", "{}", "pre_")
-        assertTrue(id.startsWith("pre_my_tool_"))
-    }
-
-    @Test
-    fun limitContext_emptyList() {
-        val result = limitContext(emptyList(), 5)
-        assertTrue(result.isEmpty())
-    }
-
-    @Test
-    fun limitContext_respectsEstimatedTokenBudget() {
-        val msgs = (1..10).map { i ->
-            ChatMessage(
-                id = "msg$i",
-                parentId = null,
-                text = "message-$i " + "payload ".repeat(40),
-                participant = if (i % 2 == 0) Participant.MODEL else Participant.USER
-            )
-        }
-        val result = limitContext(msgs, 140)
-        val userCount = result.count { it.participant == Participant.USER }
-        assertEquals(1, userCount)
-        assertEquals(listOf("msg9", "msg10"), result.map { it.id })
-    }
-
-    @Test
-    fun limitContext_includesToolMessages() {
-        val msgs = listOf(
-            ChatMessage(id = "u1", parentId = null, text = "user1", participant = Participant.USER),
-            ChatMessage(id = "m1", parentId = "u1", text = "resp1", participant = Participant.MODEL),
-            ChatMessage(id = Constants.TOOL_MSG_PREFIX + "t1", parentId = "m1", text = "",
-                participant = Participant.MODEL),
-            ChatMessage(id = Constants.RESULT_MSG_PREFIX + "r1", parentId = "t1", text = "result",
-                participant = Participant.MODEL),
-            ChatMessage(id = "m2", parentId = "r1", text = "resp2", participant = Participant.MODEL),
-            ChatMessage(id = "u2", parentId = "m2", text = "user2", participant = Participant.USER),
-            ChatMessage(id = "m3", parentId = "u2", text = "resp3", participant = Participant.MODEL)
+    fun limitContextCountsOrdinaryReasoningOnlyWhenRequested() {
+        val anchor = ChatMessage(
+            id = "u1",
+            text = "question",
+            participant = Participant.USER,
         )
-        val result = limitContext(msgs, 20)
-        assertEquals(2, result.size)
-        assertEquals("u2", result[0].id)
-        assertEquals("m3", result[1].id)
-    }
-
-    @Test
-    fun convertToOpenAiMessages_systemPrompt() {
-        val msgs = listOf(
-            ChatMessage(id = "u1", parentId = null, text = "hello", participant = Participant.USER)
+        val older = ChatMessage(
+            id = "m1",
+            text = "answer",
+            participant = Participant.MODEL,
+            segments = listOf(
+                MessageSegment(type = "thought", content = "reasoning ".repeat(80)),
+            ),
         )
-        val result = convertToOpenAiMessages(msgs, "You are helpful")
-        assertEquals("system", result.first().role)
-        assertEquals("You are helpful", result.first().content!!.first().text)
-    }
-
-    @Test
-    fun convertToOpenAiMessages_userAndModelRoles() {
-        val msg = ChatMessage(id = "u1", text = "hello", participant = Participant.USER)
-        val result = convertToOpenAiMessages(listOf(msg))
-        assertEquals("user", result.first().role)
-
-        val modelMsg = ChatMessage(id = "m1", text = "response", participant = Participant.MODEL)
-        val result2 = convertToOpenAiMessages(listOf(modelMsg))
-        assertEquals("assistant", result2.first().role)
-    }
-
-    @Test
-    fun convertToOpenAiMessages_includeImagesFalse() {
-        val msg = ChatMessage(
-            id = "u1", text = "look at this",
-            images = listOf("/nonexistent/image.jpg"),
-            participant = Participant.USER
+        val latest = ChatMessage(
+            id = "u2",
+            text = "latest",
+            participant = Participant.USER,
         )
-        val result = convertToOpenAiMessages(listOf(msg), includeImages = false)
-        assertEquals(1, result.first().content!!.size) // only text, no image
-        assertEquals("text", result.first().content!!.first().type)
-    }
-
-    @Test
-    fun convertToOpenAiMessages_emptyText_addsVisibleFallbackPart() {
-        val msg = ChatMessage(id = "u1", text = "", participant = Participant.USER)
-        val result = convertToOpenAiMessages(listOf(msg))
-        assertEquals(1, result.first().content!!.size)
-        assertEquals("[Attachment unavailable]", result.first().content!!.first().text)
+        val messages = listOf(anchor, older, latest)
+        val budget = ContextTokenEstimator.estimate(messages)
+        assertEquals(
+            listOf("u1", "m1", "u2"),
+            limitContext(messages, budget).map(ChatMessage::id),
+        )
+        assertEquals(
+            listOf("u2"),
+            limitContext(
+                messages,
+                budget,
+                includeAssistantReasoning = true,
+            ).map(ChatMessage::id),
+        )
     }
 
     @Test

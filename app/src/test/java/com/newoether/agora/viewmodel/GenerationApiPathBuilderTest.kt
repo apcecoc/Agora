@@ -1,10 +1,19 @@
 package com.newoether.agora.viewmodel
 
-import com.newoether.agora.api.util.convertToOpenAiMessages
+import com.newoether.agora.api.OpenAiMessage
+import com.newoether.agora.api.ToolDefinition
+import com.newoether.agora.api.ToolFunction
+import com.newoether.agora.api.ToolParameters
+import com.newoether.agora.api.ToolProperty
+import com.newoether.agora.api.captureProviderRequest
+import com.newoether.agora.api.openai.CustomOpenAiProvider
 import com.newoether.agora.api.util.prepareMessages
 import com.newoether.agora.data.local.MessageEntity
 import com.newoether.agora.data.repository.ConversationRepository
 import com.newoether.agora.model.ChatMessage
+import com.newoether.agora.model.AttachmentItem
+import com.newoether.agora.model.AttachmentMeta
+import com.newoether.agora.model.ImageArtifact
 import com.newoether.agora.model.MessageStatus
 import com.newoether.agora.model.Participant
 import com.newoether.agora.util.Constants
@@ -13,7 +22,11 @@ import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.mockk
 import kotlinx.coroutines.test.runTest
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.decodeFromJsonElement
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -21,7 +34,11 @@ class GenerationApiPathBuilderTest {
     @Test
     fun `caller snapshot produces compact-bounded path and exact provider config`() = runTest {
         val repository = mockk<ConversationRepository>(relaxed = true)
-        val builder = GenerationApiPathBuilder(repository) { emptyList() }
+        val builder = GenerationApiPathBuilder(
+            conversations = repository,
+            generationErrorFormatter = { it },
+            toolDefinitions = { listOf(toolDefinition()) },
+        )
         val compact = message("${Constants.COMPACT_MSG_PREFIX}boundary", parentId = "old", sequence = 1)
         val user = message("user", parentId = compact.id, sequence = 2, participant = Participant.USER)
         val model = message("model", parentId = user.id, sequence = 3)
@@ -30,7 +47,7 @@ class GenerationApiPathBuilderTest {
             GenerationApiPathRequest(
                 parentId = model.id,
                 conversationId = "conversation",
-                config = generationConfig(),
+                config = generationConfig().copy(anthropicCacheEnabled = false, anthropicCacheTtl = "5m"),
                 context = GenerationContext(),
                 loadedMessages = listOf(message("old", null, 0), compact, user, model),
             ),
@@ -38,20 +55,91 @@ class GenerationApiPathBuilderTest {
 
         assertEquals(listOf(compact.id, user.id, model.id), path.messages.map { it.id })
         assertEquals("model-id", path.providerConfig.modelId)
+        assertFalse(path.providerConfig.anthropicCacheEnabled)
+        assertEquals("5m", path.providerConfig.anthropicCacheTtl)
         assertEquals("system", path.providerConfig.systemPrompt)
-        assertTrue(path.providerConfig.tools.orEmpty().isEmpty())
+        assertEquals(listOf(toolDefinition()), path.providerConfig.tools)
         assertEquals(
             generationConfig().maxContextWindow -
-                ContextTokenEstimator.estimateFixed("system", emptyList()),
+                ContextTokenEstimator.estimateFixed("system", listOf(toolDefinition())),
             path.providerConfig.maxContextWindow,
         )
-        coVerify(exactly = 0) { repository.getMessagesForConversationSnapshot(any()) }
+    }
+
+    @Test
+    fun `low context mode omits system prompt tools and their fixed token cost`() = runTest {
+        val repository = mockk<ConversationRepository>(relaxed = true)
+        var definitionReads = 0
+        val builder = GenerationApiPathBuilder(
+            conversations = repository,
+            generationErrorFormatter = { it },
+            toolDefinitions = {
+                definitionReads++
+                error("Low Context Mode must not read tool definitions")
+            },
+        )
+        val user = message("user", null, 0, Participant.USER)
+        val config = generationConfig().copy(
+            effectiveSystemPrompt = null,
+            lowContextModeEnabled = true,
+        )
+
+        val path = builder.build(
+            GenerationApiPathRequest(
+                parentId = user.id,
+                conversationId = "conversation",
+                config = config,
+                context = GenerationContext(),
+                loadedMessages = listOf(user),
+            ),
+        )
+
+        assertEquals(0, definitionReads)
+        assertEquals(null, path.providerConfig.systemPrompt)
+        assertTrue(path.providerConfig.tools.orEmpty().isEmpty())
+        assertEquals(
+            config.maxContextWindow -
+                ContextTokenEstimator.estimateFixed(null, emptyList()),
+            path.providerConfig.maxContextWindow,
+        )
+    }
+    @Test
+    fun `deepseek chat with tools enables ordinary reasoning accounting`() = runTest {
+        val repository = mockk<ConversationRepository>(relaxed = true)
+        val user = message("user", null, 0, Participant.USER)
+        suspend fun build(config: GenerationConfig, withTools: Boolean = true) =
+            GenerationApiPathBuilder(
+                conversations = repository,
+                generationErrorFormatter = { it },
+                toolDefinitions = { if (withTools) listOf(toolDefinition()) else emptyList() },
+            ).build(
+                GenerationApiPathRequest(
+                    parentId = user.id,
+                    conversationId = "conversation",
+                    config = config,
+                    context = GenerationContext(),
+                    loadedMessages = listOf(user),
+                ),
+            ).providerConfig.includeAssistantReasoning
+        val deepSeek = generationConfig(Constants.PROVIDER_DEEPSEEK).copy(
+            modelId = "deepseek-chat",
+            thinkingEnabled = true,
+        )
+        assertTrue(build(deepSeek))
+        assertTrue(build(deepSeek.copy(providerName = "Relay")))
+        assertFalse(build(deepSeek, withTools = false))
+        assertFalse(build(deepSeek.copy(responsesApiEnabled = true)))
+        assertFalse(build(deepSeek.copy(thinkingEnabled = false)))
     }
 
     @Test
     fun `nearest normally completed compact on the parent chain is the context boundary`() = runTest {
         val repository = mockk<ConversationRepository>(relaxed = true)
-        val builder = GenerationApiPathBuilder(repository) { emptyList() }
+        val builder = GenerationApiPathBuilder(
+            conversations = repository,
+            generationErrorFormatter = { it },
+            toolDefinitions = { emptyList() },
+        )
 
         for (invalidStatus in listOf(
             MessageStatus.ERROR,
@@ -94,7 +182,11 @@ class GenerationApiPathBuilderTest {
     @Test
     fun `blank successful Compact still excludes every older ancestor`() = runTest {
         val repository = mockk<ConversationRepository>(relaxed = true)
-        val builder = GenerationApiPathBuilder(repository) { emptyList() }
+        val builder = GenerationApiPathBuilder(
+            conversations = repository,
+            generationErrorFormatter = { it },
+            toolDefinitions = { emptyList() },
+        )
         val old = message("old", null, 0, Participant.USER)
         val compact = message(
             "${Constants.COMPACT_MSG_PREFIX}blank",
@@ -120,7 +212,11 @@ class GenerationApiPathBuilderTest {
     @Test
     fun `stopped run remains an assistant before queued guidance in first openai request`() = runTest {
         val repository = mockk<ConversationRepository>(relaxed = true)
-        val builder = GenerationApiPathBuilder(repository) { emptyList() }
+        val builder = GenerationApiPathBuilder(
+            conversations = repository,
+            generationErrorFormatter = { it },
+            toolDefinitions = { emptyList() },
+        )
         val oldUser = message("old-user", null, 0, Participant.USER)
         val stoppedModel = message("stopped-model", oldUser.id, 1)
             .copy(text = "partial answer", status = MessageStatus.STOPPED, runId = "old-run")
@@ -142,29 +238,41 @@ class GenerationApiPathBuilderTest {
         assertEquals(listOf(oldUser.id, stoppedModel.id, queuedUser.id), path.messages.map { it.id })
         assertEquals(Participant.MODEL, path.messages[1].participant)
         assertTrue(path.messages[1].text.startsWith("partial answer"))
-        assertTrue(path.messages[1].text.contains("[Generation status: STOPPED]"))
+        assertTrue(path.messages[1].text.contains("<generation_interrupted reason=\"stopped\" />"))
         val projected = projectGenerationInputMessages(
             messages = path.messages,
             includeImages = true,
             userPrepend = path.providerConfig.userPrepend,
             userPostpend = path.providerConfig.userPostpend,
         )
-        val wire = convertToOpenAiMessages(
-            prepareMessages(projected, path.providerConfig.maxContextWindow),
+        val request = captureProviderRequest(
+            provider = CustomOpenAiProvider("provider", "https://example.test/v1"),
+            messages = prepareMessages(projected, path.providerConfig.maxContextWindow),
+            // These wire assertions cover conversation turns without a system message.
+            config = path.providerConfig.copy(systemPrompt = null),
         )
+        val wire = Json.decodeFromJsonElement<List<OpenAiMessage>>(request.getValue("messages"))
         val wireText = wire.flatMap { it.content.orEmpty() }.mapNotNull { it.text }.joinToString("\n")
 
         assertEquals(listOf("user", "assistant", "user"), wire.map { it.role })
         assertEquals(1, Regex(Regex.escape("partial answer")).findAll(wireText).count())
         assertEquals(1, Regex(Regex.escape("first guidance")).findAll(wireText).count())
         assertEquals(1, Regex(Regex.escape("second guidance")).findAll(wireText).count())
-        assertEquals(1, Regex(Regex.escape("[Generation status: STOPPED]")).findAll(wireText).count())
+        assertEquals(
+            1,
+            Regex(Regex.escape("<generation_interrupted reason=\"stopped\" />")).findAll(wireText).count(),
+        )
     }
 
     @Test
-    fun `failed run sends its concrete raw error once on the same assistant turn`() = runTest {
+    fun `failed run sends the formatted error once on the same assistant turn`() = runTest {
         val repository = mockk<ConversationRepository>(relaxed = true)
-        val builder = GenerationApiPathBuilder(repository) { emptyList() }
+        val displayedError = "Displayed provider failure"
+        val builder = GenerationApiPathBuilder(
+            conversations = repository,
+            generationErrorFormatter = { displayedError },
+            toolDefinitions = { emptyList() },
+        )
         val rawError = """Network error (403): {"balance":0.57,"code":"INSUFFICIENT_BALANCE"}"""
         val oldUser = message("old-user", null, 0, Participant.USER)
         val failedModel = message("failed-model", oldUser.id, 1)
@@ -193,19 +301,29 @@ class GenerationApiPathBuilderTest {
         val failed = path.messages.single { it.id == failedModel.id }
         assertEquals(Participant.MODEL, failed.participant)
         assertEquals(MessageStatus.SUCCESS, failed.status)
-        assertEquals(1, Regex(Regex.escape(rawError)).findAll(failed.text).count())
-        val wire = convertToOpenAiMessages(
-            prepareMessages(path.messages, path.providerConfig.maxContextWindow),
+        assertEquals(1, Regex(Regex.escape(displayedError)).findAll(failed.text).count())
+        assertFalse(failed.text.contains(rawError))
+        val request = captureProviderRequest(
+            provider = CustomOpenAiProvider("provider", "https://example.test/v1"),
+            messages = prepareMessages(path.messages, path.providerConfig.maxContextWindow),
+            // These wire assertions cover conversation turns without a system message.
+            config = path.providerConfig.copy(systemPrompt = null),
         )
+        val wire = Json.decodeFromJsonElement<List<OpenAiMessage>>(request.getValue("messages"))
         assertEquals(listOf("user", "assistant", "user"), wire.map { it.role })
         val wireText = wire.flatMap { it.content.orEmpty() }.mapNotNull { it.text }.joinToString("\n")
-        assertEquals(1, Regex(Regex.escape(rawError)).findAll(wireText).count())
+        assertEquals(1, Regex(Regex.escape(displayedError)).findAll(wireText).count())
+        assertFalse(wireText.contains(rawError))
     }
 
     @Test
     fun `failed compact is not a request boundary`() = runTest {
         val repository = mockk<ConversationRepository>(relaxed = true)
-        val builder = GenerationApiPathBuilder(repository) { emptyList() }
+        val builder = GenerationApiPathBuilder(
+            conversations = repository,
+            generationErrorFormatter = { it },
+            toolDefinitions = { emptyList() },
+        )
         val old = message("old", null, 0, participant = Participant.USER)
         val failed = message(
             "${Constants.COMPACT_MSG_PREFIX}failed",
@@ -246,6 +364,7 @@ class GenerationApiPathBuilderTest {
         )
         val builder = GenerationApiPathBuilder(
             conversations = repository,
+            generationErrorFormatter = { it },
             contextLoader = contextLoader,
             toolDefinitions = { emptyList() },
         )
@@ -266,11 +385,74 @@ class GenerationApiPathBuilderTest {
                     !request.followSelectedBranch
             })
         }
-        coVerify(exactly = 0) { repository.getMessagesForConversationSnapshot(any()) }
     }
 
-    private fun generationConfig() = GenerationConfig(
-        providerName = "provider",
+    @Test
+    fun `prompt cache key is scoped to the official OpenAI provider`() = runTest {
+        val repository = mockk<ConversationRepository>(relaxed = true)
+        val builder = GenerationApiPathBuilder(
+            conversations = repository,
+            generationErrorFormatter = { it },
+            toolDefinitions = { emptyList() },
+        )
+        val message = message("user", null, 0, Participant.USER)
+
+        val enabled = builder.build(
+            GenerationApiPathRequest(
+                parentId = message.id,
+                conversationId = "conversation",
+                config = generationConfig("OpenAI Compatible").copy(promptCacheKeyEnabled = true),
+                context = GenerationContext(),
+                loadedMessages = listOf(message),
+            ),
+        )
+        val disabled = builder.build(
+            GenerationApiPathRequest(
+                parentId = message.id,
+                conversationId = "conversation",
+                config = generationConfig("OpenAI Compatible"),
+                context = GenerationContext(),
+                loadedMessages = listOf(message),
+            ),
+        )
+
+        assertEquals("conversation", enabled.providerConfig.promptCacheKey)
+        assertEquals(null, disabled.providerConfig.promptCacheKey)
+    }
+
+    @Test
+    fun `transcription enabled requests preserve all undescribed image occurrences`() = runTest {
+        val builder = GenerationApiPathBuilder(
+            conversations = mockk<ConversationRepository>(relaxed = true),
+            generationErrorFormatter = { it },
+            toolDefinitions = { emptyList() },
+        )
+        val pending = ImageArtifact("pending.jpg", "image/jpeg", 100L, 1_000, 1_000)
+        val user = message("user", null, 0, Participant.USER).copy(
+            images = listOf("described.jpg", pending.path),
+            attachmentMeta = Json.encodeToString(AttachmentMeta(listOf(
+                AttachmentItem(type = "image", imageIndex = 0, transcription = "stored description"),
+                AttachmentItem(type = "image", imageIndex = 1, imageArtifacts = listOf(pending)),
+            ))),
+        )
+        val path = builder.build(GenerationApiPathRequest(
+            parentId = user.id, conversationId = "conversation",
+            config = generationConfig().copy(modelId = "OpenAI:claude-sonnet-4-5"),
+            context = GenerationContext(imageTranscriptionEnabled = true),
+            loadedMessages = listOf(user),
+        ))
+        assertTrue(path.providerConfig.includeImages)
+        assertEquals(listOf(pending.path), path.messages.single().images)
+        assertEquals(0, path.messages.single().attachmentMeta!!.items[1].imageIndex)
+        val projected = projectGenerationInputMessages(
+            path.messages, path.providerConfig.includeImages, null, null,
+        )
+        assertEquals(listOf(pending.path), projected.single().images)
+        assertTrue(projected.single().text.contains("stored description"))
+    }
+
+    private fun generationConfig(providerName: String = "provider") = GenerationConfig(
+        providerName = providerName,
         modelId = "model-id",
         apiKey = "key",
         effectiveSystemPrompt = "system",
@@ -278,6 +460,22 @@ class GenerationApiPathBuilderTest {
         googleSearchEnabled = false,
         thinkingEnabled = false,
         baseUrl = null,
+    )
+
+    private fun toolDefinition() = ToolDefinition(
+        function = ToolFunction(
+            name = "test_tool",
+            description = "Test tool",
+            parameters = ToolParameters(
+                properties = mapOf(
+                    "value" to ToolProperty(
+                        type = "string",
+                        description = "Test value",
+                    )
+                ),
+                required = listOf("value"),
+            ),
+        ),
     )
 
     private fun message(

@@ -9,6 +9,8 @@ import com.newoether.agora.model.ToolCallData
 import com.newoether.agora.model.apiModelName
 import com.newoether.agora.util.SnackbarEvent
 import java.nio.charset.StandardCharsets
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
 import java.util.Locale
 import java.util.UUID
 
@@ -46,10 +48,13 @@ internal object CustomProviderIdentityPolicy {
 
     fun isStableId(value: String): Boolean = stableIdPattern.matches(value.trim())
 
+    /** Cheap precheck: text without the prefix cannot hold a stable ID. */
+    fun mayContainStableId(text: String?): Boolean = text != null && text.contains(PREFIX, ignoreCase = true)
+
     fun replaceStableIdsForDisplay(
         text: String,
         replacement: (String) -> String,
-    ): String = stableIdInTextPattern.replace(text) { match ->
+    ): String = if (!mayContainStableId(text)) text else stableIdInTextPattern.replace(text) { match ->
         replacement(match.value)
     }
 
@@ -113,11 +118,11 @@ internal fun String.remapProviderReference(
     return match.value + removePrefix(match.key)
 }
 
-internal fun remapModelAliases(
-    aliases: Map<String, String>,
+internal fun <T> remapModelPreferenceKeys(
+    aliases: Map<String, T>,
     migrations: Map<String, String>,
-): Map<String, String> {
-    val result = linkedMapOf<String, String>()
+): Map<String, T> {
+    val result = linkedMapOf<String, T>()
     aliases.forEach { (modelId, alias) ->
         if (modelId.remapProviderReference(migrations) == modelId) result[modelId] = alias
     }
@@ -144,11 +149,11 @@ internal fun canonicalCustomModelId(
  * is intentionally conservative: an orphan namespace moves only when the current model catalog
  * identifies exactly one active custom provider. Ambiguous aliases remain untouched.
  */
-internal fun repairOrphanedCustomProviderAliases(
-    aliases: Map<String, String>,
+internal fun <T> repairOrphanedCustomProviderPreferenceKeys(
+    aliases: Map<String, T>,
     knownModelReferences: Collection<String>,
     activeProviderIds: Set<String>,
-): Map<String, String> {
+): Map<String, T> {
     val activeModels = knownModelReferences.asSequence()
         .map(ModelId::parse)
         .filter { it.providerName in activeProviderIds }
@@ -170,7 +175,7 @@ internal fun repairOrphanedCustomProviderAliases(
     }.toMap()
     if (recoveredProviders.isEmpty()) return aliases
 
-    val result = linkedMapOf<String, String>()
+    val result = linkedMapOf<String, T>()
     aliases.forEach { (modelId, alias) ->
         val parsed = ModelId.parse(modelId)
         if (parsed.providerName !in recoveredProviders) result[modelId] = alias
@@ -219,9 +224,32 @@ private fun String?.replaceCustomProviderIdsForDisplayOrNull(
     customProviders: List<CustomProviderConfig>,
 ): String? = this?.let { replaceCustomProviderIdsForDisplay(it, customProviders) }
 
+/**
+ * Whether any displayed field may hold a stable provider ID. Display projection runs for every
+ * message of the open path on each stream snapshot, so a message without one is returned as is,
+ * without a regex pass or a copy, and keeps its identity for Compose skipping.
+ */
+private fun ChatMessage.mayHoldProviderIds(): Boolean {
+    val ids = CustomProviderIdentityPolicy::mayContainStableId
+    return ids(text) || ids(thoughts) || ids(thoughtTitle) || ids(retryText) ||
+        toolCall?.let { call ->
+            ids(call.toolName) || ids(call.arguments) || ids(call.result) || ids(call.displayName) ||
+                ids(call.target) || ids(call.resultText) || ids(call.structuredResult)
+        } == true ||
+        segments?.any { segment ->
+            segment.type != "citation" && (ids(segment.content) || ids(segment.toolName) ||
+                ids(segment.toolArgs) || ids(segment.toolResult) || ids(segment.toolProgress) ||
+                ids(segment.toolTarget) || ids(segment.toolDisplayName) || ids(segment.toolResultText) ||
+                ids(segment.toolStructuredResult))
+        } == true ||
+        attachmentMeta?.items?.any { item ->
+            ids(item.fileName) || ids(item.warning) || ids(item.textContent) || ids(item.transcription)
+        } == true
+}
+
 fun ChatMessage.forDisplay(
     customProviders: List<CustomProviderConfig>,
-): ChatMessage = copy(
+): ChatMessage = if (!mayHoldProviderIds()) this else copy(
     text = replaceCustomProviderIdsForDisplay(text, customProviders),
     thoughts = thoughts.replaceCustomProviderIdsForDisplayOrNull(customProviders),
     thoughtTitle = thoughtTitle.replaceCustomProviderIdsForDisplayOrNull(customProviders),
@@ -238,6 +266,7 @@ private fun ToolCallData.forDisplay(
     arguments = replaceCustomProviderIdsForDisplay(arguments, customProviders),
     result = replaceCustomProviderIdsForDisplay(result, customProviders),
     displayName = displayName.replaceCustomProviderIdsForDisplayOrNull(customProviders),
+    target = target.replaceCustomProviderIdsForDisplayOrNull(customProviders),
     resultText = resultText.replaceCustomProviderIdsForDisplayOrNull(customProviders),
     structuredResult = structuredResult.replaceCustomProviderIdsForDisplayOrNull(customProviders),
 )
@@ -280,6 +309,157 @@ fun modelApiDisplayName(
     customProviders,
 )
 
+private val aliasSeparators = Regex("[-_\\s]+")
+private val omittedAliasVariantSuffix = Regex(":(?:batch|free)$", RegexOption.IGNORE_CASE)
+private val novaAliasPattern = Regex(
+    "^nova-(\\d+(?:\\.\\d+)?)-(.+)-v\\d+(?::\\d+)?$",
+    RegexOption.IGNORE_CASE,
+)
+private val geminiPreviewAliasPattern = Regex(
+    "^(gemini-[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?)-preview$",
+    RegexOption.IGNORE_CASE,
+)
+private val claudeFamilyFirstAliasPattern = Regex(
+    "^claude-([a-z][a-z0-9]*(?:-[a-z][a-z0-9]*)*)-(\\d{1,2})(?:-(\\d{1,2}))?" +
+        "(?:-(\\d{8}))?(?:-fast)?$",
+    RegexOption.IGNORE_CASE,
+)
+private val claudeVersionFirstAliasPattern = Regex(
+    "^claude-(\\d{1,2})(?:-(\\d{1,2}))?-([a-z][a-z0-9]*(?:-[a-z][a-z0-9]*)*)" +
+        "(?:-(\\d{8}))?(?:-fast)?$",
+    RegexOption.IGNORE_CASE,
+)
+private val snapshotDateFormatter = DateTimeFormatter.BASIC_ISO_DATE
+private val exactAliasTokenDisplayNames = mapOf(
+    "a3b" to "A3B",
+    "a70b" to "A70B",
+    "e4b" to "E4B",
+    "glm" to "GLM",
+    "mimo" to "MiMo",
+    "minimax" to "MiniMax",
+    "oss" to "OSS",
+    "tts" to "TTS",
+)
+private val aliasTokenDisplayNames = mapOf(
+    "ai" to "AI",
+    "api" to "API",
+    "claude" to "Claude",
+    "cohere" to "Cohere",
+    "command" to "Command",
+    "deepseek" to "DeepSeek",
+    "gemini" to "Gemini",
+    "gemma" to "Gemma",
+    "gpt" to "GPT",
+    "grok" to "Grok",
+    "kimi" to "Kimi",
+    "llama" to "Llama",
+    "llm" to "LLM",
+    "mistral" to "Mistral",
+    "mixtral" to "Mixtral",
+    "nova" to "Nova",
+    "phi" to "Phi",
+    "qwen" to "Qwen",
+    "qwq" to "QwQ",
+    "vl" to "VL",
+    "vlm" to "VLM",
+)
+
+/** Human-readable display fallback only; the original model ID remains authoritative. */
+internal fun inferModelAlias(modelName: String): String {
+    val trimmed = modelName.trim()
+    if (trimmed.isEmpty()) return trimmed
+
+    val pathTail = trimmed.substringAfterLast('/').trim().ifEmpty { trimmed }
+    val withoutVariant = pathTail.replace(omittedAliasVariantSuffix, "").ifEmpty { pathTail }
+    inferGeminiAlias(withoutVariant)?.let { return it }
+    inferClaudeAlias(withoutVariant)?.let { return it }
+    inferNovaAlias(withoutVariant)?.let { return it }
+    return humanizeModelAlias(withoutVariant).ifEmpty { trimmed }
+}
+
+private fun inferGeminiAlias(slug: String): String? {
+    val match = geminiPreviewAliasPattern.matchEntire(slug) ?: return null
+    return humanizeModelAlias(match.groupValues[1])
+}
+
+private fun inferClaudeAlias(slug: String): String? {
+    claudeFamilyFirstAliasPattern.matchEntire(slug)?.let { match ->
+        val snapshot = match.groupValues[4].takeIf(String::isNotEmpty)
+        if (snapshot != null && !isValidSnapshotDate(snapshot)) return null
+        return buildClaudeAlias(
+            family = match.groupValues[1],
+            major = match.groupValues[2],
+            minor = match.groupValues[3].takeIf(String::isNotEmpty),
+        )
+    }
+    claudeVersionFirstAliasPattern.matchEntire(slug)?.let { match ->
+        val snapshot = match.groupValues[4].takeIf(String::isNotEmpty)
+        if (snapshot != null && !isValidSnapshotDate(snapshot)) return null
+        return buildClaudeAlias(
+            family = match.groupValues[3],
+            major = match.groupValues[1],
+            minor = match.groupValues[2].takeIf(String::isNotEmpty),
+            versionFirst = true,
+        )
+    }
+    return null
+}
+
+private fun buildClaudeAlias(
+    family: String,
+    major: String,
+    minor: String?,
+    versionFirst: Boolean = false,
+): String {
+    val version = listOfNotNull(major, minor).joinToString(".")
+    val familyName = humanizeModelAlias(family)
+    return if (versionFirst) {
+        "Claude $version $familyName"
+    } else {
+        "Claude $familyName $version"
+    }
+}
+
+private fun inferNovaAlias(slug: String): String? {
+    val match = novaAliasPattern.matchEntire(slug) ?: return null
+    return "Nova ${match.groupValues[1]} ${humanizeModelAlias(match.groupValues[2])}"
+}
+
+private fun humanizeModelAlias(value: String): String = value
+    .split(aliasSeparators)
+    .filter(String::isNotEmpty)
+    .joinToString(" ", transform = ::formatAliasToken)
+
+private fun formatAliasToken(value: String): String {
+    val normalized = value.lowercase(Locale.ROOT)
+    exactAliasTokenDisplayNames[normalized]?.let { return it }
+    aliasTokenDisplayNames[normalized]?.let { return it }
+    aliasTokenDisplayNames.entries.firstOrNull { (token, _) ->
+        normalized.length > token.length &&
+            normalized.startsWith(token) &&
+            normalized[token.length].isDigit()
+    }?.let { (token, displayName) ->
+        val numericSuffix = normalized.removePrefix(token)
+        return if (token == "qwen") "$displayName $numericSuffix" else displayName + numericSuffix
+    }
+    if (normalized.matches(Regex("[vr]\\d+(?:\\.\\d+)?"))) {
+        return normalized.replaceFirstChar(Char::uppercaseChar)
+    }
+    if (normalized.matches(Regex("o\\d+(?:\\.\\d+)?"))) {
+        return normalized.replaceFirstChar(Char::uppercaseChar)
+    }
+    if (normalized.matches(Regex("\\d+(?:\\.\\d+)?[bkmt]"))) {
+        return normalized.dropLast(1) + normalized.last().uppercaseChar()
+    }
+    return normalized.replaceFirstChar { character ->
+        if (character.isLetter()) character.titlecase(Locale.ROOT) else character.toString()
+    }
+}
+
+private fun isValidSnapshotDate(value: String): Boolean = runCatching {
+    LocalDate.parse(value, snapshotDateFormatter)
+}.isSuccess
+
 fun modelAliasDisplayName(
     modelId: String,
     aliases: Map<String, String>,
@@ -287,16 +467,16 @@ fun modelAliasDisplayName(
 ): String = aliases[modelId]
     ?.takeIf(String::isNotBlank)
     ?.let { replaceCustomProviderIdsForDisplay(it, customProviders) }
-    ?: modelApiDisplayName(modelId, customProviders)
+    ?: inferModelAlias(modelApiDisplayName(modelId, customProviders))
 
 fun modelDisplayName(
     modelId: String,
     aliases: Map<String, String>,
     customProviders: List<CustomProviderConfig>,
+    showProviderName: Boolean,
 ): String {
-    aliases[modelId]?.takeIf(String::isNotBlank)?.let {
-        return modelAliasDisplayName(modelId, aliases, customProviders)
-    }
+    val alias = modelAliasDisplayName(modelId, aliases, customProviders)
+    if (!showProviderName) return alias
     val parsed = ModelId.parse(modelId)
-    return "${modelApiDisplayName(modelId, customProviders)} (${providerDisplayName(parsed.providerName, customProviders)})"
+    return "$alias (${providerDisplayName(parsed.providerName, customProviders)})"
 }

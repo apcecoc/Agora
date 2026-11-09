@@ -5,6 +5,16 @@ Status: authoritative, 2026-08-14.
 This contract owns Agora's complete citation lifecycle. It applies to structured citations from
 Providers, compatible relays, supported conversation imports, durable message storage, streaming
 projection, message reload, copy/search/selection, and answer rendering.
+The WebUI follows this complete native contract as confirmed on 2026-10-14: Kotlin projects the
+canonical normalized citation records and Markdown presentation through its existing sync payload;
+the browser renders terminal inline/group capsules, the Sources summary and shared source sheet,
+safe URL and non-URL details, portable Copy output, and body-search metadata exclusion. It must not
+parse Provider-private dialects or become a second normalization, persistence or generation owner.
+The canonical Markdown projection optionally tracks original UTF-16 positions through citation
+insertion, wrapper replacement, grouping and private-marker removal. The WebUI composes that map
+with its existing math source map, so body search after a capsule keeps original message offsets.
+Inline placeholder expansion retains each remaining text leaf's position within its Markdown token;
+capsule labels never enter body-search ranges.
 
 Citation presentation is answer metadata. It is not Markdown syntax, ordinary answer text, a tool
 call, a tool result, or Provider-history content.
@@ -77,15 +87,20 @@ search, or exposed as a fallback title or URL.
   while preserving first-source order. Repeated deltas or final metadata must not duplicate a
   source or anchor.
 - Provider metadata may arrive after the cited answer text and remains eligible for streaming
-  checkpoint persistence and live presentation. As soon as a source and anchor validate, its inline
-  source capsule is projected in both streaming and terminal answer states; inline presentation is
-  not gated by the bottom action controls. The summary capsule alone follows the action-control
-  lifecycle and remains hidden while those controls are hidden.
+  checkpoint persistence. Active generation keeps inline citation presentation hidden. The terminal
+  answer projects validated inline source capsules. The Sources summary follows the bottom
+  action-control lifecycle and remains hidden while those controls are hidden.
 - A trailing streaming suffix that is still a possible parenthesized Markdown-link citation wrapper
   is withheld until it resolves to a structured citation, becomes provably ordinary answer text, or
-  the answer terminalizes. A validated wrapper becomes the native capsule immediately. If the answer
-  terminalizes without matching structured metadata, the original ordinary Markdown is restored.
-  Streaming must not expose a raw wrapper and then replace it with a placeholder glyph at completion.
+  the answer terminalizes. A validated wrapper becomes a native capsule only in terminal
+  presentation. If the answer terminalizes without matching structured metadata, the original
+  ordinary Markdown is restored. Streaming must not expose the raw wrapper before that decision.
+- When a streaming projection differs from the terminal projection, the final streaming Markdown
+  remains mounted until the message-list mutation anchor is armed. The terminal projection commits
+  on the following frame through the same Markdown subtree and adopts its measured terminal size
+  immediately. Late terminal citation metadata repeats this same handoff. Crossfading duplicate
+  Markdown trees, exposing terminal click targets before commit, and animating ordinary streaming
+  growth or the terminal Markdown size change are prohibited.
 - The same projection applies after normal completion, user Stop, or a persisted partial failure.
   Valid citations already received remain available in all three terminal states.
 - Malformed, unsafe, unsupported, or late citation metadata cannot turn an otherwise valid answer
@@ -103,11 +118,17 @@ exact-`citedText` occurrence rule in section 2. Markdown syntax, links, code, HT
 transformations that prevent a deterministic source-to-display mapping cause a bottom-sheet-only
 fallback; they do not justify splitting the answer into independent Markdown blocks.
 
-When the entire cited range is a parenthesized Markdown link whose target is the same canonical safe
-URL as the structured citation source, that wrapper is Provider presentation syntax: streaming and
-terminal projection replace the full range with the native capsule. It must not preserve the
-parentheses, link label, or Markdown target and then append a second capsule. For ordinary claim-text
-anchors, the claim remains unchanged and the capsule is inserted after it.
+A parenthesized Markdown link whose target has the same canonical safe URL as a structured citation
+source is Provider presentation syntax when it maps deterministically through an overlapping anchor
+or, when no positional evidence identifies a wrapper, through one unique same-URL wrapper. The
+anchor may cover the complete wrapper, the Markdown link, the label, or another valid subrange; it
+does not need to cover the complete wrapper. Terminal projection replaces every positionally mapped
+wrapper, or the unique same-URL fallback wrapper, as one complete range with the native capsule. It
+must not preserve the parentheses, link label, or Markdown target and then append a second capsule.
+Repeated same-URL wrappers without positional evidence remain ambiguous and receive no inline
+capsule. A standard Markdown link without the additional outer parentheses remains ordinary answer
+content even when its URL matches a structured citation. For ordinary claim-text anchors, the claim
+remains unchanged and the capsule is inserted after it.
 
 Resolvable private-use markers map to their structured source and disappear from visible answer
 text. Unresolved OpenAI/ChatGPT `cite`, `filecite`, and equivalent bare `turn...` envelopes are
@@ -139,13 +160,18 @@ ordinary Unicode text or standard Markdown links.
   `labelLarge` text. Icon and text share the existing capsule foreground color. Its external left
   edge extends 4 dp into the message list's 8 dp inset, matching the compact Thinking card's 4 dp
   screen-side margin without changing the capsule's internal padding or right-side geometry.
-- Inline/group, summary, numbered-source containers, and bottom-sheet source rows own a draw-only fade
-  from alpha `0f` to `1f` over 320 ms with `LinearEasing`. The fade adds no scale, translation, delayed
-  data, hidden click target, remeasurement, or message-height change. Stable message/source/group
-  identity prevents ordinary recomposition or count-label updates from replaying it; genuinely
-  new/reappearing capsules and false-to-true summary visibility transitions replay it. Opacity-only
-  fade remains enabled when spatial motion is reduced. A valid Gemini citation first visible around
-  answer terminalization must start at zero draw alpha and fade in rather than flash at full opacity.
+- Inline/group, numbered-source containers, and bottom-sheet source rows own a draw-only fade from
+  alpha `0f` to `1f` over 320 ms with `LinearEasing`. The opacity layer adds no scale, translation,
+  delayed data, hidden click target, or remeasurement. The Sources summary has no independent fade,
+  scale, measured-height host, retained zero-height slot, or layout-mutation owner. It is composed at
+  the same visibility boundary as the bottom information actions and uses that owner's exact alpha,
+  including the 320 ms enter, 220 ms exit, `LinearEasing`, and interruption behavior. While a shared
+  exit fade is still visible, its fixed content may remain composed but is disabled and exposes no
+  semantics; when the shared alpha reaches zero it leaves layout directly. Stable
+  message/source/group identity prevents ordinary recomposition or count-label updates from replaying
+  capsule transitions. Genuinely new/reappearing inline, numbered, and source-row capsules replay
+  their owned opacity fade. A valid Gemini citation first visible around answer terminalization must
+  start at zero draw alpha and fade in rather than flash at full opacity.
 - Primary inline/group, summary, and numbered-source containers use the thinking-card palette: the
   theme surface color at 2 dp tonal elevation with `primary.copy(alpha = 0.7f)` foreground text.
   Each complete source row in either Sources sheet is transparent at rest. It retains
@@ -175,6 +201,9 @@ ordinary Unicode text or standard Markdown links.
 - Every clickable link rendered in chat answer content uses the theme link/accent color with
   `TextDecoration.None`. Sources-sheet URL titles are the explicit presentation exception: they use
   `onSurface` like non-URL source titles while retaining the same safe link target and activation.
+  Pressing and releasing an ordinary Markdown link interpolates only that link's text color between
+  the normal accent and its existing 72%-alpha pressed color over 180 ms with
+  `FastOutSlowInEasing`; the color-only feedback remains enabled under Reduced Motion.
   Link labels, targets, safe-activation rules, and ordinary Markdown semantics remain unchanged.
   Non-URL file/document sources remain normal text and open the in-app detail surface.
 - A safe HTTP(S) source opens through Agora's existing safe-link interaction path. A non-URL
@@ -192,8 +221,10 @@ ordinary Unicode text or standard Markdown links.
 - The message Copy action emits the cleaned original answer followed, when sources exist, by a
   portable Markdown `Sources` list. It includes display titles and safe URLs where available; it
   never includes raw Provider-private IDs.
-- In-conversation text search matches cleaned answer text and citation source titles. It does not
-  match raw URLs, file IDs, Provider-private IDs, or encoded citation JSON.
+- In-conversation text search matches only ordinary selected-branch USER and Assistant message body
+  text through the existing visible Markdown projection. Citation source titles and all citation
+  metadata are excluded, including raw URLs, file IDs, Provider-private IDs, and encoded citation
+  JSON.
 - Selection operates on visible rendered content. Inline capsule alternate text remains
   `[<capsule label>]`; the dedicated Copy action remains the authoritative portable
   answer-plus-Sources export.
@@ -227,7 +258,7 @@ ordinary Unicode text or standard Markdown links.
 | `GenerationManager` and existing streaming segment overlay | Accept identified citation events, checkpoint the bounded segments, and preserve them through terminal settlement. |
 | Provider message projection | Exclude citation segments while preserving original assistant text and all existing tool/thought protocol behavior. |
 | Importers/exporters | Normalize supported external citations and preserve native citation segments. |
-| Existing Markdown/message UI | Project terminal inline source capsules, the action-lifecycle Sources summary capsule and bottom sheet, detail interaction, copy text, search titles, selection fallback, and accessibility. |
+| Existing Markdown/message UI | Project terminal inline source capsules, the action-lifecycle Sources summary capsule and bottom sheet, detail interaction, copy text, body-search highlighting, selection fallback, and accessibility. |
 
 These owners must not create a citation-specific generation lifecycle, Room schema, Provider
 adapter hierarchy, Markdown dialect, tool execution path, or branch/history owner.
@@ -253,14 +284,19 @@ Changes touching citations must prove:
    object-replacement glyph, domain/file-label capsules without parenthesized domains, maximal
    adjacent-run grouping with non-ellipsized `+N`, separated-run isolation, content-measured single
    capsules with no absent-suffix reservation, exact action-control lifecycle matching, a 36 dp
-   left-aligned dynamic-count summary capsule, thinking-card capsule colors, 320 ms draw-only fade for
-   initial/reappearing/late-Gemini capsules, unconditional `N Sources` titles with thinking-sheet
-   typography, grouped subset-sheet reuse, full-list summary-sheet preservation, complete ordered
-   bottom-sheet contents, transparent rows with pill-clipped ripple, safe click/detail behavior,
-   selection fallback, Copy output, and accessibility labels.
-7. Citation-title global search uses stable primary-key keyset pages and a bounded newest-first
-   top-K accumulator. It preserves limit/title-only semantics, handles equal timestamps without
-   gaps or duplicates, and never loads or decodes the whole citation corpus at once. A no-match
-   query may scan all bounded pages; a future title index requires a separately reviewed migration.
+   left-aligned dynamic-count summary capsule, thinking-card capsule colors, shared information-action
+   alpha with 320 ms enter, 220 ms exit, `LinearEasing`, and identical interruption behavior, no
+   Sources scale or measured-height host, 320 ms draw-only opacity fade for initial/reappearing/
+   late-Gemini inline and source capsules, unconditional `N Sources` titles with
+   thinking-sheet typography, grouped subset-sheet reuse, full-list summary-sheet preservation,
+   complete ordered bottom-sheet contents, transparent rows with pill-clipped ripple, safe
+   click/detail behavior, selection fallback, Copy output, and accessibility labels.
+7. Global citation-title search shares the literal history path in `semantic-search.md`: bounded
+   newest-first `(timestamp, id)` keyset pages select identities through the timestamp/id index before
+   applying eligibility or loading citation JSON. Enough matches stop the scan immediately; only
+   winners are hydrated. Query-plan tests prevent a per-page corpus sort or unindexed scan. Preserve
+   title-only semantics, equal-timestamp ordering, literal query behavior and cancellation without
+   loading or decoding the whole citation corpus at once. A miss may scan all short pages. The
+   additive timestamp/id index is not a citation-title index and does not backfill citation payloads.
 8. Complete scoped diff review, `git diff --check`, focused tests, the project full build, and
    deployment of the exact successful APK for owner UI testing.

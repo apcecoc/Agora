@@ -1,5 +1,7 @@
 package com.newoether.agora.ui.chat
 
+import com.newoether.agora.presentation.resolveOpenAiConversationServiceTier
+
 import com.newoether.agora.data.ConversationSettings
 import com.newoether.agora.data.CustomEndpointProtocol
 import com.newoether.agora.data.CustomProviderConfig
@@ -30,7 +32,7 @@ class OpenAiConversationServiceTierTest {
             globalTier = OpenAiServiceTiers.FLEX,
             conversationOverride = ConversationSettings(
                 openAiServiceTierEnabled = false,
-                openAiServiceTier = OpenAiServiceTiers.FAST,
+                openAiServiceTier = "priority",
             ),
             providerName = Constants.PROVIDER_OPENAI,
             builtInOpenAiResponsesEnabled = true,

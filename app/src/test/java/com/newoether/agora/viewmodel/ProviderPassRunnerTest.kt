@@ -1,13 +1,20 @@
 package com.newoether.agora.viewmodel
 
+import android.content.Context
+import com.newoether.agora.api.util.MALFORMED_TOOL_CALL_NAME
 import com.newoether.agora.api.GenerationError
 import com.newoether.agora.api.LlmProvider
 import com.newoether.agora.api.ProviderConfig
 import com.newoether.agora.api.StreamEvent
+import com.newoether.agora.api.ToolDefinition
+import com.newoether.agora.api.ToolFunction
+import com.newoether.agora.api.ToolParameters
 import com.newoether.agora.model.ChatMessage
 import com.newoether.agora.model.CitationRecord
+import com.newoether.agora.model.MessageStatus
 import com.newoether.agora.model.Participant
 import com.newoether.agora.model.RunEffectIdentity
+import io.mockk.mockk
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
@@ -83,7 +90,32 @@ class ProviderPassRunnerTest {
     }
 
     @Test
-    fun `malformed duplicate incomplete and empty tool batches fail closed`() = runTest {
+    fun `equivalent text and native calls with the same id keep native authority`() = runTest {
+        val native = StreamEvent.ToolCallRequest(
+            id = "call_1",
+            name = "file_read",
+            arguments = "{ \"path\": \"a.txt\" }",
+            streamKey = "native_stream",
+        )
+        val forwarded = mutableListOf<StreamEvent>()
+
+        val outcome = runner(
+            listOf(
+                StreamEvent.TextChunk(
+                    "<tool_call>{\"id\":\"call_1\",\"name\":\"file_read\"," +
+                        "\"arguments\":{\"path\":\"a.txt\"}}</tool_call>"
+                ),
+                native,
+            )
+        ).run(IDENTITY, messages(), CONFIG, forwarded::add)
+
+        assertEquals(ProviderPassOutcome.CompletedToolCalls(IDENTITY, listOf(native)), outcome)
+        assertEquals(listOf(native), forwarded.filterIsInstance<StreamEvent.ToolCallRequest>())
+        assertTrue(forwarded.none { it is StreamEvent.Error })
+    }
+
+    @Test
+    fun `malformed duplicate incomplete and empty tool batches stay pairable`() = runTest {
         val valid = StreamEvent.ToolCallRequest("call_1", "file_read", "{}", streamKey = "s1")
         val invalidStreams = listOf(
             listOf<StreamEvent>(
@@ -93,7 +125,6 @@ class ProviderPassRunnerTest {
             listOf<StreamEvent>(valid.copy(name = "bad name")),
             listOf<StreamEvent>(valid.copy(id = "bad id")),
             listOf<StreamEvent>(valid.copy(streamKey = "")),
-            listOf<StreamEvent>(valid.copy(arguments = "{")),
             listOf<StreamEvent>(
                 valid,
                 valid.copy(id = "call_2"),
@@ -104,7 +135,10 @@ class ProviderPassRunnerTest {
             listOf<StreamEvent>(StreamEvent.ToolCallsRequest(emptyList())),
         )
 
-        invalidStreams.forEach { streamEvents ->
+        // Identity damage is answered as malformed calls; a reused or blank stream key is local
+        // bookkeeping and only gets a fresh key.
+        val expectedMalformed = listOf(1, 1, 1, 0, 0, 1, 1)
+        invalidStreams.zip(expectedMalformed).forEach { (streamEvents, malformedCount) ->
             val forwarded = mutableListOf<StreamEvent>()
             val outcome = runner(streamEvents).run(
                 IDENTITY,
@@ -113,10 +147,24 @@ class ProviderPassRunnerTest {
                 forwarded::add,
             )
 
-            assertTrue(outcome is ProviderPassOutcome.Failed)
-            assertTrue((outcome as ProviderPassOutcome.Failed).error is GenerationError.SseParse)
-            assertTrue(forwarded.last() is StreamEvent.Error)
+            val calls = (outcome as ProviderPassOutcome.CompletedToolCalls).calls
+            assertEquals(malformedCount, calls.count { it.name == MALFORMED_TOOL_CALL_NAME })
+            assertEquals(calls.size, calls.map { it.id }.distinct().size)
+            assertEquals(calls.size, calls.map { it.streamKey }.distinct().size)
+            assertTrue(calls.all { it.streamKey.isNotBlank() })
+            assertTrue(forwarded.none { it is StreamEvent.Error })
         }
+    }
+
+    @Test
+    fun `unparsable arguments stay pairable and are reported by the tool executor`() = runTest {
+        val malformed = StreamEvent.ToolCallRequest("call_1", "file_read", "{", streamKey = "s1")
+        val forwarded = mutableListOf<StreamEvent>()
+
+        val outcome = runner(listOf(malformed)).run(IDENTITY, messages(), CONFIG, forwarded::add)
+
+        assertEquals(ProviderPassOutcome.CompletedToolCalls(IDENTITY, listOf(malformed)), outcome)
+        assertTrue(forwarded.none { it is StreamEvent.Error })
     }
 
     @Test
@@ -234,6 +282,151 @@ class ProviderPassRunnerTest {
         )
     }
 
+    @Test
+    fun `retry drops only failed formatting before the real accumulator and preserves prior tool pass`() = runTest {
+        val prefixes = listOf(
+            listOf<StreamEvent>(StreamEvent.TextChunk(" \t\n")),
+            listOf<StreamEvent>(StreamEvent.ThoughtChunk(" \t\n", title = "Failed attempt")),
+            listOf<StreamEvent>(StreamEvent.TextChunk("  "), StreamEvent.ThoughtChunk("\n")),
+        )
+        listOf(CONFIG.copy(tools = null), CONFIG).forEach { config ->
+            prefixes.forEach { prefix ->
+                val output = GenerationOutputAccumulator(
+                    object : GenerationToolPresentationSource {
+                        override fun presentationMetadata(name: String, arguments: String?) = null
+                    },
+                    "provider",
+                )
+                val context = mockk<Context>(relaxed = true)
+                val provider = fakeProvider(flowOf())
+                val gate = StreamingUiUpdateGate()
+                var providerAnswerStart = 0
+                val retrySnapshots = mutableListOf<String>()
+                val consume: suspend (StreamEvent) -> Unit = { event ->
+                    output.handleStreamEvent(
+                        event, providerAnswerStart, provider, context, emptyMap(), gate,
+                        publishStreamUpdate = {},
+                        publishRetrySnapshot = { retrySnapshots += output.totalText.toString() },
+                    )
+                }
+                val call = StreamEvent.ToolCallRequest("call_previous", "file_read", "{}", streamKey = "previous")
+                val citation = StreamEvent.CitationUpdate(
+                    CitationRecord(sourceId = "previous_source", provider = "test", kind = "url", title = "Source"),
+                )
+                output.beginProviderRequest()
+                val priorOutcome = runner(listOf(
+                    StreamEvent.ThoughtChunk("Previous thought", signature = "previous_signature"),
+                    StreamEvent.TextChunk("Previous answer\n"), citation, call,
+                )).run(IDENTITY, messages(), config, consume)
+                assertTrue(priorOutcome is ProviderPassOutcome.CompletedToolCalls)
+                output.tokenUsageAccumulator.finishRequest()
+                output.flushAnswerSegment()
+                output.flushThoughtSegment()
+                output.currentStatus = MessageStatus.SENDING
+                val priorSegments = output.toolOverlay.snapshot()
+                providerAnswerStart = output.totalText.length
+                output.beginProviderRequest()
+
+                val outcome = runner(
+                    prefix + StreamEvent.Retrying(1, 5) + prefix + StreamEvent.Retrying(2, 5) +
+                        listOf(StreamEvent.TextChunk("    \n"), StreamEvent.TextChunk("ok")),
+                ).run(IDENTITY.copy(pass = 4, effectId = "provider-4-0"), messages(), config, consume)
+                output.tokenUsageAccumulator.finishRequest()
+
+                assertTrue(outcome is ProviderPassOutcome.CompletedText)
+                assertEquals(listOf("Previous answer\n", "Previous answer\n"), retrySnapshots)
+                assertEquals("Previous answer\n    \nok", output.totalText.toString())
+                assertEquals("    \nok", output.currentAnswerBuf.toString())
+                assertEquals("Previous thought", output.totalThoughts)
+                assertEquals("", output.currentThoughtBuf.toString())
+                assertEquals(priorSegments, output.toolOverlay.snapshot())
+                assertTrue(priorSegments.any { it.signature == "previous_signature" })
+                assertTrue(priorSegments.any { it.type == "tool" })
+                assertTrue(priorSegments.any { it.type == "citation" })
+            }
+        }
+    }
+
+    @Test
+    fun `successful thought prefix signature and whitespace only completion stay exact`() = runTest {
+        listOf(CONFIG.copy(tools = null), CONFIG).forEach { config ->
+            val thoughts = mutableListOf<StreamEvent>()
+            runner(listOf(
+                StreamEvent.ThoughtChunk("\n\n", title = "Failed attempt"),
+                StreamEvent.Retrying(1, 5),
+                StreamEvent.ThoughtChunk(" \t\n"),
+                StreamEvent.ThoughtChunk("reason", signature = "signature"),
+            )).run(IDENTITY, messages(), config, thoughts::add)
+            assertEquals(" \t\nreason", thoughts.filterIsInstance<StreamEvent.ThoughtChunk>().joinToString("") { it.thought })
+            assertTrue(thoughts.filterIsInstance<StreamEvent.ThoughtChunk>().any { it.signature == "signature" })
+
+            val blank = mutableListOf<StreamEvent>()
+            runner(listOf(StreamEvent.TextChunk(" \t\n"))).run(IDENTITY, messages(), config, blank::add)
+            assertEquals(" \t\n", blank.filterIsInstance<StreamEvent.TextChunk>().joinToString("") { it.text })
+        }
+    }
+
+    @Test
+    fun `successful formatting keeps usage and citation order before real accumulation`() = runTest {
+        val output = GenerationOutputAccumulator(
+            object : GenerationToolPresentationSource {
+                override fun presentationMetadata(name: String, arguments: String?) = null
+            },
+            "provider",
+        )
+        val context = mockk<Context>(relaxed = true)
+        val provider = fakeProvider(flowOf())
+        val gate = StreamingUiUpdateGate()
+        val events = listOf(
+            StreamEvent.TextChunk("    "),
+            StreamEvent.UsageUpdate(12, thoughtsTokenCount = 3),
+            StreamEvent.CitationUpdate(
+                CitationRecord(sourceId = "prefix_source", provider = "test", kind = "url", title = "Source"),
+            ),
+            StreamEvent.TextChunk("ok"),
+        )
+        val forwarded = mutableListOf<StreamEvent>()
+
+        output.beginProviderRequest()
+        val outcome = runner(events).run(IDENTITY, messages(), CONFIG.copy(tools = null)) { event ->
+            forwarded += event
+            output.handleStreamEvent(
+                event, 0, provider, context, emptyMap(), gate,
+                publishStreamUpdate = {}, publishRetrySnapshot = {},
+            )
+        }
+        output.tokenUsageAccumulator.finishRequest()
+
+        assertEquals(ProviderPassOutcome.CompletedText(IDENTITY), outcome)
+        assertEquals(events, forwarded)
+        assertEquals("    ok", output.totalText.toString())
+        assertEquals("    ok", output.currentAnswerBuf.toString())
+        assertTrue(output.totalTokenCount > 0)
+        assertTrue(output.toolOverlay.snapshot().any { it.type == "citation" })
+    }
+
+    @Test
+    fun `held formatting preserves metadata at retry and terminal boundaries`() = runTest {
+        val usage = StreamEvent.UsageUpdate(12)
+        val citation = StreamEvent.CitationUpdate(
+            CitationRecord(sourceId = "held_source", provider = "test", kind = "url", title = "Source"),
+        )
+        val prefix = listOf(StreamEvent.TextChunk("  "), usage, citation)
+        val retry = StreamEvent.Retrying(1, 5)
+        val error = StreamEvent.Error(GenerationError.Api("bad", "request", "failure"))
+        val cases = listOf(
+            (prefix + retry + StreamEvent.TextChunk("ok")) to
+                listOf(usage, citation, retry, StreamEvent.TextChunk("ok")),
+            (prefix + error) to (prefix + error),
+            prefix to prefix,
+        )
+        cases.forEach { (events, expected) ->
+            val forwarded = mutableListOf<StreamEvent>()
+            runner(events).run(IDENTITY, messages(), CONFIG.copy(tools = null), forwarded::add)
+            assertEquals(expected, forwarded)
+        }
+    }
+
     private fun runner(events: List<StreamEvent>) = ProviderPassRunnerHarness(
         ProviderPassRunner(),
         fakeProvider(flowOf(*events.toTypedArray())),
@@ -275,6 +468,18 @@ class ProviderPassRunnerTest {
             pass = 3,
             effectId = "provider-3-0",
         )
-        val CONFIG = ProviderConfig(apiKey = "key", modelId = "model")
+        val CONFIG = ProviderConfig(
+            apiKey = "key",
+            modelId = "model",
+            tools = listOf("file_read", "file_write").map { name ->
+                ToolDefinition(
+                    function = ToolFunction(
+                        name = name,
+                        description = name,
+                        parameters = ToolParameters(properties = emptyMap()),
+                    )
+                )
+            },
+        )
     }
 }

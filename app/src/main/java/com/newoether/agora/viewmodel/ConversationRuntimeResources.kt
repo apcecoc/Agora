@@ -3,6 +3,7 @@ package com.newoether.agora.viewmodel
 import com.newoether.agora.model.ChatMessage
 import com.newoether.agora.model.MessageStatus
 import com.newoether.agora.model.RunEffect
+import com.newoether.agora.model.RunRecoveryPolicy
 import com.newoether.agora.model.RunState
 import com.newoether.agora.model.RuntimeRunIdentity
 import com.newoether.agora.model.Transition
@@ -22,6 +23,11 @@ data class ConversationGenerationSnapshot(
     val streamingMessage: ChatMessage? = null,
     val isLoading: Boolean = false,
     val isGenerating: Boolean = false,
+)
+
+private fun ChatMessage.toStoppedRuntimeSnapshot(): ChatMessage = copy(
+    status = MessageStatus.STOPPED,
+    segments = segments?.let(RunRecoveryPolicy::stopIncompleteTools),
 )
 
 /**
@@ -53,6 +59,7 @@ internal class ConversationRuntimeResources {
     private var uiGenToken = 0L
     private val persistId = AtomicLong(0L)
     private var suppressedQueueDrainCount = 0
+    private var retainedHandoffOwnerToken: Long? = null
 
     fun captureUiToken(): Long = uiGenToken
 
@@ -74,6 +81,13 @@ internal class ConversationRuntimeResources {
 
     fun activate(identity: RuntimeRunIdentity, loading: Boolean) {
         uiGenToken = identity.ownerToken
+        // A drain suppression belongs to the run that armed it and is answered by that run's slot
+        // release. A newly activated run means that release either already happened or never will
+        // (its terminal effect failed), so a leftover suppression can no longer be satisfied.
+        // Keeping it armed would make THIS run's release silently skip its queue drain, leaving
+        // queued sends stranded with nothing left to trigger them.
+        suppressedQueueDrainCount = 0
+        retainedHandoffOwnerToken = null
         _isLoading.value = loading
         _generating.value = true
         _stopping.value = false
@@ -102,7 +116,7 @@ internal class ConversationRuntimeResources {
             .singleOrNull()
             ?.let { effect ->
                 check(uiGenToken == effect.identity.ownerToken)
-                val stopped = _streamingMessage.value?.copy(status = MessageStatus.STOPPED)
+                val stopped = _streamingMessage.value?.toStoppedRuntimeSnapshot()
                 check(stopped == null || effect.identity.runId != null) {
                     "A streaming Stop effect requires a bound Run"
                 }
@@ -135,7 +149,7 @@ internal class ConversationRuntimeResources {
             currentState is RunState.Idle ||
                 currentState is RunState.Finalizing && !currentState.persistenceFailureReported
         }
-        ?.copy(status = MessageStatus.STOPPED)
+        ?.toStoppedRuntimeSnapshot()
 
     fun streamUpdate(uiToken: Long, message: ChatMessage) {
         if (this.uiGenToken == uiToken) _streamingMessage.value = message
@@ -156,6 +170,16 @@ internal class ConversationRuntimeResources {
         if (_streamingMessage.value?.status == MessageStatus.STOPPED) {
             _streamingMessage.value = null
         }
+    }
+
+    fun retainRunHandoff(ownerToken: Long) {
+        if (uiGenToken == ownerToken) retainedHandoffOwnerToken = ownerToken
+    }
+
+    fun isRunHandoffRetained(ownerToken: Long): Boolean = retainedHandoffOwnerToken == ownerToken
+
+    fun releaseRunHandoffRetention(ownerToken: Long) {
+        if (retainedHandoffOwnerToken == ownerToken) retainedHandoffOwnerToken = null
     }
 
     fun deferNextQueueDrain() {

@@ -1,6 +1,10 @@
 package com.newoether.agora.viewmodel
 
+import com.newoether.agora.api.util.CONTEXT_SUMMARY_CLOSE_TAG
+import com.newoether.agora.api.util.CONTEXT_SUMMARY_OPEN_TAG
 import com.newoether.agora.api.util.contextWindowUsage
+import com.newoether.agora.api.util.tokens.ContextCostModel
+import com.newoether.agora.api.util.tokens.ContextCostModels
 import com.newoether.agora.api.util.projectGenerationStatusesForApi
 import com.newoether.agora.api.util.splitContextForCompactRetention
 import com.newoether.agora.api.util.stripEmptyTurns
@@ -18,15 +22,48 @@ data class CompactRequest(
     val prompt: String,
     val retainLogicalMessages: Int,
     val replaceMessageId: String? = null,
+    // When true the request keeps the conversation's ordinary system prompt and moves the
+    // Compact Prompt into the user message. Default false preserves the legacy behaviour for
+    // every construction site that has not opted in explicitly.
+    val preserveSystemPrompt: Boolean = false,
 )
 
 /** Provider-equivalent split input without role coalescing away durable graph ids. */
 internal fun compactSplitMessages(messages: List<ChatMessage>): List<ChatMessage> =
     stripEmptyTurns(
-        validateToolMessages(
-            projectGenerationStatusesForApi(messages.distinctBy(ChatMessage::id))
-        )
+        validateToolMessages(messages.distinctBy(ChatMessage::id))
     )
+
+internal fun normalizeContextCompactOutput(text: String): String {
+    val firstContentIndex = text.indexOfFirst { !it.isWhitespace() }
+    if (firstContentIndex < 0) return text
+    val candidate = text.substring(firstContentIndex)
+    if (CONTEXT_SUMMARY_OPEN_TAG.startsWith(candidate)) return ""
+    if (!candidate.startsWith(CONTEXT_SUMMARY_OPEN_TAG)) return text
+
+    val body = candidate
+        .substring(CONTEXT_SUMMARY_OPEN_TAG.length)
+        .removePrefix("\r\n")
+        .removePrefix("\n")
+    val closingIndex = body.lastIndexOf(CONTEXT_SUMMARY_CLOSE_TAG)
+    if (
+        closingIndex >= 0 &&
+        body.substring(closingIndex + CONTEXT_SUMMARY_CLOSE_TAG.length).isBlank()
+    ) {
+        return body.substring(0, closingIndex).trimEnd()
+    }
+
+    val partialClosingLength = minOf(body.length, CONTEXT_SUMMARY_CLOSE_TAG.length - 1)
+        .downTo(1)
+        .firstOrNull { length ->
+            CONTEXT_SUMMARY_CLOSE_TAG.startsWith(body.takeLast(length))
+        }
+        ?: return body
+    return body
+        .dropLast(partialClosingLength)
+        .removeSuffix("\r\n")
+        .removeSuffix("\n")
+}
 
 internal fun buildPersistedCompactText(
     summary: String,
@@ -136,10 +173,15 @@ internal fun automaticCompactNeeded(
     selectedChildren: Map<String?, String>,
     contextLimit: Int,
     retainLogicalMessages: Int,
+    generationErrorFormatter: (String) -> String,
     includeStoredTranscriptions: Boolean = false,
     fixedTokenCost: Int = 0,
+    includeAssistantReasoning: Boolean = false,
     userPrepend: String? = null,
     userPostpend: String? = null,
+    assistantPrepend: String? = null,
+    assistantPostpend: String? = null,
+    costs: ContextCostModel = ContextCostModel.Default,
 ): Boolean {
     val selectedPath = ConversationUiState.resolvePath(
         allMessages = entities.map { it.toUiChatMessage { text -> text } },
@@ -151,15 +193,22 @@ internal fun automaticCompactNeeded(
         path = ApiPathAssembler.assemble(
             selectedPath.mapNotNull { entitiesById[it.id] },
             entities,
-        ).let { projectProviderMessages(it, includeStoredTranscriptions) },
+        ).let { entities ->
+            projectProviderMessages(entities, includeStoredTranscriptions)
+        }.let { messages ->
+            projectGenerationStatusesForApi(messages, generationErrorFormatter)
+        },
         contextLimit = contextLimit,
         retainLogicalMessages = retainLogicalMessages,
         fixedTokenCost = fixedTokenCost,
+        includeAssistantReasoning = includeAssistantReasoning,
         userPrepend = userPrepend,
         userPostpend = userPostpend,
-        // Transcription-enabled models receive descriptions instead of raw images at dispatch;
-        // the admission estimate must match.
-        includeImages = !includeStoredTranscriptions,
+        assistantPrepend = assistantPrepend,
+        assistantPostpend = assistantPostpend,
+        // Stored descriptions remove only their own images before admission accounting.
+        includeImages = true,
+        costs = costs,
     )
 }
 
@@ -168,9 +217,13 @@ internal fun automaticCompactNeeded(
     contextLimit: Int,
     retainLogicalMessages: Int,
     fixedTokenCost: Int = 0,
+    includeAssistantReasoning: Boolean = false,
     userPrepend: String? = null,
     userPostpend: String? = null,
+    assistantPrepend: String? = null,
+    assistantPostpend: String? = null,
     includeImages: Boolean = true,
+    costs: ContextCostModel = ContextCostModel.Default,
 ): Boolean {
     if (path.isEmpty() || retainLogicalMessages < 0) return false
     val semanticPath = path.filterNot { it.isContextCompact() && !it.isSuccessfulContextCompact() }
@@ -186,9 +239,13 @@ internal fun automaticCompactNeeded(
                 includeImages = includeImages,
                 userPrepend = userPrepend,
                 userPostpend = userPostpend,
+                assistantPrepend = assistantPrepend,
+                assistantPostpend = assistantPostpend,
             ),
             contextLimit.coerceAtLeast(1),
             fixedTokenCost = fixedTokenCost,
+            includeAssistantReasoning = includeAssistantReasoning,
+            costs = costs,
         ).estimatedTokenCount >=
         contextLimit.coerceAtLeast(1)
 }
@@ -196,8 +253,10 @@ internal fun automaticCompactNeeded(
 /** Non-destructive context compaction. Original messages remain in the graph. */
 internal class ContextCompactor(
     private val conversations: ConversationRepository,
+    private val generationErrorFormatter: (String) -> String,
+    appContext: android.content.Context? = null,
     private val contextLoader: DurableSelectedContextLoader =
-        DurableSelectedContextLoader(conversations),
+        DurableSelectedContextLoader(conversations, generationErrorFormatter, appContext = appContext),
 ) : ContextCompactOperation {
     override suspend fun automaticNeeded(
         conversationId: String,
@@ -209,12 +268,15 @@ internal class ContextCompactor(
             contextLimit,
             config.thresholdPercent,
         )
+        val mainPrompt = config.mainPromptTemplate?.let {
+            resolveGenerationPromptTemplate(it, config.mainModelId.orEmpty())
+        }
         val path = contextLoader.load(
             DurableSelectedContextRequest(
                 conversationId = conversationId,
                 followSelectedBranch = true,
                 includeStoredTranscriptions =
-                    config.generationContext.imageTranscriptionEnabled,
+                    config.mainImageTranscriptionEnabled,
             ),
         ).messages
         return automaticCompactNeeded(
@@ -222,9 +284,15 @@ internal class ContextCompactor(
             contextLimit = threshold,
             retainLogicalMessages = config.request.retainLogicalMessages,
             fixedTokenCost = config.fixedTokenCost,
-            userPrepend = config.userPrepend,
-            userPostpend = config.userPostpend,
-            includeImages = !config.generationContext.imageTranscriptionEnabled,
+            costs = ContextCostModels.forModel(
+                config.mainModelId, com.newoether.agora.api.LocalModelRuntime::exactTokenCountOrNull,
+            ),
+            includeAssistantReasoning = config.includeAssistantReasoning,
+            userPrepend = mainPrompt?.userPrepend ?: config.userPrepend,
+            userPostpend = mainPrompt?.userPostpend ?: config.userPostpend,
+            assistantPrepend = mainPrompt?.assistantPrepend ?: config.assistantPrepend,
+            assistantPostpend = mainPrompt?.assistantPostpend ?: config.assistantPostpend,
+            includeImages = true,
         )
     }
 }

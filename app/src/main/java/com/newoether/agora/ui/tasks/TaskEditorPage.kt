@@ -2,8 +2,8 @@ package com.newoether.agora.ui.tasks
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -22,16 +22,14 @@ import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Label
 import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.Repeat
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Schedule
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material.icons.filled.Timer
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -41,14 +39,15 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.newoether.agora.R
 import com.newoether.agora.automation.CronExpression
@@ -58,14 +57,23 @@ import com.newoether.agora.data.local.TaskEntity
 import com.newoether.agora.data.modelDisplayName
 import java.util.Calendar
 import com.newoether.agora.ui.chat.ChatDeleteConfirmDialog
+import com.newoether.agora.ui.chat.ChatDeleteDialogPhase
+import com.newoether.agora.ui.components.SystemPromptPickerDialog
+import com.newoether.agora.viewmodel.executionSummariesForTask
+import com.newoether.agora.viewmodel.runTaskNow
+import com.newoether.agora.viewmodel.runningTaskIds
+import com.newoether.agora.viewmodel.saveTask
 import com.newoether.agora.ui.components.clearFocusOnTap
+import com.newoether.agora.ui.components.rememberUnsavedChangesBack
 import com.newoether.agora.ui.settings.AnimatedActionFab
 import com.newoether.agora.ui.settings.CollapsingSettingsLazyScaffold
 import com.newoether.agora.ui.settings.SettingsGroup
-import com.newoether.agora.ui.settings.SettingsIconContent
 import com.newoether.agora.ui.settings.SettingsItem
 import com.newoether.agora.viewmodel.ChatViewModel
+import kotlinx.coroutines.flow.distinctUntilChanged
 import java.util.Locale
+import com.newoether.agora.ui.components.AgoraDropdownMenu
+import com.newoether.agora.ui.components.AgoraDropdownMenuItem
 
 /**
  * The schedule editor mode is explicit UI state. In particular, CUSTOM must not be inferred from
@@ -92,6 +100,17 @@ internal fun isScheduleDraftValid(mode: ScheduleEditorMode, cronExpr: String): B
         cronExpr.isNotBlank() && CronExpression.isValid(cronExpr)
     } else {
         cronExpr.isBlank() || CronExpression.isValid(cronExpr)
+    }
+
+internal fun taskExecutionHistoryForPresentation(
+    previewPhase: TaskHistoryPreviewPhase,
+    retained: List<com.newoether.agora.automation.TaskManager.ExecutionSummary>?,
+    live: List<com.newoether.agora.automation.TaskManager.ExecutionSummary>?,
+): List<com.newoether.agora.automation.TaskManager.ExecutionSummary>? =
+    if (previewPhase == TaskHistoryPreviewPhase.RETURNING && retained != null) {
+        retained
+    } else {
+        live ?: retained
     }
 
 private fun ScheduleType.toEditorMode(): ScheduleEditorMode = when (this) {
@@ -137,58 +156,126 @@ private fun scheduleSeedFromCron(cronExpr: String): TaskSchedule {
 internal fun TaskDetailPage(
     viewModel: ChatViewModel,
     task: TaskEntity,
-    isNew: Boolean,
+    editorSession: TaskEditorSessionViewModel,
+    backHandlingEnabled: Boolean,
     onBack: () -> Unit,
-    onOpenConversation: (taskId: String, conversationId: String) -> Unit,
+    onOpenConversation: (conversationId: String) -> Unit,
 ) {
     val running by viewModel.runningTaskIds.collectAsState()
     val enabledModels by viewModel.settings.enabledModels.collectAsState()
     val modelAliases by viewModel.settings.modelAliases.collectAsState()
+    val modelProviderNames by viewModel.settings.modelProviderNames.collectAsState()
     val customProviders by viewModel.settings.customProviders.collectAsState()
+    val systemPrompts by viewModel.settings.systemPrompts.collectAsState()
+    val activeSystemPromptId by viewModel.settings.activeSystemPromptId.collectAsState()
 
-    var name by rememberSaveable(task.id) { mutableStateOf(task.name) }
-    var prompt by rememberSaveable(task.id) { mutableStateOf(task.prompt) }
-    var modelId by rememberSaveable(task.id) { mutableStateOf(task.modelId) }
-    var cronExpr by rememberSaveable(task.id) { mutableStateOf(task.cronExpr) }
-    var runAt by rememberSaveable(task.id) { mutableStateOf(task.runAt) }
-    var scheduleEditorModeName by rememberSaveable(task.id) {
-        mutableStateOf(initialScheduleEditorMode(task.cronExpr, task.runAt).name)
-    }
-    var enabled by rememberSaveable(task.id) { mutableStateOf(task.enabled) }
+    val name = editorSession.name
+    val prompt = editorSession.prompt
+    val modelId = editorSession.modelId
+    val cronExpr = editorSession.cronExpr
+    val runAt = editorSession.runAt
+    val scheduleEditorMode = editorSession.scheduleEditorMode
+    val enabled = editorSession.enabled
+    val isNew = editorSession.isNew
     var showModelPicker by remember { mutableStateOf(false) }
-    var executionToDelete by remember { mutableStateOf<com.newoether.agora.automation.TaskManager.ExecutionSummary?>(null) }
-    val listState = rememberLazyListState()
+    var showSystemPromptPicker by remember { mutableStateOf(false) }
+    var showPromptDialog by remember { mutableStateOf(false) }
+    var executionToDelete by remember(task.id) { mutableStateOf<com.newoether.agora.automation.TaskManager.ExecutionSummary?>(null) }
+    val executionDeleteId = executionToDelete?.conversation?.id
+    var executionDeletePhase by remember(executionDeleteId) {
+        mutableStateOf(ChatDeleteDialogPhase.CONFIRM)
+    }
+    LaunchedEffect(executionDeleteId, executionDeletePhase) {
+        if (executionDeleteId == null || executionDeletePhase != ChatDeleteDialogPhase.PENDING) {
+            return@LaunchedEffect
+        }
+        withFrameNanos { }
+        val accepted = viewModel.deleteConversation(executionDeleteId) { deleted ->
+            if (executionToDelete?.conversation?.id == executionDeleteId) {
+                if (deleted) executionToDelete = null
+                else executionDeletePhase = ChatDeleteDialogPhase.FAILED
+            }
+        }
+        if (!accepted) executionDeletePhase = ChatDeleteDialogPhase.FAILED
+    }
+    val savedListIndex = remember(task.id) { editorSession.detailListIndex }
+    val savedListOffset = remember(task.id) { editorSession.detailListOffset }
+    val previewPhase = editorSession.historyPreview.phase
+    val retainedExecutionSnapshot = editorSession.executionHistoryFor(task.id)
+    val executionHistoryFlow = remember(task.id, viewModel) {
+        viewModel.executionSummariesForTask(task.id)
+    }
+    val liveExecutionSnapshot by executionHistoryFlow.collectAsState(initial = null)
+    val executionSnapshot = taskExecutionHistoryForPresentation(
+        previewPhase = previewPhase,
+        retained = retainedExecutionSnapshot,
+        live = liveExecutionSnapshot,
+    )
+    val executions = executionSnapshot.orEmpty()
+    val executionsLoaded = executionSnapshot != null
+    // History arrives after the first frame, so a saved position the list cannot honour yet gets
+    // clamped and then corrected once the rows exist, which is the visible upward jump. A fresh
+    // entry therefore starts at the top; only a retained snapshot (returning from a preview, where
+    // the full list composes immediately) restores the saved position.
+    val listState = rememberLazyListState(
+        initialFirstVisibleItemIndex = if (retainedExecutionSnapshot != null) savedListIndex else 0,
+        initialFirstVisibleItemScrollOffset =
+            if (retainedExecutionSnapshot != null) savedListOffset else 0,
+    )
     val focusManager = LocalFocusManager.current
 
     val isRunning = task.id in running
-    val executions by viewModel.executionSummariesForTask(task.id).collectAsState(initial = emptyList())
 
-    val scheduleEditorMode = ScheduleEditorMode.valueOf(scheduleEditorModeName)
     val cronValid = isScheduleDraftValid(scheduleEditorMode, cronExpr)
     val isComplete = name.isNotBlank() && prompt.isNotBlank() && cronValid
 
-    fun current() = task.copy(
-        name = name.trim(), prompt = prompt, modelId = modelId,
-        cronExpr = cronExpr, runAt = runAt, enabled = enabled,
+    fun current() = checkNotNull(editorSession.current(task))
+
+    // Save calls onBack directly; only back navigation goes through the unsaved-changes guard.
+    val guardedBack = rememberUnsavedChangesBack(
+        hasUnsavedChanges = editorSession.hasUnsavedChanges,
+        onBack = onBack,
     )
-    fun save() { if (isComplete) viewModel.saveTask(current()) }
-    // Back still saves — an editor that silently discards work on the system back gesture is a
-    // trap. The explicit Save button exists to make the commit point visible, not to gate it.
-    fun leave() { save(); onBack() }
 
-    BackHandler { leave() }
+    BackHandler(enabled = backHandlingEnabled) { guardedBack() }
 
-    LaunchedEffect(listState.isScrollInProgress) {
-        if (listState.isScrollInProgress) focusManager.clearFocus()
+    LaunchedEffect(task.id, previewPhase, liveExecutionSnapshot) {
+        val latest = liveExecutionSnapshot ?: return@LaunchedEffect
+        if (previewPhase != TaskHistoryPreviewPhase.RETURNING) {
+            editorSession.retainExecutionHistory(task.id, latest)
+        }
+    }
+
+    LaunchedEffect(task.id, listState) {
+        snapshotFlow {
+            listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset
+        }
+            .distinctUntilChanged()
+            .collect { (index, offset) -> editorSession.updateScroll(index, offset) }
+    }
+
+    // Only a user drag dismisses the keyboard. The list also scrolls on its own to bring a newly
+    // focused field into view, and treating that scroll as a dismissal dropped focus (and the
+    // cursor) the moment the prompt field was tapped.
+    LaunchedEffect(listState) {
+        listState.interactionSource.interactions.collect { interaction ->
+            if (interaction is DragInteraction.Start) focusManager.clearFocus()
+        }
     }
 
     CollapsingSettingsLazyScaffold(
         title = name.ifBlank { stringResource(if (isNew) R.string.task_new else R.string.task_edit) },
-        onBack = { leave() },
+        onBack = guardedBack,
         modifier = Modifier.clearFocusOnTap(),
         listState = listState,
         actions = {
-            IconButton(enabled = isComplete, onClick = { leave() }) {
+            IconButton(
+                enabled = isComplete,
+                onClick = {
+                    viewModel.saveTask(current())
+                    onBack()
+                },
+            ) {
                 Icon(Icons.Default.Save, contentDescription = stringResource(R.string.task_save))
             }
         },
@@ -197,7 +284,10 @@ internal fun TaskDetailPage(
                 label = stringResource(if (isRunning) R.string.task_running else R.string.task_run_now),
                 icon = Icons.Default.PlayArrow,
                 onClick = {
-                    viewModel.runTaskNow(current())
+                    viewModel.runTaskNow(
+                        current(),
+                        preservePersistedEnabled = false,
+                    )
                 },
                 enabled = isComplete && !isRunning,
                 loading = isRunning,
@@ -209,24 +299,17 @@ internal fun TaskDetailPage(
                 title = stringResource(R.string.task_section_details),
                 items = listOf(
                     {
-                        LabeledField(
+                        TaskLabeledField(
                             label = stringResource(R.string.task_name),
                             icon = Icons.Default.Label,
                             value = name,
-                            onValueChange = { name = it },
+                            onValueChange = editorSession::updateName,
                             placeholder = stringResource(R.string.task_name_hint),
                             singleLine = true,
                         )
                     },
                     {
-                        LabeledField(
-                            label = stringResource(R.string.task_prompt),
-                            icon = Icons.Default.Psychology,
-                            value = prompt,
-                            onValueChange = { prompt = it },
-                            placeholder = stringResource(R.string.task_prompt_hint),
-                            singleLine = false,
-                        )
+                        TaskPromptRow(prompt) { showPromptDialog = true }
                     },
                     {
                         SettingsItem(
@@ -234,7 +317,7 @@ internal fun TaskDetailPage(
                             headlineContent = { Text(stringResource(R.string.task_model)) },
                             supportingContent = {
                                 Text(
-                                    modelId?.let { modelDisplayName(it, modelAliases, customProviders) }
+                                    modelId?.let { modelDisplayName(it, modelAliases, customProviders, modelProviderNames[it] != false) }
                                         ?: stringResource(R.string.task_model_default)
                                 )
                             },
@@ -242,6 +325,11 @@ internal fun TaskDetailPage(
                                 Icon(Icons.Default.Chat, null, tint = MaterialTheme.colorScheme.primary)
                             },
                         )
+                    },
+                    {
+                        TaskSystemPromptRow(editorSession.systemPromptId, systemPrompts, activeSystemPromptId) {
+                            showSystemPromptPicker = true
+                        }
                     },
                 ),
             )
@@ -252,11 +340,11 @@ internal fun TaskDetailPage(
             ScheduleGroup(
                 cronExpr = cronExpr,
                 runAt = runAt,
-                onScheduleChange = { newCron, newRunAt -> cronExpr = newCron; runAt = newRunAt },
+                onScheduleChange = editorSession::updateSchedule,
                 editorMode = scheduleEditorMode,
-                onEditorModeChange = { scheduleEditorModeName = it.name },
+                onEditorModeChange = editorSession::updateScheduleEditorMode,
                 enabled = enabled,
-                onEnabledChange = { enabled = it },
+                onEnabledChange = editorSession::updateEnabled,
             )
             Spacer(Modifier.height(24.dp))
         }
@@ -269,7 +357,27 @@ internal fun TaskDetailPage(
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
             )
         }
-        if (executions.isEmpty()) {
+        if (!executionsLoaded) {
+            // The history section owns the wait, so the rest of the page stays put while it loads.
+            item(key = "task_detail_history_loading") {
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(24.dp),
+                    color = MaterialTheme.colorScheme.surface,
+                    tonalElevation = 1.dp,
+                ) {
+                    Box(
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 64.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(24.dp),
+                            strokeWidth = 3.dp,
+                        )
+                    }
+                }
+            }
+        } else if (executions.isEmpty()) {
             item {
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
@@ -301,13 +409,20 @@ internal fun TaskDetailPage(
                     )
                 }
             }
-        } else {
+        } else if (executions.isNotEmpty()) {
             itemsIndexed(executions, key = { _, e -> e.conversation.id }) { index, execution ->
                 ExecutionRow(
                     execution = execution,
                     customProviders = customProviders,
                     shape = stackedShape(index, executions.size),
-                    onClick = { onOpenConversation(task.id, execution.conversation.id) },
+                    onClick = {
+                        editorSession.updateScroll(
+                            listState.firstVisibleItemIndex,
+                            listState.firstVisibleItemScrollOffset,
+                        )
+                        editorSession.retainExecutionHistory(task.id, executions)
+                        onOpenConversation(execution.conversation.id)
+                    },
                     menuEnabled = !isRunning,
                     onDelete = { executionToDelete = execution },
                 )
@@ -325,71 +440,48 @@ internal fun TaskDetailPage(
             modelAliases = modelAliases,
             customProviders = customProviders,
             selected = modelId,
-            onSelect = { modelId = it; showModelPicker = false },
+            onSelect = { selectedModelId ->
+                editorSession.updateModelId(selectedModelId)
+                showModelPicker = false
+            },
             onDismiss = { showModelPicker = false },
         )
     }
-    executionToDelete?.let { execution ->
-        ChatDeleteConfirmDialog(
-            onConfirm = {
-                viewModel.deleteConversation(execution.conversation.id)
-                executionToDelete = null
+    if (showPromptDialog) {
+        TaskPromptDialog(
+            initial = prompt,
+            onSave = {
+                editorSession.updatePrompt(it)
+                showPromptDialog = false
             },
-            onDismiss = { executionToDelete = null },
+            onDismiss = { showPromptDialog = false },
         )
     }
-}
 
-/** A group row whose value is typed in place. Icon-bearing fields use the same leading-icon
- *  content column as the Proxy settings page, so the label and field share its left inset. */
-@Composable
-private fun LabeledField(
-    label: String,
-    value: String,
-    onValueChange: (String) -> Unit,
-    placeholder: String,
-    singleLine: Boolean,
-    icon: androidx.compose.ui.graphics.vector.ImageVector? = null,
-    isError: Boolean = false,
-    supporting: String? = null,
-    supportingIsError: Boolean = false,
-) {
-    val fieldContent: @Composable () -> Unit = {
-        Text(
-            label,
-            style = MaterialTheme.typography.bodyLarge.copy(fontWeight = FontWeight.Medium),
-            color = MaterialTheme.colorScheme.onSurface,
+    if (showSystemPromptPicker) {
+        SystemPromptPickerDialog(
+            settings = viewModel.settings,
+            initialSelectedId = editorSession.systemPromptId,
+            selectionKey = editorSession.systemPromptId,
+            onSave = {
+                editorSession.updateSystemPromptId(it)
+                showSystemPromptPicker = false
+            },
+            onDismiss = { showSystemPromptPicker = false },
         )
-        Spacer(Modifier.height(8.dp))
-        OutlinedTextField(
-            value = value,
-            onValueChange = onValueChange,
-            placeholder = { Text(placeholder, style = MaterialTheme.typography.bodyMedium) },
-            singleLine = singleLine,
-            minLines = if (singleLine) 1 else 4,
-            isError = isError,
-            shape = RoundedCornerShape(16.dp),
-            modifier = Modifier.fillMaxWidth(),
-            textStyle = MaterialTheme.typography.bodyMedium.copy(color = MaterialTheme.colorScheme.onSurface),
-        )
-        if (supporting != null) {
-            Spacer(Modifier.height(6.dp))
-            Text(
-                supporting,
-                style = MaterialTheme.typography.bodySmall,
-                color = if (supportingIsError) MaterialTheme.colorScheme.error
-                else MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
     }
-    if (icon != null) {
-        SettingsIconContent(icon = icon) {
-            fieldContent()
-        }
-    } else {
-        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 16.dp)) {
-            fieldContent()
-        }
+    executionToDelete?.let {
+        ChatDeleteConfirmDialog(
+            phase = executionDeletePhase,
+            onConfirm = {
+                if (executionDeletePhase != ChatDeleteDialogPhase.PENDING) {
+                    executionDeletePhase = ChatDeleteDialogPhase.PENDING
+                }
+            },
+            onDismiss = {
+                if (executionDeletePhase != ChatDeleteDialogPhase.PENDING) executionToDelete = null
+            },
+        )
     }
 }
 
@@ -513,14 +605,13 @@ private fun ScheduleGroup(
                             Icon(Icons.Default.Repeat, null, tint = MaterialTheme.colorScheme.primary)
                         },
                     )
-                    DropdownMenu(
+                    AgoraDropdownMenu(
                         expanded = showRepeatMenu,
                         onDismissRequest = { showRepeatMenu = false },
                         containerColor = MaterialTheme.colorScheme.surfaceContainer,
-                        shape = RoundedCornerShape(16.dp),
                     ) {
                         ScheduleEditorMode.entries.forEach { mode ->
-                            DropdownMenuItem(
+                            AgoraDropdownMenuItem(
                                 text = { Text(repeatLabel(mode)) },
                                 leadingIcon = {
                                     if (editorMode == mode) {
@@ -593,7 +684,7 @@ private fun ScheduleGroup(
             // ── Custom cron passthrough ──
             if (isCustomCron) {
                 add {
-                    LabeledField(
+                    TaskLabeledField(
                         label = stringResource(R.string.task_schedule_custom),
                         icon = Icons.Default.Code,
                         value = cronExpr,
@@ -644,6 +735,9 @@ private fun ScheduleGroup(
                             color = if (oncePast) MaterialTheme.colorScheme.error
                             else MaterialTheme.colorScheme.onSurfaceVariant,
                         )
+                    },
+                    leadingContent = {
+                        Icon(Icons.Default.Timer, null, tint = MaterialTheme.colorScheme.primary)
                     },
                     trailingContent = {
                         Switch(

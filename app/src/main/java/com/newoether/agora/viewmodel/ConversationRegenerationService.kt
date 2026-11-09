@@ -20,6 +20,8 @@ internal data class ConversationRegenerationRequest(
     val messageId: String,
     val modelId: String,
     val visiblePath: List<ChatMessage>,
+    /** Client that issued the regenerate; it plays the branch transition. */
+    val origin: ChatClient,
 )
 
 /**
@@ -32,7 +34,6 @@ internal class ConversationRegenerationService(
     private val conversations: ConversationRepository,
     private val requestBuilder: GenerationRequestBuilder,
     private val executionCoordinator: ConversationExecutionCoordinator,
-    private val transitions: RegenerationTransitionCoordinator,
     private val terminalSettlement: GenerationTerminalSettlementController,
     private val boundRunGenerationLauncher: BoundRunGenerationLauncher,
     private val guidanceDrain: QueuedGuidanceDrainExecutor,
@@ -56,11 +57,13 @@ internal class ConversationRegenerationService(
             request.messageId,
         ) ?: return false
         if (boundary.lastAssistant?.id != request.messageId) return false
-        val rootOutputId = boundary.firstAssistant?.id ?: return false
+        val firstAssistant = boundary.firstAssistant ?: return false
+        val rootOutputId = firstAssistant.id
         val targetParentMessageId =
-            boundary.input?.id ?: boundary.firstAssistant.parentId ?: return false
+            boundary.input?.id ?: firstAssistant.parentId ?: return false
 
         val uiToken = state.tryAcquireForReplacement() ?: return false
+        val transitions = request.origin.branchTransitions
         val transition = transitions.begin(
             conversationId = request.conversationId,
             oldMessageId = request.messageId,
@@ -78,6 +81,7 @@ internal class ConversationRegenerationService(
             var runBound = false
             var stopFinalizationClaimed = false
             try {
+                if (!state.acquireGenerationAdmission(uiToken, executionCoordinator)) return@generation
                 if (!transitions.awaitFade(transition.id)) return@generation
                 if (
                     !state.isCurrentToken(uiToken) ||
@@ -157,6 +161,8 @@ internal class ConversationRegenerationService(
                         listOf(modelEntity),
                         messageSelectionUpdates = mapOf(sourceBoundary.id to modelEntity.id),
                         conversationModelId = generationSnapshot.selectedModelId,
+                        at = startTime,
+                        touchConversationOnAdmission = true,
                     )
                     graphCommitted = true
                     transitions.markCommitted(transition.id)
@@ -193,7 +199,7 @@ internal class ConversationRegenerationService(
                             persistId = persistId,
                             runId = runId,
                             pass = 0,
-                            callerTag = "regenerate",
+                            requestKind = "chat",
                         ),
                         state,
                     )

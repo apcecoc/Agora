@@ -1,13 +1,32 @@
 package com.newoether.agora.viewmodel
 
 import com.newoether.agora.api.LlmProvider
+import com.newoether.agora.api.ProviderRequestResolver
+import com.newoether.agora.data.PromptTemplateItem
 import com.newoether.agora.model.ContextBudget
 import com.newoether.agora.model.ProviderPassResult
 import com.newoether.agora.model.RunEffect
 import com.newoether.agora.model.RunEffectIdentity
 import com.newoether.agora.model.RunEndReason
 import com.newoether.agora.model.RunStatus
-import com.newoether.agora.util.Constants
+
+data class GenerationPromptTemplate(
+    val systemItems: List<PromptTemplateItem>,
+    val userItems: List<PromptTemplateItem>,
+    val assistantItems: List<PromptTemplateItem>,
+    /**
+     * Active memory read once when the template is captured, so every Provider pass of one Run
+     * (initial request, tool continuations, retries) sees the same text and keeps the prompt
+     * cache stable. Mid-Run edits become visible through active_memory_read and land next Run.
+     */
+    val activeMemory: String = "",
+    /**
+     * Skill catalog frozen with the template for the same reason as [activeMemory]: mid-Run
+     * skill edits must not rewrite the system prompt between Provider passes. Empty when skill
+     * access was off at capture time. Edits land next Run.
+     */
+    val skillCatalog: String = "",
+)
 
 data class GenerationConfig(
     val providerName: String,
@@ -25,59 +44,26 @@ data class GenerationConfig(
     val thinkingBudgetTokens: Int = 4096,
     val openAiServiceTier: String? = null,
     val responsesApiEnabled: Boolean = false,
+    val anthropicCacheEnabled: Boolean = true,
+    val anthropicCacheTtl: String = "1h",
+    /** Send the conversation ID as prompt_cache_key on OpenAI-protocol requests. */
+    val promptCacheKeyEnabled: Boolean = false,
     val openAiWebSearchEnabled: Boolean = false,
     val baseUrl: String?,
     val userPrepend: String? = null,
     val userPostpend: String? = null,
+    val assistantPrepend: String? = null,
+    val assistantPostpend: String? = null,
+    /** Frozen template structure with values resolved independently for every dispatch attempt. */
+    val promptTemplate: GenerationPromptTemplate? = null,
+    val requestResolver: ProviderRequestResolver? = null,
+    /** Omits the selected structured prompt and every tool definition for embedded Local requests. */
+    val lowContextModeEnabled: Boolean = false,
     val temperature: Float? = null,
     val maxTokens: Int? = null,
     val topP: Float? = null,
     val frequencyPenalty: Float? = null,
     val presencePenalty: Float? = null
-)
-
-data class GenerationContext(
-    val conversationId: String? = null,
-    val accessSavedMemories: Boolean = true,
-    val accessActiveMemory: Boolean = true,
-    val skillReadAccess: Boolean = true,
-    val skillModifyAccess: Boolean = true,
-    val skillCatalog: String = "",
-    val accessPastConversations: Boolean = true,
-    val modelSearchMethod: String = "keyword",
-    val activeEmbeddingConfig: com.newoether.agora.data.EmbeddingModelConfig? = null,
-    val embeddingApiKey: String = "",
-    val ragThreshold: Float = 0.5f,
-    val searchMatchLimit: Int = 10,
-    val searchContextWindow: Int = 8,
-    val webSearchEnabled: Boolean = false,
-    val webSearchApiKeys: Map<String, String> = emptyMap(),
-    val webSearchProvider: String = "duckduckgo",
-    val webSearchNumResults: Int = 5,
-    val webSearchBaseUrl: String = "",
-    val imageGenEnabled: Boolean = false,
-    val imageGenApiKey: String = "",
-    val imageGenBaseUrl: String = "",
-    val imageGenModel: String = "gpt-image-1",
-    val imageGenSize: String = "1024x1024",
-    val automationToolsEnabled: Boolean = false,
-    /** Workers use WorkManager's foreground execution instead of starting our service. */
-    val foregroundServiceManagedExternally: Boolean = false,
-    val shellEnabled: Boolean = false,
-    val shellDevices: List<com.newoether.agora.data.ShellDeviceConfig> = emptyList(),
-    val sandboxEnabled: Boolean = false,
-    val sandboxSharedStorageEnabled: Boolean = false,
-    val imageTranscriptionEnabled: Boolean = false,
-    val imageTranscriptionModel: String? = null,
-    val imageTranscriptionBatchSize: Int = 3,
-    val imageTranscriptionPrompt: String = com.newoether.agora.data.BuiltInPrompts.IMAGE_TRANSCRIPTION_USER,
-    val transcriptionProviderName: String = "",
-    val transcriptionModelId: String = "",
-    val transcriptionApiKey: String = "",
-    val transcriptionBaseUrl: String? = null,
-    /** Wall-clock budget for a single tool execution; downgrades a blocking tool from a
-     *  permanent generation hang to a recoverable tool error (#49). */
-    val toolTimeoutMs: Long = Constants.TOOL_EXECUTION_TIMEOUT_MS
 )
 
 /** Frozen automatic-Compact policy and provider access captured with one generation. */
@@ -100,8 +86,21 @@ internal data class AutomaticCompactConfig(
     /** Frozen API-only USER templates included in the exact Auto Compact threshold projection. */
     val userPrepend: String? = null,
     val userPostpend: String? = null,
+    val assistantPrepend: String? = null,
+    val assistantPostpend: String? = null,
+    /** Main-request templates resolve at the same accounting boundary, independently of Compact. */
+    val mainPromptTemplate: GenerationPromptTemplate? = null,
+    /** Main-request transcription policy. Compact's policy applies only to its summary request. */
+    val mainImageTranscriptionEnabled: Boolean = false,
     /** Filled by the effect owner that has the exact frozen tool-definition set. */
     val fixedTokenCost: Int = 0,
+    /**
+     * Main request model, not the Compact model. The threshold measures the main request's context,
+     * so it must be priced with the main model's cost model.
+     */
+    val mainModelId: String? = null,
+    /** Main request, not Compact-model, replay policy for ordinary assistant reasoning. */
+    val includeAssistantReasoning: Boolean = false,
 )
 
 /** Request-shape snapshot used only for exact context accounting; no Provider access is required. */
@@ -173,6 +172,10 @@ internal data class GenerationCallbacks(
      *  each round boundary and ends the generation there so the queue can flush immediately
      *  (steering) instead of waiting out the entire loop. Headless runs keep the default. */
     val hasQueuedSends: () -> Boolean = { false },
+    /** An already-scheduled ordinary successor keeps successful terminalization interim. */
+    val hasPendingContinuation: Boolean = false,
+    /** Null for headless automation, which retains its existing foreground/background policy. */
+    val isConversationVisible: (() -> Boolean)? = null,
     /** A validated Provider outcome is necessary but not sufficient: runtime identity must accept
      * the exact batch before any tool can execute. Defaults preserve the isolated headless test
      * adapter until Task ownership migrates fully in Phase 7. */
@@ -183,7 +186,7 @@ internal data class GenerationCallbacks(
     val onToolBatchCompleted: suspend (RunEffectIdentity) -> RunEffect.CommitToolRound? = {
         RunEffect.CommitToolRound(it.copy(effectId = "tool-round-${it.effectId}"))
     },
-    /** Generic final text projection applied before the shared terminal writer persists output. */
+    /** Generic output text projection applied before streaming UI, checkpoints, and terminal Room writes. */
     val transformFinalText: (String, com.newoether.agora.model.MessageStatus) -> String =
         { text, _ -> text },
     /** Only an accepted durable success result authorizes the next Provider pass. */

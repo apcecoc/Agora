@@ -8,6 +8,8 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.media.AudioAttributes
+import android.media.RingtoneManager
 import android.net.Uri
 import android.os.Build
 import android.os.Handler
@@ -163,15 +165,22 @@ class AgoraForegroundService : Service() {
         private val mainHandler = Handler(Looper.getMainLooper())
         @Volatile private var instance: AgoraForegroundService? = null
         private val ownerLeases = ForegroundOwnerLeases()
+        // Conversation of each live lease, in acquisition order. The ongoing notification opens
+        // the most recently started conversation that is still generating.
+        private val ownerConversations = LinkedHashMap<String, String>()
 
         /** Acquires this generation's lease; returns false for a duplicate owner/start failure. */
-        fun acquire(context: Context, owner: String): Boolean {
+        fun acquire(context: Context, owner: String, conversationId: String? = null): Boolean {
             if (owner.isBlank()) return false
             val transition = ownerLeases.acquire(owner)
             if (!transition.accepted) return false
             if (transition.action == ForegroundServiceLeaseAction.Start && !startService(context)) {
                 ownerLeases.startRequestFailed(owner)
                 return false
+            }
+            if (!conversationId.isNullOrBlank()) {
+                synchronized(ownerConversations) { ownerConversations[owner] = conversationId }
+                instance?.refreshGenerationNotification()
             }
             CrashReporter.note(
                 "FGS.acquire owners=${ownerLeases.size()} state=${ownerLeases.lifecycleState()}"
@@ -229,7 +238,14 @@ class AgoraForegroundService : Service() {
          */
         fun release(owner: String) {
             val transition = ownerLeases.release(owner)
+            val hadConversation = synchronized(ownerConversations) {
+                ownerConversations.remove(owner) != null
+            }
             val action = transition.action
+            // A stopping service removes its notification; re-posting it would leave it behind.
+            if (hadConversation && action !is ForegroundServiceLeaseAction.Stop) {
+                instance?.refreshGenerationNotification()
+            }
             if (action is ForegroundServiceLeaseAction.Stop) {
                 CrashReporter.note("FGS.stop requested startId=${action.startId}")
                 instance?.requestLeaseStop(action.startId)
@@ -240,7 +256,15 @@ class AgoraForegroundService : Service() {
             )
         }
 
-        fun createChannel(context: Context) {
+        private fun notificationConversationId(): String? =
+            synchronized(ownerConversations) { ownerConversations.values.lastOrNull() }
+
+        fun createChannels(context: Context) {
+            createGenerationChannel(context)
+            createCompletionChannel(context)
+        }
+
+        private fun createGenerationChannel(context: Context) {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
             val manager = context.getSystemService(NotificationManager::class.java)
             val channel = NotificationChannel(
@@ -255,27 +279,50 @@ class AgoraForegroundService : Service() {
             manager.createNotificationChannel(channel)
         }
 
-        fun showCompletionNotification(context: Context, responseText: String, conversationId: String) {
+        fun showTerminalNotification(
+            context: Context,
+            responseText: String,
+            conversationId: String,
+            isError: Boolean,
+        ) {
             createCompletionChannel(context)
             val manager = context.getSystemService(NotificationManager::class.java)
+            val displayText = if (responseText.length > 200) {
+                responseText.take(200) + "…"
+            } else {
+                responseText
+            }
             val notification = NotificationCompat.Builder(context, COMPLETION_CHANNEL_ID)
-                .setContentTitle(context.getString(R.string.agora_responded))
-                .setContentText(if (responseText.length > 200) responseText.take(200) + "…" else responseText)
+                .setContentTitle(
+                    context.getString(if (isError) R.string.app_name else R.string.agora_responded)
+                )
+                .setContentText(displayText)
                 .setSmallIcon(R.drawable.ic_notification)
-                .setContentIntent(createPendingIntent(context, stableCompletionNotificationId(conversationId), conversationId))
-                .setAutoCancel(true)
-                .setPriority(NotificationCompat.PRIORITY_HIGH)
-                .setStyle(
-                    NotificationCompat.BigTextStyle().bigText(
-                        if (responseText.length > 200) responseText.take(200) + "…" else responseText
+                .setContentIntent(
+                    createPendingIntent(
+                        context,
+                        stableCompletionNotificationId(conversationId),
+                        conversationId,
                     )
                 )
+                .setAutoCancel(true)
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(displayText))
                 .build()
 
             try {
                 manager.notify(stableCompletionNotificationId(conversationId), notification)
             } catch (e: RuntimeException) {
-                DebugLog.w(TAG, "Failed to show completion notification", e)
+                DebugLog.w(TAG, "Failed to show terminal notification", e)
+            }
+        }
+
+        fun cancelTerminalNotification(context: Context, conversationId: String) {
+            val manager = context.getSystemService(NotificationManager::class.java)
+            try {
+                manager.cancel(stableCompletionNotificationId(conversationId))
+            } catch (e: RuntimeException) {
+                DebugLog.w(TAG, "Failed to cancel terminal notification", e)
             }
         }
 
@@ -288,6 +335,13 @@ class AgoraForegroundService : Service() {
             ).apply {
                 description = "Shown when a response finishes generating"
                 setShowBadge(true)
+                setSound(
+                    RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION),
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+                        .build(),
+                )
+                enableVibration(true)
             }
             val manager = context.getSystemService(NotificationManager::class.java)
             manager.createNotificationChannel(channel)
@@ -326,7 +380,7 @@ class AgoraForegroundService : Service() {
         super.onCreate()
         instance = this
         CrashReporter.note("FGS.onCreate")
-        createChannel(this)
+        createGenerationChannel(this)
         val notification = buildGenerationNotification(currentText ?: getString(R.string.generating_response))
         // Must NOT catch exceptions here: if startForeground() fails, the real
         // exception (SecurityException, ForegroundServiceStartNotAllowed, etc.)
@@ -402,6 +456,10 @@ class AgoraForegroundService : Service() {
         }
     }
 
+    private fun refreshGenerationNotification() {
+        updateNotificationText(currentText ?: getString(R.string.generating_response))
+    }
+
     private fun buildGenerationNotification(text: String): Notification {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(getString(R.string.app_name))
@@ -411,7 +469,7 @@ class AgoraForegroundService : Service() {
             .setOnlyAlertOnce(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setCategory(NotificationCompat.CATEGORY_PROGRESS)
-            .setContentIntent(createPendingIntent(this, 0))
+            .setContentIntent(createPendingIntent(this, 0, notificationConversationId()))
             .build()
     }
 

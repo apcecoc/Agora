@@ -32,12 +32,16 @@ import com.newoether.agora.viewmodel.ChatViewModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import com.newoether.agora.ui.components.AgoraDropdownMenu
+import com.newoether.agora.ui.components.AgoraDropdownMenuItem
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsMemoryPage(viewModel: ChatViewModel, onBack: () -> Unit) {
     val accessSavedMemories by viewModel.settings.accessSavedMemories.collectAsState()
     val accessActiveMemory by viewModel.settings.accessActiveMemory.collectAsState()
+    val catalogRevision by viewModel.memoryManager.catalogRevision.collectAsState()
+    val activeMemoryRevision by viewModel.memoryManager.activeMemoryRevision.collectAsState()
     val scope = rememberCoroutineScope()
     val unknownError = stringResource(R.string.unknown_error)
     var activeMemoryContent by remember { mutableStateOf("") }
@@ -58,7 +62,7 @@ fun SettingsMemoryPage(viewModel: ChatViewModel, onBack: () -> Unit) {
         viewModel.emitSnackbar(error.localizedMessage ?: unknownError)
     }
 
-    LaunchedEffect(Unit) {
+    LaunchedEffect(catalogRevision, activeMemoryRevision) {
         val loaded = withContext(Dispatchers.IO) {
             runCatching {
                 viewModel.memoryManager.getActiveMemory() to viewModel.memoryManager.listFiles()
@@ -181,14 +185,13 @@ fun SettingsMemoryPage(viewModel: ChatViewModel, onBack: () -> Unit) {
                                                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                                                 )
                                             }
-                                            DropdownMenu(
+                                            AgoraDropdownMenu(
                                                 containerColor = MaterialTheme.colorScheme.surfaceContainer,
                                                 tonalElevation = 16.dp,
                                                 expanded = showFileMenu,
-                                                onDismissRequest = { showFileMenu = false },
-                                                shape = RoundedCornerShape(12.dp)
+                                                onDismissRequest = { showFileMenu = false }
                                             ) {
-                                                DropdownMenuItem(
+                                                AgoraDropdownMenuItem(
                                                     text = { Text(stringResource(R.string.provider_edit)) },
                                                     leadingIcon = { Icon(Icons.Default.Edit, null) },
                                                     onClick = {
@@ -218,7 +221,7 @@ fun SettingsMemoryPage(viewModel: ChatViewModel, onBack: () -> Unit) {
                                                     },
                                                     enabled = !memoryOperationInFlight,
                                                 )
-                                                DropdownMenuItem(
+                                                AgoraDropdownMenuItem(
                                                     text = { Text(stringResource(R.string.provider_delete), color = MaterialTheme.colorScheme.error) },
                                                     leadingIcon = { Icon(Icons.Default.Delete, null, tint = MaterialTheme.colorScheme.error) },
                                                     onClick = {

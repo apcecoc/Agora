@@ -1,5 +1,7 @@
 package com.newoether.agora.viewmodel
 
+import com.newoether.agora.api.util.MALFORMED_TOOL_CALL_NAME
+import com.newoether.agora.api.util.malformedToolCallResultText
 import android.app.Application
 import com.newoether.agora.api.ToolDefinition
 import com.newoether.agora.data.MemoryManager
@@ -10,6 +12,7 @@ import com.newoether.agora.model.RunEffectIdentity
 import com.newoether.agora.model.ToolCallData
 import com.newoether.agora.model.ToolExecutionStates
 import com.newoether.agora.sandbox.SandboxManagerFactory
+import com.newoether.agora.tool.BuiltInToolNames
 import com.newoether.agora.tool.ImageGenToolProvider
 import com.newoether.agora.tool.MemoryToolProvider
 import com.newoether.agora.tool.SkillToolProvider
@@ -21,6 +24,7 @@ import com.newoether.agora.tool.ToolImageStore
 import com.newoether.agora.tool.ToolPresentationMetadata
 import com.newoether.agora.tool.ToolProvider
 import com.newoether.agora.tool.WebSearchToolProvider
+import com.newoether.agora.util.Constants
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -31,6 +35,8 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 
 internal data class AuthorizedToolCall(
@@ -51,7 +57,7 @@ internal data class AuthorizedToolResult(
 )
 
 internal interface GenerationToolPresentationSource {
-    fun presentationMetadata(name: String): ToolPresentationMetadata?
+    fun presentationMetadata(name: String, arguments: String? = null): ToolPresentationMetadata?
 }
 
 /**
@@ -71,9 +77,10 @@ internal class GenerationToolExecutor private constructor(
             "file_read",
             "file_write",
             "file_edit",
+            "file_multi_edit",
             "file_glob",
             "file_grep",
-            "view_image",
+            "file_view_image",
         )
 
         fun createDefault(
@@ -83,7 +90,8 @@ internal class GenerationToolExecutor private constructor(
             skillManager: SkillManager,
             sandboxFactory: SandboxManagerFactory?,
             additionalProviders: List<ToolProvider>,
-            confirmShellCommand: suspend (server: String, summary: String) -> Boolean,
+            confirmShellCommand: suspend (server: String, summary: String, conversationId: String?) -> Boolean,
+            generatingConversationIds: () -> Set<String> = { emptySet() },
         ): GenerationToolExecutor {
             val imageGenProvider = ImageGenToolProvider(app)
             val shellProvider = ShellToolProvider(
@@ -94,10 +102,11 @@ internal class GenerationToolExecutor private constructor(
             }
             return GenerationToolExecutor(
                 providers = listOf(
+                    com.newoether.agora.tool.TodoToolProvider(conversations),
                     MemoryToolProvider(memoryManager),
                     SkillToolProvider(skillManager),
                     WebSearchToolProvider(),
-                    RagToolProvider(conversations),
+                    RagToolProvider(conversations, generatingConversationIds),
                     imageGenProvider,
                     shellProvider,
                 ) + additionalProviders,
@@ -134,10 +143,11 @@ internal class GenerationToolExecutor private constructor(
             .flatMap { it.definitions(context) }
             .filter { it.function.name in FILE_TOOL_NAMES }
 
-    override fun presentationMetadata(name: String): ToolPresentationMetadata? {
+    override fun presentationMetadata(name: String, arguments: String?): ToolPresentationMetadata? {
         if (name.isBlank()) return null
+        val canonicalName = BuiltInToolNames.canonical(name)
         for (provider in providers) {
-            provider.presentationMetadata(name)?.let { return it }
+            provider.presentationMetadata(canonicalName, arguments)?.let { return it }
         }
         return null
     }
@@ -149,9 +159,6 @@ internal class GenerationToolExecutor private constructor(
     ): List<Pair<MessageEntity, Float>> = providers.filterIsInstance<RagToolProvider>()
         .first()
         .semanticSearch(query, limit, context)
-
-    fun drainGeneratedImages(conversationId: String): List<String> =
-        imageGenProvider?.drainImages(conversationId).orEmpty()
 
     /** Cleanup side effect only; it cannot authorize continuation or change runtime state. */
     suspend fun acknowledgeCommittedShellJobs(
@@ -167,7 +174,15 @@ internal class GenerationToolExecutor private constructor(
         call: AuthorizedToolCall,
         onEvent: suspend (ToolExecutionEvent) -> Unit,
     ): AuthorizedToolResult {
-        if (call.name !in call.authorizedToolNames) {
+        val toolName = BuiltInToolNames.canonical(call.name)
+        val authorizedNames = call.authorizedToolNames.mapTo(mutableSetOf(), BuiltInToolNames::canonical)
+        if (call.name == MALFORMED_TOOL_CALL_NAME) {
+            // Stand-in for a damaged call: never executed, answered with what was wrong.
+            return call.result(
+                ToolExecutionResult(text = malformedToolCallResultText(call.arguments), isError = true),
+            )
+        }
+        if (toolName !in authorizedNames) {
             return call.result(
                 ToolExecutionResult(
                     text = "Error executing tool '${call.name}': tool was not authorized for this provider pass",
@@ -188,8 +203,12 @@ internal class GenerationToolExecutor private constructor(
             )
         }
 
+        val executionTimeoutMs = toolExecutionTimeoutMs(
+            toolName = toolName,
+            defaultTimeoutMs = call.context.toolTimeoutMs,
+        )
         val result = try {
-            val provider = providers.firstOrNull { it.handles(call.name) }
+            val provider = providers.firstOrNull { it.handles(toolName) }
                 ?: return call.result(
                     ToolExecutionResult(text = "Unknown tool: ${call.name}", isError = true),
                 )
@@ -199,7 +218,8 @@ internal class GenerationToolExecutor private constructor(
             val attemptJob = Job()
             val attempt = CoroutineScope(currentCoroutineContext() + attemptJob).async {
                 var completedResult: ToolExecutionResult? = null
-                provider.executeEvents(call.name, completeArguments, call.context).collect { event ->
+                val context = call.context.copy(toolEffectIdentity = call.batchIdentity)
+                provider.executeEvents(toolName, completeArguments, context).collect { event ->
                     if (event is ToolExecutionEvent.Completed) {
                         completedResult = event.result
                     }
@@ -212,13 +232,13 @@ internal class GenerationToolExecutor private constructor(
                     )
             }
             try {
-                withTimeout(call.context.toolTimeoutMs) { attempt.await() }
+                withTimeout(executionTimeoutMs) { attempt.await() }
             } finally {
                 attemptJob.cancel()
             }
         } catch (error: TimeoutCancellationException) {
             ToolExecutionResult(
-                text = "Error executing tool '${call.name}': timed out after ${call.context.toolTimeoutMs}ms",
+                text = "Error executing tool '${call.name}': timed out after ${executionTimeoutMs}ms",
                 isError = true,
             )
         } catch (error: CancellationException) {
@@ -239,6 +259,16 @@ internal class GenerationToolExecutor private constructor(
     )
 }
 
+internal fun toolExecutionTimeoutMs(
+    toolName: String,
+    defaultTimeoutMs: Long,
+): Long = when (BuiltInToolNames.canonical(toolName)) {
+    "image_generate" -> Constants.IMAGE_GENERATION_TIMEOUT_MS
+    // Ask User owns one configured deadline for its whole question set.
+    "ask_user" -> Long.MAX_VALUE
+    else -> defaultTimeoutMs
+}
+
 internal fun appendBoundedToolOutput(
     current: String?,
     delta: String,
@@ -250,24 +280,36 @@ internal fun appendBoundedToolOutput(
     else combined.takeLast(maxChars)
 }
 
-internal fun finalToolState(result: String): String {
-    if (result.isEmpty()) return ToolExecutionStates.EMPTY
+internal fun finalToolState(result: ToolExecutionResult, originalToolName: String): String {
+    val toolName = BuiltInToolNames.canonical(originalToolName)
+    val protocol = result.structuredContent ?: result.text.takeUnless {
+        toolName == "memory_read" || toolName == "active_memory_read" ||
+            toolName == "skill_read" || toolName.startsWith("mcp_")
+    }
     val resultObject = runCatching {
-        Json.parseToJsonElement(result).jsonObject
+        Json.parseToJsonElement(protocol.orEmpty()).jsonObject
     }.getOrNull()
-    val errorCode = (resultObject?.get("error") as? JsonPrimitive)?.content
+    val jobTool = toolName in setOf("shell_exec", "shell_job_get", "shell_job_wait", "shell_job_stop")
+    val payload = if (jobTool) resultObject?.get("result") as? JsonObject ?: resultObject else resultObject
+    val errorCode = (payload?.get("error") as? JsonPrimitive)?.contentOrNull
+        ?: (resultObject?.get("error") as? JsonPrimitive)?.contentOrNull
     if (errorCode == "no_results") return ToolExecutionStates.EMPTY
-    if (result.startsWith("Error", ignoreCase = true) || errorCode != null) {
+    val failedFlag = (payload?.get("failed") as? JsonPrimitive)?.content == "true" ||
+        (resultObject?.get("failed") as? JsonPrimitive)?.content == "true"
+    if (result.isError || failedFlag || !errorCode.isNullOrBlank()) {
         return ToolExecutionStates.FAILED
     }
+    if (result.text.isEmpty() && result.structuredContent == null && result.images.isEmpty()) {
+        return ToolExecutionStates.EMPTY
+    }
+    val jobState = if (jobTool) (payload?.get("state") as? JsonPrimitive)?.content?.lowercase() else null
+    if (jobState == "stopped" || jobState == "interrupted") return ToolExecutionStates.STOPPED
     val isBackground = (resultObject?.get("background") as? JsonPrimitive)
         ?.content
         ?.toBooleanStrictOrNull() == true ||
         (
-            (resultObject?.get("state") as? JsonPrimitive)
-                ?.content
-                ?.equals("running", ignoreCase = true) == true &&
-                resultObject.get("job_id") != null
+            jobState in setOf("running", "stopping", "settling") &&
+                (payload?.get("job_id") ?: resultObject?.get("job_id")) != null
             )
     return if (isBackground) ToolExecutionStates.BACKGROUND_RUNNING
     else ToolExecutionStates.SUCCEEDED

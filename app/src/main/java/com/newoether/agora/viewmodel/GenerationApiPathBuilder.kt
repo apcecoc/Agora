@@ -37,24 +37,47 @@ internal fun interface GenerationToolDefinitionSource {
  */
 internal class GenerationApiPathBuilder(
     private val conversations: ConversationRepository,
+    private val generationErrorFormatter: (String) -> String,
+    appContext: android.content.Context? = null,
     private val contextLoader: DurableSelectedContextLoader =
-        DurableSelectedContextLoader(conversations),
+        DurableSelectedContextLoader(conversations, generationErrorFormatter, appContext = appContext),
     private val toolDefinitions: GenerationToolDefinitionSource,
 ) {
     suspend fun build(request: GenerationApiPathRequest): GenerationApiPath =
         withContext(Dispatchers.Default) {
             val config = request.config
-            val definitions = toolDefinitions.definitions(request.context)
-            val fixedTokenCost = ContextTokenEstimator.estimateFixed(
-                systemPrompt = config.effectiveSystemPrompt,
-                tools = definitions,
-                initialUserPrompt = config.initialUserPrompt,
-                codeExecutionEnabled = config.codeExecutionEnabled,
-                googleSearchEnabled = config.googleSearchEnabled,
-                openAiWebSearchEnabled = config.openAiWebSearchEnabled,
-            )
-            val providerTokenBudget =
+            val definitions = if (config.lowContextModeEnabled) {
+                emptyList()
+            } else {
+                toolDefinitions.definitions(request.context)
+            }
+            val includeAssistantReasoning =
+                !config.responsesApiEnabled &&
+                    config.thinkingEnabled &&
+                    (
+                        config.providerName == Constants.PROVIDER_DEEPSEEK ||
+                            com.newoether.agora.api.openai.isDeepSeekModel(config.modelId)
+                        ) &&
+                    definitions.isNotEmpty()
+            val fixedTokenCost = if (config.requestResolver == null) {
+                ContextTokenEstimator.forModel(
+                    config.modelId, com.newoether.agora.api.LocalModelRuntime::exactTokenCountOrNull,
+                ).estimateFixed(
+                    systemPrompt = config.effectiveSystemPrompt,
+                    tools = definitions,
+                    initialUserPrompt = config.initialUserPrompt,
+                    codeExecutionEnabled = config.codeExecutionEnabled,
+                    googleSearchEnabled = config.googleSearchEnabled,
+                    openAiWebSearchEnabled = config.openAiWebSearchEnabled,
+                )
+            } else {
+                0
+            }
+            val providerTokenBudget = if (config.requestResolver == null) {
                 (config.maxContextWindow - fixedTokenCost).coerceAtLeast(1)
+            } else {
+                config.maxContextWindow
+            }
             val currentPath = request.loadedMessages?.let { loaded ->
                 projectLoadedSnapshot(
                     parentId = request.parentId,
@@ -76,9 +99,10 @@ internal class GenerationApiPathBuilder(
                 providerConfig = ProviderConfig(
                     apiKey = config.apiKey,
                     modelId = config.modelId,
-                    // Transcription-enabled models receive image descriptions instead of raw
-                    // images. Sending image_url parts to a non-vision model is a hard provider 400.
-                    includeImages = !request.context.imageTranscriptionEnabled,
+                    // Successful stored descriptions have already removed their own image range.
+                    // Undescribed images remain part of dispatch and context accounting.
+                    includeImages = true,
+                    includeAssistantReasoning = includeAssistantReasoning,
                     systemPrompt = config.effectiveSystemPrompt,
                     maxContextWindow = providerTokenBudget,
                     codeExecutionEnabled = config.codeExecutionEnabled,
@@ -89,6 +113,8 @@ internal class GenerationApiPathBuilder(
                     thinkingBudgetTokens = config.thinkingBudgetTokens,
                     openAiServiceTier = config.openAiServiceTier,
                     responsesApiEnabled = config.responsesApiEnabled,
+                    anthropicCacheEnabled = config.anthropicCacheEnabled,
+                    anthropicCacheTtl = config.anthropicCacheTtl,
                     openAiWebSearchEnabled = config.openAiWebSearchEnabled,
                     baseUrl = config.baseUrl,
                     tools = definitions,
@@ -99,6 +125,13 @@ internal class GenerationApiPathBuilder(
                     topP = config.topP,
                     frequencyPenalty = config.frequencyPenalty,
                     presencePenalty = config.presencePenalty,
+                    promptCacheKey = request.conversationId.takeIf {
+                        config.promptCacheKeyEnabled
+                    },
+                    sessionId = request.conversationId.takeIf {
+                        config.providerName == Constants.PROVIDER_OPENCODE_GO
+                    },
+                    requestResolver = config.requestResolver,
                 ),
             )
         }
@@ -125,6 +158,8 @@ internal class GenerationApiPathBuilder(
         return projectProviderMessages(
             entities = ApiPathAssembler.assemble(pathEntities, loadedMessages),
             includeStoredTranscriptions = includeStoredTranscriptions,
-        ).let(::projectGenerationStatusesForApi)
+        ).let { messages ->
+            projectGenerationStatusesForApi(messages, generationErrorFormatter)
+        }
     }
 }

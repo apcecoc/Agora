@@ -1,6 +1,5 @@
 package com.newoether.agora.ui.chat
 
-import com.newoether.agora.ui.chat.bottombar.CHAT_DROPDOWN_MENU_SHAPE
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -9,7 +8,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuAnchorType
 import androidx.compose.material3.ExposedDropdownMenuBox
@@ -32,6 +30,8 @@ import com.newoether.agora.R
 import com.newoether.agora.data.CustomProviderConfig
 import com.newoether.agora.data.modelDisplayName
 import com.newoether.agora.ui.components.clearFocusOnTap
+import com.newoether.agora.ui.components.AgoraDropdownMenuItem
+import com.newoether.agora.ui.components.AgoraExposedDropdownMenu
 
 /** Manual Compact uses the same Material alert-dialog treatment as the other chat editors. */
 @OptIn(ExperimentalMaterial3Api::class)
@@ -42,6 +42,7 @@ internal fun ChatManualCompactDialog(
     initialRetainCount: Int,
     enabledModels: Set<String>,
     modelAliases: Map<String, String>,
+    modelProviderNames: Map<String, Boolean>,
     customProviders: List<CustomProviderConfig>,
     isCompacting: Boolean,
     onCompact: (model: String, prompt: String, retainCount: Int) -> Unit,
@@ -82,7 +83,7 @@ internal fun ChatManualCompactDialog(
                     onExpandedChange = { if (!busy) modelMenu = it },
                 ) {
                     OutlinedTextField(
-                        value = modelDisplayName(model, modelAliases, customProviders),
+                        value = modelDisplayName(model, modelAliases, customProviders, modelProviderNames[model] != false),
                         onValueChange = {},
                         readOnly = true,
                         enabled = !busy,
@@ -99,15 +100,14 @@ internal fun ChatManualCompactDialog(
                                 enabled = !busy,
                             ),
                     )
-                    ExposedDropdownMenu(
+                    AgoraExposedDropdownMenu(
                         expanded = modelMenu,
                         onDismissRequest = { modelMenu = false },
-                        shape = CHAT_DROPDOWN_MENU_SHAPE,
                     ) {
                         enabledModels.sorted().forEach { candidate ->
-                            DropdownMenuItem(
+                            AgoraDropdownMenuItem(
                                 text = {
-                                    Text(modelDisplayName(candidate, modelAliases, customProviders))
+                                    Text(modelDisplayName(candidate, modelAliases, customProviders, modelProviderNames[candidate] != false))
                                 },
                                 onClick = {
                                     model = candidate
