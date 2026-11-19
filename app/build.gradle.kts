@@ -36,7 +36,7 @@ android {
         applicationId = "com.newoether.agora"
         minSdk = 26
         targetSdk = 36
-        versionCode = 32
+        versionCode = providers.environmentVariable("AGORA_FORK_VERSION_CODE").orNull?.toInt() ?: 32
         versionName = "2.2.0"
 
 
@@ -60,10 +60,16 @@ android {
             keyAlias = keystoreProperties.getProperty("keyAlias", "")
             keyPassword = keystoreProperties.getProperty("keyPassword", "")
         }
+        create("forkDebug") {
+            storeFile = rootProject.file("fork-debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
     }
 
     val hasKeystore = keystoreProperties.getProperty("storeFile", ".").let { it != "." }
-    val releaseSigning = if (hasKeystore) signingConfigs.getByName("release") else signingConfigs.getByName("debug")
+    val releaseSigning = signingConfigs.getByName(if (hasKeystore) "release" else "forkDebug")
 
     buildTypes {
         debug {
@@ -75,6 +81,7 @@ android {
             }
         }
         release {
+            applicationIdSuffix = ".fork"
             signingConfig = releaseSigning
             // R8 shrinks and optimizes release code; keep rules live in proguard-rules.pro.
             isMinifyEnabled = true

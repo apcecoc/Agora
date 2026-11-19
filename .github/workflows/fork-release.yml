@@ -1,0 +1,101 @@
+name: Fork Release
+
+on:
+  push:
+    branches: [master, feature/ci-fork-identity]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: "platform-tools ndk;28.2.13676358"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build PRoot runtime
+        run: bash ./build-proot.sh
+
+      - name: Build F-Droid release APK
+        run: |
+          export AGORA_FORK_VERSION_CODE=$((1000 + GITHUB_RUN_NUMBER))
+          chmod +x ./gradlew
+          ./gradlew assembleFdroidRelease
+
+      - name: Verify and stage APK
+        shell: bash
+        run: |
+          shopt -s nullglob
+          apks=(app/build/outputs/apk/fdroid/release/*.apk)
+          if (( ${#apks[@]} != 1 )); then
+            echo "Expected one F-Droid release APK, found ${#apks[@]}" >&2
+            exit 1
+          fi
+          apk="${apks[0]}"
+          entries=$(unzip -Z1 "$apk")
+          for library in libproot_exec.so libproot_loader.so libtalloc.so; do
+            grep -Fxq "lib/arm64-v8a/$library" <<< "$entries"
+          done
+          cp "$apk" "Agora-Fork-build-${GITHUB_RUN_NUMBER}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fork-release-apk
+          path: Agora-Fork-build-${{ github.run_number }}.apk
+          if-no-files-found: error
+
+  publish:
+    if: github.repository == 'apcecoc/Agora'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: fork-release-apk
+
+      - name: Publish pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="build-${GITHUB_RUN_NUMBER}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists."
+          else
+            printf -v notes 'Branch: %s\nCommit: %s\nversionCode: %d' \
+              "$GITHUB_REF_NAME" "$GITHUB_SHA" "$((1000 + GITHUB_RUN_NUMBER))"
+            gh release create "$tag" "Agora-Fork-$tag.apk" --prerelease \
+              --target "$GITHUB_SHA" --title "Agora Fork $tag" --notes "$notes"
+          fi
+
+      - name: Keep the five highest build numbers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          stale_releases=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
+            --jq '.[] | select(.prerelease and (.draft | not) and (.tag_name | test("^build-[0-9]+$")) and (.name == ("Agora Fork " + .tag_name))) | .tag_name' \
+            | sort -t- -k2,2nr | tail -n +6)
+          while IFS= read -r tag; do
+            [[ -n "$tag" ]] || continue
+            gh release delete "$tag" --cleanup-tag --yes
+          done <<< "$stale_releases"

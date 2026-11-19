@@ -119,7 +119,11 @@ private fun localCloneSource(path: String): File? = when {
 
 private fun ownedImageRelativePath(path: String): String? = runCatching {
     val uri = java.net.URI(path)
-    val ownedAuthorities = setOf("com.newoether.agora.fileprovider", "com.newoether.agora.screenshots.fileprovider")
+    val ownedAuthorities = setOf(
+        "com.newoether.agora.fileprovider",
+        "com.newoether.agora.screenshots.fileprovider",
+        "com.newoether.agora.fork.fileprovider",
+    )
     if (uri.scheme != "content" || uri.authority !in ownedAuthorities ||
         uri.query != null || uri.fragment != null || !uri.path.orEmpty().startsWith("/images/")
     ) null else uri.path.removePrefix("/images/").takeIf(String::isNotBlank)
