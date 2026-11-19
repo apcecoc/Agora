@@ -2,7 +2,7 @@ name: Fork Release
 
 on:
   push:
-    branches: [master, feature/ci-fork-identity]
+    branches: [master]
   workflow_dispatch:
 
 permissions:
